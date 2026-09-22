@@ -124,6 +124,8 @@ def gather(client):
         # yet serving, which is the whole point of it.
         "all_cases": list(client.cases.all()),
         "ecm": ECM in eligible,
+        # Where the member LIVES, for the borough check on every row.
+        "home_borough": member_home_borough(client),
     }
 
 
@@ -137,9 +139,78 @@ def _find_case(cases, service_type, case_type=None):
     return None
 
 
-def _item(label, done, *, case=None, program="", detail="", state=None):
+# ── the borough check ────────────────────────────────────────────────────────
+# Which address decides where a member LIVES. The same set the eligibility gate
+# judges, minus "mailing": a PO box in another borough says nothing about where the
+# member is, and "current" first because that is the one the profile header shows --
+# so the tracker and the profile cannot disagree about where somebody lives.
+_HOME_ADDRESS_TYPES = ("current", "home", "delivery")
+
+
+def member_home_borough(client):
+    """The borough the member lives in, from their primary address ZIP, or "".
+
+    Derived from ServiceZipCode -- the same table the service-area check and the
+    programme borough decoder use, so all three agree about what a borough is.
+    """
+    from .service_area import housing_area_check
+
+    addresses = list(client.addresses.all())
+    for wanted in _HOME_ADDRESS_TYPES:
+        for address in addresses:
+            if (address.type or "").lower() == wanted and address.zip:
+                borough = housing_area_check(address.zip)["borough"]
+                if borough:
+                    return borough
+    # Any address with a usable ZIP, rather than nothing: a member with only a
+    # mailing address still lives somewhere, and "unknown" disables the check.
+    for address in addresses:
+        if address.zip:
+            borough = housing_area_check(address.zip)["borough"]
+            if borough:
+                return borough
+    return ""
+
+
+def _programme_borough(program_name):
+    """The borough a programme name names, or "".
+
+    Reads ActiveProgram.borough first -- decoded once by migration 0282 against the
+    ServiceZipCode list -- and falls back to the same name-tail parse for a case
+    whose programme is not in our table, which is most external ones.
+    """
+    from ..models import ActiveProgram
+
+    name = (program_name or "").strip()
+    if not name:
+        return ""
+    program = ActiveProgram.objects.filter(program_name=name).only("borough").first()
+    if program is not None:
+        return program.borough or ""
+    parts = [p.strip() for p in name.split(" - ")]
+    candidate = parts[-1] if len(parts) >= 2 else ""
+    from .service_area import service_boroughs
+
+    return candidate if candidate in service_boroughs() else ""
+
+
+def _item(label, done, *, case=None, program="", detail="", state=None,
+          home_borough=""):
     """One line in a track. ``state`` overrides the done/todo pair for the cases
     that are neither -- a recommendation waiting on an assessment, say."""
+    # THE BOROUGH THIS ROW IS IN, and whether it matches where the member lives.
+    # A case opened in the wrong borough is billed against the wrong programme, and
+    # nothing else on the profile compares the two.
+    #
+    # `match` is deliberately THREE-VALUED: None means we could not tell -- no
+    # address ZIP, or a programme with no borough in its name -- and painting that
+    # red would accuse good data of being wrong.
+    row_borough = _programme_borough(
+        (case.program_name if case is not None else "") or program
+    )
+    match = None
+    if row_borough and home_borough:
+        match = row_borough == home_borough
     return {
         "label": label,
         "state": state or ("done" if done else "todo"),
@@ -148,6 +219,8 @@ def _item(label, done, *, case=None, program="", detail="", state=None):
         "case_id": str(case.case_id) if case is not None else "",
         "case_status": (case.case_status or "") if case is not None else "",
         "case_program": (case.program_name or "") if case is not None else "",
+        "borough": row_borough,
+        "borough_match": match,
     }
 
 
@@ -185,10 +258,12 @@ def rule_0_care_management(ctx):
             _item(
                 "Care Management Case", care is not None, case=care,
                 detail="Category: Care Management",
+                home_borough=ctx["home_borough"],
             ),
             _item(
                 "Eligibility Case", eligibility is not None, case=eligibility,
                 detail="Category: Eligibility",
+                home_borough=ctx["home_borough"],
             ),
         ],
     }
@@ -224,6 +299,7 @@ def rule_1_housing(ctx, client):
         case=dwelling,
         state=state,
         detail=detail,
+        home_borough=ctx["home_borough"],
     )]
 
     # Rule 1b: only once the assessment is actually submitted. Listing
@@ -290,6 +366,7 @@ def rule_1_housing(ctx, client):
                 program=program,
                 state=None if already else state,
                 detail="Case already opened" if already else detail,
+                home_borough=ctx["home_borough"],
             ))
         if not recs:
             items.append(_item(
@@ -319,7 +396,10 @@ def rule_2_and_3_food(ctx):
     if eligible & set(FOOD_PRESCRIPTION):
         case = _find_case(ctx["live_cases"], "Produce Prescription/Voucher")
         items.append({
-            **_item("Produce Prescription / Voucher", case is not None, case=case),
+            **_item(
+                "Produce Prescription / Voucher", case is not None, case=case,
+                home_borough=ctx["home_borough"],
+            ),
             "rule": "Rule 2",
         })
         items += _scheduled_reauth_rows(ctx, "Produce Prescription/Voucher")
@@ -333,6 +413,7 @@ def rule_2_and_3_food(ctx):
             **_item(
                 "Medically Tailored Meals (MTM)", case is not None, case=case,
                 detail="Covers Clinically Appropriate Meals too",
+                home_borough=ctx["home_borough"],
             ),
             "rule": "Rule 3",
         })
@@ -394,6 +475,9 @@ def tracker_for(client):
             "screening_domains": ctx["dropped_from_older_screening"],
             "assessment_services": ctx["dropped_from_older_assessment"],
         },
+        # So the UI can name the borough it is comparing against, rather than
+        # showing a red chip with nothing to compare it to.
+        "home_borough": ctx["home_borough"],
         "tracks": tracks,
     }
 
@@ -487,6 +571,7 @@ def _scheduled_reauth_rows(ctx, service_type):
             # Marking it outstanding would have an agent chasing work that is done.
             state="waiting",
             case=case,
+            home_borough=ctx["home_borough"],
             # Only the FIRST letter: str.capitalize() lower-cases the rest and
             # turned "starts 25 Oct 2026" into "Starts 25 oct 2026".
             detail=when[:1].upper() + when[1:],

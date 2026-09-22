@@ -36373,3 +36373,151 @@ class HousingRecommendationFamilyTest(TestCase):
         existing = _existing_housing_cases(member)
         self.assertIn(("Heater", "Brooklyn"), existing)
         self.assertNotIn(("Heater", "Queens"), existing)
+
+
+class ServiceTrackerBoroughTest(TestCase):
+    """Does each opened case sit in the borough the member lives in?
+
+    A case opened in the wrong borough is billed against the wrong programme, and
+    nothing else on the profile compares the two. Real data has them: 36 mismatches
+    in a 500-member sample, including one member living in Manhattan whose care
+    management, eligibility and meals cases are all in Brooklyn.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+
+    def setUp(self):
+        from .models import ActiveProgram, Client, ServiceZipCode
+
+        for zip_code, borough in (
+            ("11236", "Brooklyn"), ("11103", "Queens"), ("10002", "Manhattan"),
+        ):
+            ServiceZipCode.objects.create(
+                zip=zip_code, borough=borough, is_active=True,
+            )
+        for borough in ("Brooklyn", "Queens"):
+            ActiveProgram.objects.create(
+                program_name=f"Enhanced Care Management - Level 2 Only - {borough}",
+                case_category="Care Management", borough=borough,
+            )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bor", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _address(self, zip_code, kind="current"):
+        from .models import Address
+
+        return Address.objects.create(
+            client=self.member, type=kind, zip=zip_code, city="X", state="NY",
+        )
+
+    def _setup_ecm(self, borough):
+        from .models import Assessment, Case, CaseType, Screening
+
+        Screening.objects.create(
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=[self.ECM],
+            screen_created_at=timezone.now(),
+        )
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=[self.ECM],
+            screen_created_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member, case_type=CaseType.NAVIGATION,
+            case_status="managed", service_type="Social Service Case Management",
+            program_name=f"Enhanced Care Management - Level 2 Only - {borough}",
+            case_created_at=timezone.now(),
+        )
+
+    def _care_row(self):
+        from .services.service_tracker import tracker_for
+
+        tracker = tracker_for(self.member)
+        track = next(t for t in tracker["tracks"] if t["code"] == "core")
+        return tracker, track["items"][0]
+
+    def test_a_case_in_the_SAME_borough_matches(self):
+        self._address("11103")            # Queens
+        self._setup_ecm("Queens")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "Queens")
+        self.assertEqual(row["borough"], "Queens")
+        self.assertIs(row["borough_match"], True)
+
+    def test_a_case_in_ANOTHER_borough_is_flagged(self):
+        self._address("11103")            # Queens
+        self._setup_ecm("Brooklyn")
+        _tracker, row = self._care_row()
+        self.assertEqual(row["borough"], "Brooklyn")
+        self.assertIs(row["borough_match"], False)
+
+    def test_with_NO_ADDRESS_the_check_is_UNKNOWN_not_wrong(self):
+        """Painting "we could not tell" red accuses good data of being wrong."""
+        self._setup_ecm("Brooklyn")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "")
+        self.assertIsNone(row["borough_match"])
+
+    def test_a_programme_with_no_borough_is_UNKNOWN_too(self):
+        from .models import Case, CaseType
+
+        self._address("11103")
+        self._setup_ecm("Queens")
+        # A real example: "Care Management Services" names no borough at all.
+        self.member.cases.all().delete()
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member, case_type=CaseType.NAVIGATION,
+            case_status="managed", service_type="Social Service Case Management",
+            program_name="Care Management Services",
+            case_created_at=timezone.now(),
+        )
+        _tracker, row = self._care_row()
+        self.assertEqual(row["borough"], "")
+        self.assertIsNone(row["borough_match"])
+
+    def test_CURRENT_beats_the_other_address_types(self):
+        """It is the one the profile header shows, so the tracker and the profile
+        cannot disagree about where somebody lives."""
+        self._address("11236", kind="home")       # Brooklyn
+        self._address("11103", kind="current")    # Queens
+        self._setup_ecm("Queens")
+        tracker, _row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "Queens")
+
+    def test_a_MAILING_address_is_not_used_when_a_home_one_exists(self):
+        """A PO box in another borough says nothing about where a member lives."""
+        self._address("10002", kind="mailing")    # Manhattan
+        self._address("11103", kind="home")       # Queens
+        self._setup_ecm("Queens")
+        tracker, _row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "Queens")
+
+    def test_a_mailing_address_is_BETTER_THAN_NOTHING(self):
+        """A member with only a mailing address still lives somewhere, and answering
+        "unknown" would disable the check entirely."""
+        self._address("10002", kind="mailing")
+        self._setup_ecm("Brooklyn")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "Manhattan")
+        self.assertIs(row["borough_match"], False)
+
+    def test_an_OUT_OF_AREA_zip_yields_no_borough(self):
+        self._address("33314")            # Florida
+        self._setup_ecm("Queens")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "")
+        self.assertIsNone(row["borough_match"])
+
+    def test_service_boroughs_knows_the_three_without_a_ZIP_table(self):
+        """A borough decoder that knows no boroughs answers "" for everything rather
+        than failing, so the fallback is load-bearing on a fresh database."""
+        from .models import ServiceZipCode
+        from .services.service_area import service_boroughs
+
+        ServiceZipCode.objects.all().delete()
+        self.assertEqual(
+            service_boroughs(), {"Brooklyn", "Manhattan", "Queens"},
+        )
