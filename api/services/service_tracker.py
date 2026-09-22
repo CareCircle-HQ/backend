@@ -461,6 +461,7 @@ def tracker_for(client):
         # So the UI can name the borough it is comparing against, rather than
         # showing a red chip with nothing to compare it to.
         "home_borough": ctx["home_borough"],
+        "alerts": detect_alerts(ctx),
         "tracks": tracks,
     }
 
@@ -560,3 +561,86 @@ def _scheduled_reauth_rows(ctx, service_type):
             detail=when[:1].upper() + when[1:],
         ))
     return rows
+
+
+# ── bad scenarios ────────────────────────────────────────────────────────────
+# Things that are WRONG rather than merely unfinished. A to-do row says "this still
+# needs doing"; an alert says "what is already recorded does not add up".
+#
+# All four are rare on real data -- 0, 1, 1 and 6 in a 600-member sample -- which is
+# what makes a red banner the right weight for them. A warning that fires on a third
+# of members gets scrolled past, and then it is worse than nothing.
+#
+# NOT INCLUDED: "screened for Housing, qualified, but no dwelling case". That is 6%
+# of members and already the first row of the housing track, in amber, saying which
+# half is missing. Repeating it as an alert would double-count the commonest state in
+# the tracker and teach an agent to ignore the banner.
+
+def _alert(code, title, detail, *, severity="error", program=""):
+    return {
+        "code": code,
+        "severity": severity,
+        "title": title,
+        "detail": detail,
+        "program_name": program,
+    }
+
+
+def detect_alerts(ctx):
+    """What does not add up about this member's screening, eligibility and cases."""
+    alerts = []
+    domains = ctx["screened_domains"]
+    eligible = set(ctx["eligible"])
+
+    # A NEED WITH NO QUALIFICATION. The member was screened as needing something we
+    # provide, but the assessment did not qualify them for ECM Level 2 -- so no case
+    # can be opened at all, and every track is absent. Without this the tracker
+    # would simply show nothing, which reads as "nothing to do here".
+    if not ctx["ecm"]:
+        for domain in ("Housing", "Food"):
+            if domain in domains:
+                alerts.append(_alert(
+                    f"no_ecm_{domain.lower()}",
+                    f"Screened for {domain}, but not qualified for ECM Level 2",
+                    f"No {domain.lower()} case can be opened without it. Either the "
+                    f"eligibility assessment is missing or incomplete, or the "
+                    f"screened need cannot be served.",
+                    severity="warning",
+                ))
+        return alerts
+
+    # THE WRONG KIND OF FOOD CASE.
+    #
+    # ⚠ BOTH may be allowed at once, and then NEITHER is wrong -- which is the whole
+    # reason this compares against what the assessment permits rather than against a
+    # single expected answer. (No member in a 600-strong sample had both, so the
+    # tempting shortcut "one or the other" would have passed every test and been
+    # wrong the first time it mattered.)
+    if "Food" in domains:
+        boxes_allowed = bool(eligible & set(FOOD_PRESCRIPTION))
+        meals_allowed = bool(eligible & set(MEALS))
+
+        meals_case = _find_case(ctx["live_cases"], "Medically Tailored Meals")
+        if meals_case is not None and not meals_allowed:
+            alerts.append(_alert(
+                "wrong_food_case_meals",
+                "Meals case open, but the assessment does not allow meals",
+                "The eligibility result permits "
+                + ("a produce prescription / voucher" if boxes_allowed
+                   else "no food service")
+                + ", so this case is on the wrong service.",
+                program=meals_case.program_name or "",
+            ))
+
+        boxes_case = _find_case(ctx["live_cases"], "Produce Prescription/Voucher")
+        if boxes_case is not None and not boxes_allowed:
+            alerts.append(_alert(
+                "wrong_food_case_boxes",
+                "Voucher case open, but the assessment does not allow vouchers",
+                "The eligibility result permits "
+                + ("medically tailored meals" if meals_allowed
+                   else "no food service")
+                + ", so this case is on the wrong service.",
+                program=boxes_case.program_name or "",
+            ))
+    return alerts

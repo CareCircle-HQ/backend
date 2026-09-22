@@ -36524,3 +36524,176 @@ class ServiceTrackerBoroughTest(TestCase):
         self.assertEqual(
             service_boroughs(), {"Brooklyn", "Manhattan", "Queens"},
         )
+
+
+class ServiceTrackerAlertsTest(TestCase):
+    """The bad scenarios: things that do not ADD UP, not things merely unfinished.
+
+    All are rare on real data -- 0, 1, 1 and 6 in a 600-member sample -- which is what
+    makes a red banner the right weight. A warning firing on a third of members gets
+    scrolled past, and is then worse than nothing.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+    MTM = "Medically Tailored Meals (MTM) (Food)"
+    VOUCHER = "Food Prescriptions (Voucher / Boxes) (Food)"
+
+    def setUp(self):
+        from .models import Client
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Alert", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _screen(self, services):
+        from .models import Screening
+
+        Screening.objects.create(
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=services,
+            screen_created_at=timezone.now(),
+        )
+
+    def _assess(self, services):
+        from .models import Assessment
+
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=services,
+            screen_created_at=timezone.now(),
+        )
+
+    def _case(self, service_type, program=""):
+        from .models import Case, CaseType
+
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+            service_type=service_type, program_name=program,
+            case_created_at=timezone.now(),
+        )
+
+    def _codes(self):
+        from .services.service_tracker import tracker_for
+
+        return [a["code"] for a in tracker_for(self.member)["alerts"]]
+
+    def _alerts(self):
+        from .services.service_tracker import tracker_for
+
+        return {a["code"]: a for a in tracker_for(self.member)["alerts"]}
+
+    # ── 1 and 3: a need with no qualification ───────────────────────────────
+    def test_1_housing_screened_without_ECM(self):
+        """No case can be opened at all, so every track is absent -- and without the
+        alert the tracker would show nothing, which reads as "nothing to do"."""
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess(["Nutritional Counseling and Education (Food)"])
+        self.assertIn("no_ecm_housing", self._codes())
+
+    def test_3_food_screened_without_ECM(self):
+        self._screen([self.MTM])
+        self._assess(["Pre-tenancy Services"])
+        self.assertIn("no_ecm_food", self._codes())
+
+    def test_BOTH_domains_screened_without_ECM_gives_both(self):
+        self._screen([self.MTM, "Asthma Remediation (Housing)"])
+        self._assess([])
+        self.assertEqual(
+            set(self._codes()), {"no_ecm_food", "no_ecm_housing"},
+        )
+
+    def test_it_is_a_WARNING_not_an_error(self):
+        """The member may genuinely not qualify. That is a fact to check, not a
+        mistake somebody made."""
+        self._screen([self.MTM])
+        self._assess([])
+        self.assertEqual(self._alerts()["no_ecm_food"]["severity"], "warning")
+
+    def test_with_ECM_there_is_no_such_alert(self):
+        self._screen([self.MTM, "Asthma Remediation (Housing)"])
+        self._assess([self.ECM, self.MTM])
+        codes = self._codes()
+        self.assertNotIn("no_ecm_food", codes)
+        self.assertNotIn("no_ecm_housing", codes)
+
+    # ── 4: the wrong kind of food case ──────────────────────────────────────
+    def test_4a_a_MEALS_case_when_only_vouchers_are_allowed(self):
+        self._screen([self.MTM])
+        self._assess([self.ECM, self.VOUCHER])
+        self._case(
+            "Medically Tailored Meals",
+            program="Medically Tailored Meals (MTM) - Other - Queens",
+        )
+        alert = self._alerts()["wrong_food_case_meals"]
+        self.assertEqual(alert["severity"], "error")
+        self.assertIn("produce prescription", alert["detail"])
+        # Names the case at fault: the difference between "something is wrong" and
+        # "this is the case to go and fix".
+        self.assertIn("Medically Tailored Meals (MTM) - Other", alert["program_name"])
+
+    def test_4b_a_VOUCHER_case_when_only_meals_are_allowed(self):
+        self._screen([self.MTM])
+        self._assess([self.ECM, self.MTM])
+        self._case(
+            "Produce Prescription/Voucher",
+            program="… Food Prescriptions: Voucher - Other - Queens",
+        )
+        alert = self._alerts()["wrong_food_case_boxes"]
+        self.assertIn("medically tailored meals", alert["detail"])
+
+    def test_when_BOTH_are_allowed_NEITHER_case_is_wrong(self):
+        """⚠ The reason this compares against what the assessment PERMITS rather than
+        a single expected answer. No member in a 600-strong sample had both, so the
+        shortcut "one or the other" would have passed every test and been wrong the
+        first time it mattered."""
+        self._screen([self.MTM])
+        self._assess([self.ECM, self.MTM, self.VOUCHER])
+        self._case("Medically Tailored Meals")
+        self._case("Produce Prescription/Voucher")
+        self.assertEqual(self._codes(), [])
+
+    def test_the_RIGHT_case_raises_nothing(self):
+        self._screen([self.MTM])
+        self._assess([self.ECM, self.MTM])
+        self._case("Medically Tailored Meals")
+        self.assertEqual(self._codes(), [])
+
+    def test_a_CLOSED_wrong_case_is_not_flagged(self):
+        """The alert is about what is in force. A closed case on the wrong service is
+        history, and nobody can act on it."""
+        from .models import Case, CaseType
+
+        self._screen([self.MTM])
+        self._assess([self.ECM, self.VOUCHER])
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="closed",
+            service_type="Medically Tailored Meals",
+            case_created_at=timezone.now(),
+        )
+        self.assertEqual(self._codes(), [])
+
+    def test_a_case_with_NO_food_eligibility_at_all_is_flagged(self):
+        """Screened for food, qualified for ECM, but the assessment named no food
+        service -- yet a food case is open."""
+        self._screen([self.MTM])
+        self._assess([self.ECM])
+        self._case("Medically Tailored Meals")
+        alert = self._alerts()["wrong_food_case_meals"]
+        self.assertIn("no food service", alert["detail"])
+
+    # ── 2: deliberately NOT an alert ────────────────────────────────────────
+    def test_2_a_missing_dwelling_case_is_a_ROW_not_an_alert(self):
+        """It is 6% of members -- by far the commonest state in the tracker -- and
+        already the first row of the housing track, in amber, saying which half is
+        missing. Repeating it as a banner would teach an agent to ignore the banner."""
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+        tracker = tracker_for(self.member)
+        self.assertEqual(tracker["alerts"], [])
+        housing = next(t for t in tracker["tracks"] if t["code"] == "housing")
+        self.assertEqual(housing["items"][0]["state"], "todo")
