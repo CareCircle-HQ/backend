@@ -36273,3 +36273,103 @@ class AssessmentAddressEditTest(TestCase):
         self.assertEqual(resp.status_code, 409)
         self.order.refresh_from_db()
         self.assertEqual(self.order.address_zip, "33314")
+
+
+class HousingRecommendationFamilyTest(TestCase):
+    """Which programme family a recommended product belongs to, and what counts as
+    already opened."""
+
+    def test_air_quality_and_temperature_are_HOME_REMEDIATION(self):
+        """⚠ REGRESSION. _CATEGORY_FAMILY read `if module == "ventilation"`, and when
+        the questionnaires were rebuilt around five product categories that module
+        ceased to exist -- so every air-quality and temperature product silently
+        became a Home Accessibility programme. The names it built matched nothing in
+        ActiveProgram, so each one reported exists=False and read as "no such
+        programme -- it must be created"."""
+        from .services.case_recommendations import _CATEGORY_FAMILY
+
+        for label in (
+            "Air Filtration Devices", "De-humidifier", "Humidifier",
+            "Air Conditioner", "Heater",
+        ):
+            self.assertEqual(
+                _CATEGORY_FAMILY[label], "Home Remediation", label,
+            )
+
+    def test_the_others_are_HOME_ACCESSIBILITY(self):
+        from .services.case_recommendations import _CATEGORY_FAMILY
+
+        for label in (
+            "Bathroom Facilities", "Non-skid Surfaces", "Grab Bars",
+            "Doors & Cabinet Handles", "Handrails",
+        ):
+            self.assertEqual(
+                _CATEGORY_FAMILY[label],
+                "Home Accessibility and Safety Modification",
+                label,
+            )
+
+    def test_EVERY_product_category_has_a_family(self):
+        """So a new category cannot quietly inherit the wrong one -- which is exactly
+        how the bug above survived."""
+        from .services.assessment_forms import INTERVENTIONS
+        from .services.case_recommendations import _CATEGORY_FAMILY
+
+        for groups in INTERVENTIONS.values():
+            for group in groups:
+                self.assertIn(group["label"], _CATEGORY_FAMILY)
+
+    def test_a_CLOSED_case_still_counts_as_already_opened(self):
+        """"Does one of these exist?" -- not "is one live?". A closed remediation
+        case means the work was done, and recommending it again would have an agent
+        open a duplicate."""
+        from .models import Case, CaseType, Client
+        from .services.case_recommendations import _existing_housing_cases
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Hx", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=member, case_type=CaseType.INTERNAL_SERVICE,
+            case_status="closed",
+            program_name="Home Remediation - De-humidifier - Queens",
+            case_created_at=timezone.now(),
+        )
+        self.assertIn(("De-humidifier", "Queens"), _existing_housing_cases(member))
+
+    def test_a_CANCELLED_case_counts_too(self):
+        from .models import Case, CaseType, Client
+        from .services.case_recommendations import _existing_housing_cases
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Cx", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=member, case_type=CaseType.INTERNAL_SERVICE,
+            case_status="cancelled",
+            program_name="Home Remediation - Heater - Brooklyn",
+            case_created_at=timezone.now(),
+        )
+        self.assertIn(("Heater", "Brooklyn"), _existing_housing_cases(member))
+
+    def test_the_BOROUGH_has_to_match(self):
+        """A Brooklyn heater case does not cover a Queens dwelling -- the programmes
+        are per borough, so the case genuinely has to be opened again."""
+        from .models import Case, CaseType, Client
+        from .services.case_recommendations import _existing_housing_cases
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bx", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=member, case_type=CaseType.INTERNAL_SERVICE,
+            case_status="open",
+            program_name="Home Remediation - Heater - Brooklyn",
+            case_created_at=timezone.now(),
+        )
+        existing = _existing_housing_cases(member)
+        self.assertIn(("Heater", "Brooklyn"), existing)
+        self.assertNotIn(("Heater", "Queens"), existing)

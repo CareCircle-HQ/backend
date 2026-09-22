@@ -280,12 +280,16 @@ def rule_1_housing(ctx, client):
                 state, detail = "blocked", "External Services — needs reclassifying"
             else:
                 state, detail = (None, "")
+            # A ticked row with no reason is less use than it looks. "Opened" and
+            # not "open": the check is whether a case for this product EXISTS, in
+            # any status -- a closed remediation case means the work was done, and
+            # recommending it again would have an agent open a duplicate.
             items.append(_item(
                 rec.get("program_item") or "Unpriced recommendation",
                 already,
                 program=program,
                 state=None if already else state,
-                detail="" if already else detail,
+                detail="Case already opened" if already else detail,
             ))
         if not recs:
             items.append(_item(
