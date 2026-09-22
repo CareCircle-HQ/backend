@@ -35537,10 +35537,18 @@ class ServiceTrackerTest(TestCase):
         self._case("Social Service Case Management", case_type="eligibility")
         self.assertEqual(self._core_states()["Care Management Case"], "todo")
 
-    def test_the_track_is_called_Care_Management_Case(self):
-        self._screen([self.ECM])
-        self._assess([self.ECM])
-        self.assertEqual(self._track("core")["label"], "Care Management Case")
+    def test_the_TRACK_LABELS_are_the_agreed_ones(self):
+        """Pinned because they are product decisions, not incidental strings -- both
+        have been renamed once already."""
+        self._screen([self.ECM, "Asthma Remediation (Housing)",
+                      "Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        labels = {t["code"]: t["label"] for t in self._tracker()["tracks"]}
+        self.assertEqual(labels, {
+            "core": "Care Management Case",
+            "housing": "Housing Program Progress",
+            "food": "Food Services",
+        })
 
     def test_rule_0_does_not_fire_without_ECM(self):
         self._screen(["Clinically Appropriate Meals (Food)"])

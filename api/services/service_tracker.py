@@ -276,7 +276,7 @@ def rule_1_housing(ctx, client):
             ))
     return {
         "code": "housing",
-        "label": "Housing Services",
+        "label": "Housing Program Progress",
         "rule": "Rule 1",
         "items": items,
     }
