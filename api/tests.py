@@ -35546,7 +35546,7 @@ class ServiceTrackerTest(TestCase):
         labels = {t["code"]: t["label"] for t in self._tracker()["tracks"]}
         self.assertEqual(labels, {
             "core": "Care Management Case",
-            "housing": "Housing Program Progress",
+            "housing": "Housing Program",
             "food": "Food Program",
         })
 
