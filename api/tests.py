@@ -35502,16 +35502,45 @@ class ServiceTrackerTest(TestCase):
         self.assertEqual(domain_of("Cooking Supplies"), "Food")
 
     # ── rule 0 ──────────────────────────────────────────────────────────────
-    def test_rule_0_requires_an_ELIGIBILITY_case_not_a_navigation_one(self):
-        """132,777 cases carry this service type but only 24,697 are case_type
-        eligibility; the other 108,080 are navigation and must not count."""
+    def _core_states(self):
+        return {i["label"]: i["state"] for i in self._track("core")["items"]}
+
+    def test_rule_0_needs_BOTH_a_care_management_and_an_eligibility_case(self):
+        """They are two different pieces of work and both are required. On the
+        production data they genuinely diverge: 23,818 members have a live care
+        management case and 54,345 an eligibility one, but only 23,091 have both --
+        31,254 are missing the care management side and 727 the eligibility side."""
         self._screen([self.ECM])
         self._assess([self.ECM])
+        self.assertEqual(self._core_states(), {
+            "Care Management Case": "todo", "Eligibility Case": "todo",
+        })
+
+        # The care management case has case_type "navigation" -- the programme
+        # category says Care Management, and the two do not sound alike, but the
+        # split is exact across all 165,908 cases.
         self._case("Social Service Case Management", case_type="navigation")
-        self.assertEqual(self._track("core")["items"][0]["state"], "todo")
+        self.assertEqual(self._core_states(), {
+            "Care Management Case": "done", "Eligibility Case": "todo",
+        })
 
         self._case("Social Service Case Management", case_type="eligibility")
-        self.assertEqual(self._track("core")["items"][0]["state"], "done")
+        self.assertEqual(self._core_states(), {
+            "Care Management Case": "done", "Eligibility Case": "done",
+        })
+
+    def test_an_ELIGIBILITY_case_alone_leaves_care_management_outstanding(self):
+        """The commonest real shape -- 31,254 members -- and the reason the second
+        row exists at all."""
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self._case("Social Service Case Management", case_type="eligibility")
+        self.assertEqual(self._core_states()["Care Management Case"], "todo")
+
+    def test_the_track_is_called_Care_Management_Case(self):
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self.assertEqual(self._track("core")["label"], "Care Management Case")
 
     def test_rule_0_does_not_fire_without_ECM(self):
         self._screen(["Clinically Appropriate Meals (Food)"])
@@ -35527,7 +35556,7 @@ class ServiceTrackerTest(TestCase):
             "Social Service Case Management", case_type="eligibility",
             status="closed",
         )
-        self.assertEqual(self._track("core")["items"][0]["state"], "todo")
+        self.assertEqual(self._core_states()["Eligibility Case"], "todo")
 
     def test_a_DRAFT_case_does_not_count_either(self):
         self._screen([self.ECM])
@@ -35536,7 +35565,7 @@ class ServiceTrackerTest(TestCase):
             "Social Service Case Management", case_type="eligibility",
             status="draft",
         )
-        self.assertEqual(self._track("core")["items"][0]["state"], "todo")
+        self.assertEqual(self._core_states()["Eligibility Case"], "todo")
 
     def test_pending_authorization_DOES_count(self):
         """It is a live case: the work has been done and is awaiting a decision."""
@@ -35546,7 +35575,7 @@ class ServiceTrackerTest(TestCase):
             "Social Service Case Management", case_type="eligibility",
             status="pending_authorization",
         )
-        self.assertEqual(self._track("core")["items"][0]["state"], "done")
+        self.assertEqual(self._core_states()["Eligibility Case"], "done")
 
     # ── rule 1 ──────────────────────────────────────────────────────────────
     def test_rule_1_fires_on_screened_housing_plus_ECM_ALONE(self):

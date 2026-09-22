@@ -150,28 +150,44 @@ def _item(label, done, *, case=None, program="", detail="", state=None):
 
 # ── the rules ────────────────────────────────────────────────────────────────
 
-def rule_0_core_case(ctx):
-    """ECM -> a Social Service Case Management case in the ELIGIBILITY category.
+def rule_0_care_management(ctx):
+    """ECM -> BOTH a care management case and an eligibility case, each live.
 
-    case_type matters here and is the whole rule. 132,777 cases carry this service
-    type, but 108,080 are case_type "navigation" and only 24,697 are "eligibility".
-    A navigation case does NOT satisfy this.
+    They are two different pieces of work and a member needs both. Both carry
+    ``service_type = "Social Service Case Management"``, so the only thing telling
+    them apart is ``case_type``:
+
+        ELIGIBILITY category     9 programmes   57,388 cases   case_type eligibility
+        Care Management category 5 programmes  108,520 cases   case_type navigation
+
+    ⚠ THE CARE MANAGEMENT CASE HAS case_type "navigation". The programme category
+    says Care Management and the case type says navigation, which do not sound like
+    the same thing -- but the split is exact on every one of the 165,908 cases, so
+    case_type is the reliable discriminator and this is what it looks like.
     """
     if not ctx["ecm"]:
         return None
-    case = _find_case(
+
+    care = _find_case(
+        ctx["live_cases"], "Social Service Case Management", case_type="navigation",
+    )
+    eligibility = _find_case(
         ctx["live_cases"], "Social Service Case Management", case_type="eligibility",
     )
     return {
         "code": "core",
-        "label": "Core Social Work Case",
+        "label": "Care Management Case",
         "rule": "Rule 0",
-        "items": [_item(
-            "Social Service Case Management",
-            case is not None,
-            case=case,
-            detail="Category: Eligibility",
-        )],
+        "items": [
+            _item(
+                "Care Management Case", care is not None, case=care,
+                detail="Category: Care Management",
+            ),
+            _item(
+                "Eligibility Case", eligibility is not None, case=eligibility,
+                detail="Category: Eligibility",
+            ),
+        ],
     }
 
 
@@ -316,7 +332,7 @@ def tracker_for(client):
     assessment = ctx["assessment"]
     tracks = [
         t for t in (
-            rule_0_core_case(ctx),
+            rule_0_care_management(ctx),
             rule_1_housing(ctx, client),
             rule_2_and_3_food(ctx),
         ) if t
