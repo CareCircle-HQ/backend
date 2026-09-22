@@ -35925,3 +35925,115 @@ class OutOfServiceAreaNotDispatchedTest(TestCase):
         self.assertIn(
             "33314", dispatch_svc.not_dispatchable_reason(self.order),
         )
+
+
+class AssessmentAddressEditTest(TestCase):
+    """Correcting a dwelling address from the Details tab, and what it unblocks."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Client, DispatchKind, DispatchOrder, DispatchStatus,
+            ServiceZipCode, Vendor,
+        )
+
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
+        agent = Agent.objects.create(
+            name="Addr Agent", agent_code="789", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Addr", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Addr Co"),
+            status=DispatchStatus.PENDING_SCHEDULE,
+            address_line1="7840 Southwest 30th Street", address_city="Davie",
+            address_state="FL", address_zip="33314",
+            address_formatted="7840 Southwest 30th Street, Davie, FL 33314",
+            # A phone and a referral type, because the PATCH validates the RESULTING
+            # ORDER rather than the payload -- "an edit must not leave an order in a
+            # state the wizard would have refused to create". A fixture without them
+            # is an order the wizard could never have made, and it fails for that
+            # reason rather than anything to do with the address.
+            contact_phone="(718) 555-0142", contact_phone_type="mobile",
+            referral_type="combined",
+        )
+
+    def _orders(self):
+        resp = self.api.get(
+            f"/api/portal/members/{self.member.pk}/dispatch-orders/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def _patch(self, body):
+        return self.api.patch(
+            f"/api/portal/members/{self.member.pk}/assessment-order/{self.order.pk}/",
+            body, format="json",
+        )
+
+    def test_the_payload_carries_the_address_in_PARTS(self):
+        """service_address is a display string; you cannot put it back into an
+        autocomplete field and get the same components out."""
+        address = self._orders()[0]["address"]
+        self.assertEqual(address["street"], "7840 Southwest 30th Street")
+        self.assertEqual(address["city"], "Davie")
+        self.assertEqual(address["zip"], "33314")
+
+    def test_correcting_the_address_CLEARS_the_withheld_reason(self):
+        self.assertIn("33314", self._orders()[0]["withheld_reason"])
+
+        resp = self._patch({
+            "address_line1": "1234 East 80th Street", "address_city": "Brooklyn",
+            "address_state": "NY", "address_zip": "11236",
+            "address_formatted": "1234 East 80th Street, Brooklyn, NY 11236",
+        })
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(self._orders()[0]["withheld_reason"], "")
+
+    def test_the_FORMATTED_address_is_updated_too(self):
+        """It is what the vendor app and the PDFs display, so a corrected address
+        that left it stale would show the OLD one everywhere it matters."""
+        self._patch({
+            "address_line1": "1234 East 80th Street", "address_city": "Brooklyn",
+            "address_state": "NY", "address_zip": "11236",
+            "address_formatted": "1234 East 80th Street, Brooklyn, NY 11236",
+        })
+        self.assertEqual(
+            self._orders()[0]["service_address"],
+            "1234 East 80th Street, Brooklyn, NY 11236",
+        )
+
+    def test_the_change_is_reported_field_by_field(self):
+        resp = self._patch({"address_zip": "11236"})
+        self.assertEqual(resp.data["changed_fields"], ["address_zip"])
+
+    def test_a_no_op_patch_reports_NOTHING_changed(self):
+        """The editor stays open saying so, rather than closing as though it had
+        saved -- which is how an edit came to look successful while leaving no
+        history."""
+        resp = self._patch({"address_zip": "33314"})
+        self.assertEqual(resp.data["changed_fields"], [])
+
+    def test_the_address_is_NOT_editable_once_confirmed(self):
+        """The details have been acted on by then -- a vendor may already be on the
+        way to the old address."""
+        from .models import DispatchStatus
+
+        self.order.status = DispatchStatus.CONFIRMED
+        self.order.save(update_fields=["status"])
+        resp = self._patch({"address_zip": "11236"})
+        self.assertEqual(resp.status_code, 409)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.address_zip, "33314")

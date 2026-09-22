@@ -141,6 +141,17 @@ def _serialize_order(order):
         ],
         "service_address": order.service_address,
         "address_notes": order.address_notes,
+        # The address in PARTS as well as formatted, so the Details tab can EDIT it.
+        # service_address is a display string; you cannot put it back into an
+        # autocomplete field and get the same components out.
+        "address": {
+            "street": order.address_line1,
+            "unit": order.address_line2,
+            "city": order.address_city,
+            "state": order.address_state,
+            "zip": order.address_zip,
+            "notes": order.address_notes,
+        },
         "contact_phone": order.contact_phone,
         "contact_phone_type": order.contact_phone_type,
         "contact_email": order.contact_email,
