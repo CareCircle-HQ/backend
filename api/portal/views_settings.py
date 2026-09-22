@@ -374,7 +374,7 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
     from the name on save. Full list (no pagination for client-side search) with
     optional ``?search=`` (program name), ``?category=`` (case_category),
     ``?case_type=food|transportation``, ``?service_type=<code>|none`` and
-    ``?parent_program=meals|boxes|none``.
+    ``?parent_program=meals|boxes|none`` and ``?is_active=true|false``.
     """
 
     permission_classes = [IsPortalAgent]
@@ -409,6 +409,14 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
             qs = qs.filter(parent_program="")
         elif parent in ProductTypeKind.values:
             qs = qs.filter(parent_program=parent)
+        # Active: the programmes we offer. NOT applied by default -- 209 of the 324
+        # are inactive, and silently hiding two thirds of the table would leave an
+        # agent unable to find a programme they know exists.
+        active = (params.get("is_active") or "").strip().lower()
+        if active in ("1", "true", "yes"):
+            qs = qs.filter(is_active=True)
+        elif active in ("0", "false", "no"):
+            qs = qs.filter(is_active=False)
         return qs
 
     def list(self, request, *args, **kwargs):

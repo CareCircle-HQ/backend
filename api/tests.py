@@ -35072,3 +35072,122 @@ class ProgramParentProgramTest(TestCase):
         # An external programme gets no parent product: it is another provider's,
         # and we deliver nothing for it.
         self.assertEqual(external.parent_program, "")
+
+
+class ProgramIsActiveTest(TestCase):
+    """The active flag on a programme: is this one of ours to offer?"""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import ActiveProgram, Agent
+
+        agent = Agent.objects.create(
+            name="Active Agent", agent_code="786", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        self.internal = ActiveProgram.objects.create(
+            program_name="Internal Test", case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD, is_active=True,
+        )
+        self.external = ActiveProgram.objects.create(
+            program_name="External Test", case_category="External Services",
+            case_type=ActiveProgram.CaseType.FOOD, is_active=False,
+        )
+
+    def _names(self, query=""):
+        resp = self.api.get(f"/api/portal/settings/programs/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {r["program_name"] for r in resp.data["results"]}
+
+    def test_a_new_programme_is_ACTIVE_by_default(self):
+        """Somebody adding a programme by hand intends to use it."""
+        from .models import ActiveProgram
+
+        program = ActiveProgram.objects.create(program_name="Brand New")
+        self.assertTrue(program.is_active)
+
+    def test_BOTH_are_listed_when_the_filter_is_off(self):
+        """209 of 324 are inactive. Hiding two thirds of the table by default would
+        leave an agent unable to find a programme they know exists."""
+        names = self._names()
+        self.assertIn(self.internal.program_name, names)
+        self.assertIn(self.external.program_name, names)
+
+    def test_filtering_to_ACTIVE(self):
+        names = self._names("?is_active=true")
+        self.assertIn(self.internal.program_name, names)
+        self.assertNotIn(self.external.program_name, names)
+
+    def test_filtering_to_INACTIVE(self):
+        names = self._names("?is_active=false")
+        self.assertIn(self.external.program_name, names)
+        self.assertNotIn(self.internal.program_name, names)
+
+    def test_it_combines_with_the_other_filters(self):
+        names = self._names("?is_active=true&case_type=food")
+        self.assertIn(self.internal.program_name, names)
+        self.assertNotIn(self.external.program_name, names)
+
+    def test_an_unknown_value_is_ignored(self):
+        self.assertEqual(self._names("?is_active=maybe"), self._names())
+
+    def test_an_agent_can_toggle_it(self):
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.external.id}/",
+            {"is_active": True}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.external.refresh_from_db()
+        self.assertTrue(self.external.is_active)
+
+    def test_INACTIVE_DOES_NOT_MEAN_UNUSED(self):
+        """The flag is a classification, not a usage statistic. External Services
+        took 144 cases in the last six months and SCREENING 357, and both are
+        inactive -- so nothing may use this flag to decide whether a case is real.
+
+        Asserted as a property of the data model: an inactive programme's cases are
+        still there and still found.
+        """
+        from .models import Case, CaseStatus, CaseType, Client
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Live", last_name="Case",
+            client_added_at=timezone.now(),
+        )
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=member, case_type=CaseType.EXTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED,
+            program_name=self.external.program_name,
+            case_created_at=timezone.now(),
+        )
+        self.assertFalse(self.external.is_active)
+        self.assertIn(case, Case.objects.filter(client=member))
+
+    def test_the_migration_rule_matches_case_INSENSITIVELY(self):
+        """The column holds "Internal Services", "ELIGIBILITY" and "Care
+        Management" -- three conventions at once -- so an exact match would miss a
+        row somebody retyped."""
+        from django.db.models import Q
+
+        from .models import ActiveProgram
+
+        ActiveProgram.objects.create(
+            program_name="Shouty", case_category="INTERNAL SERVICES",
+        )
+        ours = Q()
+        for category in ("internal services", "eligibility", "care management"):
+            ours |= Q(case_category__iexact=category)
+        self.assertIn(
+            "Shouty",
+            set(ActiveProgram.objects.filter(ours).values_list(
+                "program_name", flat=True,
+            )),
+        )

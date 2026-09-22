@@ -2155,6 +2155,9 @@ class PortalActiveProgramSerializer(serializers.ModelSerializer):
             # in the name distinguishes a meal programme from a box one.
             "parent_program",
             "parent_program_label",
+            # Whether this is a programme we offer. Editable: it is a judgement,
+            # and Unite Us keeps sending us other providers' programmes.
+            "is_active",
             "is_for_household",
             "to_extend",
             "updated_at",

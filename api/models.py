@@ -3356,6 +3356,22 @@ class ActiveProgram(models.Model):
         default="", db_default="", db_index=True,
     )
 
+    # IS THIS A PROGRAMME WE ACTUALLY USE?
+    #
+    # The table holds every programme Unite Us knows about -- 324 of them, of which
+    # 162 are other providers'. That is a lot of noise in a dropdown when only
+    # about a third are ours, which is what this flag exists to cut.
+    #
+    # It is a CLASSIFICATION, not a usage statistic. An inactive programme can
+    # still have live cases: External Services took 144 in the last six months, and
+    # SCREENING 357. Inactive means "not one of ours to offer", never "nothing is
+    # happening here" -- so nothing should use this flag to decide whether a case
+    # is real.
+    #
+    # Defaults TRUE: a programme somebody adds by hand is one they intend to use.
+    # Migration 0293 sets it False for the categories outside our three.
+    is_active = models.BooleanField(default=True, db_default=True, db_index=True)
+
     # Opt-in flag (managed from Settings > Programs): this program should be
     # treated as an extension/reauthorization of an existing service. Seeded True
     # for internal-service "Reauthorization: ..." programs by data migration.
