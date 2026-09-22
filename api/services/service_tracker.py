@@ -203,11 +203,24 @@ def rule_1_housing(ctx, client):
         return None
 
     dwelling = _find_case(ctx["live_cases"], "Environmental Exposure Assessment")
+
+    # WHERE THE ASSESSMENT ACTUALLY IS. The Unite Us CASE existing is what Rule 1a
+    # asks for, but it is not what an agent wants to know -- the work happens on our
+    # DISPATCH ORDER, and "the case exists" says nothing about whether a vendor has
+    # been, or can even be sent.
+    #
+    # Out of range OUTRANKS the case: an order we are withholding cannot progress
+    # however many cases exist, and that is the one state with an action attached.
+    from . import dispatch as dispatch_svc
+
+    order = dispatch_svc.assessment_order_for(client)
+    state, detail = _assessment_progress(order, dwelling, dispatch_svc)
     items = [_item(
         "Environmental Exposure Assessment",
         dwelling is not None,
         case=dwelling,
-        detail="The dwelling case",
+        state=state,
+        detail=detail,
     )]
 
     # Rule 1b: only once the assessment is actually submitted. Listing
@@ -372,3 +385,46 @@ def tracker_for(client):
         },
         "tracks": tracks,
     }
+
+
+def _assessment_progress(order, dwelling_case, dispatch_svc):
+    """``(state, detail)`` for the dwelling-assessment row.
+
+    Reports the ORDER's progress rather than only whether a case exists, because
+    "Pending Schedule" and "the vendor has been and submitted" are the same thing to
+    a rule that only checks for a case.
+    """
+    from ..models import DispatchStatus
+
+    if order is None:
+        return (None, "No assessment order raised yet")
+
+    # Checked FIRST: a withheld order cannot move, whatever its status says, and it
+    # is the only one of these an agent can fix. Same helper the vendor API uses, so
+    # the tracker cannot claim an order was sent when it was not.
+    withheld = dispatch_svc.not_dispatchable_reason(order)
+    if withheld:
+        return ("blocked", f"Out of range — {withheld}")
+
+    if order.status == DispatchStatus.CANCELLED:
+        return ("blocked", "The assessment order was cancelled")
+
+    # A visit that is booked is waiting on someone else, not on us.
+    if order.status == DispatchStatus.PENDING_SCHEDULE:
+        return ("waiting", "Sent to the vendor — awaiting scheduling")
+    if order.status == DispatchStatus.CONFIRMED:
+        visit = next(
+            (v for v in order.visits.all() if v.scheduled_for), None,
+        )
+        when = f" for {visit.scheduled_for:%d %b}" if visit else ""
+        return ("waiting", f"Visit confirmed{when}")
+    if order.status == DispatchStatus.PENDING_SUBMISSION:
+        return ("waiting", "Visited — awaiting the vendor's submission")
+
+    # SUBMITTED / UPLOADED: the vendor's work is done. The row's done/to-do still
+    # comes from the CASE, because that is what Rule 1a requires -- so a submitted
+    # assessment with no case reads as outstanding, which it is.
+    label = order.get_status_display()
+    if dwelling_case is None:
+        return (None, f"Assessment {label.lower()} — the case still needs opening")
+    return (None, f"Assessment {label.lower()}")

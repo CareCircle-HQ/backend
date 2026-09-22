@@ -35596,6 +35596,100 @@ class ServiceTrackerTest(TestCase):
         self.assertEqual(track["items"][0]["label"], "Environmental Exposure Assessment")
         self.assertEqual(track["items"][0]["state"], "todo")
 
+    # ── the dwelling assessment's PROGRESS ──────────────────────────────────
+    def _order(self, **kw):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus, Vendor
+
+        return DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name=f"V{uuid.uuid4().hex[:6]}"),
+            status=kw.pop("status", DispatchStatus.PENDING_SCHEDULE), **kw,
+        )
+
+    def _housing_row(self):
+        return self._track("housing")["items"][0]
+
+    def _housing_setup(self):
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+
+    def test_with_NO_ORDER_the_row_says_so(self):
+        """"To-do" alone would not distinguish "nobody raised the order" from
+        "the vendor has not been yet"."""
+        self._housing_setup()
+        self.assertIn("No assessment order", self._housing_row()["detail"])
+
+    def test_an_OUT_OF_RANGE_order_reads_as_blocked(self):
+        """And it outranks everything else: a withheld order cannot progress
+        whatever its status says, and it is the one state an agent can fix."""
+        from .models import ServiceZipCode
+
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
+        self._housing_setup()
+        self._order(address_zip="33314")
+        row = self._housing_row()
+        self.assertEqual(row["state"], "blocked")
+        self.assertIn("Out of range", row["detail"])
+        self.assertIn("33314", row["detail"])
+
+    def test_PENDING_SCHEDULE_is_waiting_on_the_vendor(self):
+        self._housing_setup()
+        self._order(address_zip="11236")
+        row = self._housing_row()
+        self.assertEqual(row["state"], "waiting")
+        self.assertIn("awaiting scheduling", row["detail"])
+
+    def test_CONFIRMED_shows_the_visit_date(self):
+        from datetime import timedelta
+
+        from .models import DispatchStatus, DispatchVisit
+
+        self._housing_setup()
+        order = self._order(address_zip="11236", status=DispatchStatus.CONFIRMED)
+        DispatchVisit.objects.create(
+            dispatch_order=order,
+            scheduled_for=timezone.now() + timedelta(days=3),
+        )
+        row = self._housing_row()
+        self.assertEqual(row["state"], "waiting")
+        self.assertIn("Visit confirmed for", row["detail"])
+
+    def test_PENDING_SUBMISSION_says_the_vendor_has_been(self):
+        from .models import DispatchStatus
+
+        self._housing_setup()
+        self._order(address_zip="11236", status=DispatchStatus.PENDING_SUBMISSION)
+        self.assertIn("awaiting the vendor's submission", self._housing_row()["detail"])
+
+    def test_a_CANCELLED_order_reads_as_blocked(self):
+        from .models import DispatchStatus
+
+        self._housing_setup()
+        self._order(address_zip="11236", status=DispatchStatus.CANCELLED)
+        self.assertEqual(self._housing_row()["state"], "blocked")
+
+    def test_a_SUBMITTED_assessment_with_no_CASE_is_still_outstanding(self):
+        """Rule 1a asks for the Unite Us case, and the vendor's work being finished
+        does not open it. The detail says which half is missing."""
+        from .models import DispatchStatus
+
+        self._housing_setup()
+        self._order(address_zip="11236", status=DispatchStatus.SUBMITTED)
+        row = self._housing_row()
+        self.assertEqual(row["state"], "todo")
+        self.assertIn("the case still needs opening", row["detail"])
+
+    def test_the_progress_uses_the_SAME_rule_the_vendor_api_does(self):
+        """Otherwise the tracker could claim an order was sent while the vendor API
+        was withholding it -- two opinions about one fact."""
+        import inspect
+
+        from .services import service_tracker
+
+        self.assertIn(
+            "not_dispatchable_reason", inspect.getsource(service_tracker),
+        )
+
     def test_rule_1_does_not_fire_when_housing_was_never_screened(self):
         self._screen(["Clinically Appropriate Meals (Food)"])
         self._assess([self.ECM])
