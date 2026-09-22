@@ -248,7 +248,9 @@ def rule_1_housing(ctx, client):
         except Exception:  # noqa: BLE001 - the track must still render
             logger.warning("service_tracker: recommendations failed for %s", client.pk)
 
-    if dwelling is None:
+    # No order means nothing to wait FOR -- "awaiting the vendor's assessment" beside
+    # an assessment nobody has ordered points at the wrong party.
+    if dwelling is None or order is None:
         pass
     elif not submitted:
         items.append(_item(
@@ -397,7 +399,16 @@ def _assessment_progress(order, dwelling_case, dispatch_svc):
     from ..models import DispatchStatus
 
     if order is None:
-        return (None, "No assessment order raised yet")
+        # NOT "done", even when the Unite Us case exists. Rule 1a asks for the case
+        # and the case may well be open -- but nobody has raised the work order, so
+        # no vendor is going, and a green tick beside "no assessment order raised
+        # yet" is a contradiction an agent would have to reason past.
+        #
+        # Both facts are stated, because they are genuinely different: the case being
+        # open is progress, and the missing order is the next action.
+        if dwelling_case is not None:
+            return ("todo", "Case open — no assessment order raised yet")
+        return ("todo", "No assessment order raised yet")
 
     # Checked FIRST: a withheld order cannot move, whatever its status says, and it
     # is the only one of these an agent can fix. Same helper the vendor API uses, so

@@ -35619,6 +35619,26 @@ class ServiceTrackerTest(TestCase):
         self._housing_setup()
         self.assertIn("No assessment order", self._housing_row()["detail"])
 
+    def test_an_OPEN_CASE_with_no_order_is_still_TO_DO(self):
+        """Found by deleting a real order: the row read "done" beside "no assessment
+        order raised yet", because Rule 1a is satisfied by the CASE while the work
+        order is what sends a vendor. A green tick next to "nothing raised" is a
+        contradiction an agent has to reason past."""
+        self._housing_setup()
+        self._case("Environmental Exposure Assessment")
+        row = self._housing_row()
+        self.assertEqual(row["state"], "todo")
+        self.assertIn("Case open", row["detail"])
+        self.assertIn("no assessment order raised", row["detail"])
+
+    def test_with_no_order_there_is_no_RECOMMENDATIONS_row(self):
+        """"Awaiting the vendor's assessment" beside an assessment nobody has
+        ordered points at the wrong party."""
+        self._housing_setup()
+        self._case("Environmental Exposure Assessment")
+        labels = [i["label"] for i in self._track("housing")["items"]]
+        self.assertNotIn("Recommended cases", labels)
+
     def test_an_OUT_OF_RANGE_order_reads_as_blocked(self):
         """And it outranks everything else: a withheld order cannot progress
         whatever its status says, and it is the one state an agent can fix."""
@@ -35695,18 +35715,30 @@ class ServiceTrackerTest(TestCase):
         self._assess([self.ECM])
         self.assertIsNone(self._track("housing"))
 
-    def test_the_dwelling_case_marks_rule_1a_done(self):
+    def test_rule_1a_is_done_when_the_case_AND_a_finished_order_exist(self):
+        """The case alone is no longer enough, and that is the point: Rule 1a asks
+        for the case, but a case with no work order means no vendor is going. Done
+        needs both -- the case open and the assessment actually carried out."""
+        from .models import DispatchStatus, ServiceZipCode
+
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
         self._screen(["Asthma Remediation (Housing)"])
         self._assess([self.ECM])
         self._case("Environmental Exposure Assessment")
+        self._order(address_zip="11236", status=DispatchStatus.SUBMITTED)
         self.assertEqual(self._track("housing")["items"][0]["state"], "done")
 
     def test_recommendations_WAIT_until_the_assessment_is_submitted(self):
         """Listing them earlier would ask an agent to open cases for work nobody
-        has assessed."""
+        has assessed. Needs an ORDER as well as a case: with no order there is
+        nothing to wait for, and the row is absent instead."""
+        from .models import ServiceZipCode
+
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
         self._screen(["Asthma Remediation (Housing)"])
         self._assess([self.ECM])
         self._case("Environmental Exposure Assessment")
+        self._order(address_zip="11236")
         states = [i["state"] for i in self._track("housing")["items"]]
         self.assertIn("waiting", states)
 
