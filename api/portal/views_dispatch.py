@@ -1122,3 +1122,21 @@ def _photo_group_labels(form):
         for group in section["groups"]:
             out[group["code"]] = group.get("label") or section["title"]
     return out
+
+
+class MemberServiceTrackerView(PortalAPIView):
+    """GET: what has been done for this member and what still needs doing.
+
+    A read-only view of the business rules -- see services/service_tracker.py.
+    Nothing here opens a case: a To-Do names the programme and the agent opens it
+    in Unite Us, exactly as the Cases to Open tab works.
+    """
+
+    def get(self, request, client_id):
+        from ..services.service_tracker import tracker_for
+
+        client = get_object_or_404(
+            Client.objects.prefetch_related("screenings", "assessments", "cases"),
+            pk=client_id,
+        )
+        return Response(tracker_for(client))

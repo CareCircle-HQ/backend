@@ -35426,3 +35426,241 @@ class TagVoucherCasesCommandTest(TestCase):
         self.assertFalse(
             any(n.startswith("Reauthorization") for n in PROGRAM_NAMES),
         )
+
+
+class ServiceTrackerTest(TestCase):
+    """The business rules behind the member Overview tracker.
+
+    Each rule gets a test for firing, a test for NOT firing, and a test for the
+    thing that makes it done -- because "the rule ran" and "the rule ran correctly"
+    are different claims.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+
+    def setUp(self):
+        from .models import Client
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Track", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _screen(self, services, *, when=None):
+        from .models import Screening
+
+        return Screening.objects.create(
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=services,
+            screen_created_at=when or timezone.now(),
+        )
+
+    def _assess(self, services, *, when=None):
+        from .models import Assessment
+
+        return Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=services,
+            screen_created_at=when or timezone.now(),
+        )
+
+    def _case(self, service_type, *, case_type="internal_service", status="managed",
+              program=""):
+        from .models import Case
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member, case_type=case_type,
+            case_status=status, service_type=service_type,
+            program_name=program, case_created_at=timezone.now(),
+        )
+
+    def _tracker(self):
+        from .services.service_tracker import tracker_for
+
+        return tracker_for(self.member)
+
+    def _track(self, code):
+        for track in self._tracker()["tracks"]:
+            if track["code"] == code:
+                return track
+        return None
+
+    # ── the domain derivation, which everything else rests on ───────────────
+    def test_a_domain_comes_from_the_service_NAME(self):
+        """Screening records store full service names, not domain words -- so
+        "screened for Housing" has to be derived."""
+        from .services.service_tracker import domain_of
+
+        self.assertEqual(domain_of("Asthma Remediation (Housing)"), "Housing")
+        self.assertEqual(domain_of("Clinically Appropriate Meals (Food)"), "Food")
+
+    def test_an_UNSUFFIXED_service_still_resolves(self):
+        """Two of the 25 screening values carry no suffix at all."""
+        from .services.service_tracker import domain_of
+
+        self.assertEqual(domain_of("Pre-tenancy Services"), "Housing")
+        self.assertEqual(domain_of("Cooking Supplies"), "Food")
+
+    # ── rule 0 ──────────────────────────────────────────────────────────────
+    def test_rule_0_requires_an_ELIGIBILITY_case_not_a_navigation_one(self):
+        """132,777 cases carry this service type but only 24,697 are case_type
+        eligibility; the other 108,080 are navigation and must not count."""
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self._case("Social Service Case Management", case_type="navigation")
+        self.assertEqual(self._track("core")["items"][0]["state"], "todo")
+
+        self._case("Social Service Case Management", case_type="eligibility")
+        self.assertEqual(self._track("core")["items"][0]["state"], "done")
+
+    def test_rule_0_does_not_fire_without_ECM(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess(["Clinically Appropriate Meals (Food)"])
+        self.assertIsNone(self._track("core"))
+
+    # ── what counts as done ─────────────────────────────────────────────────
+    def test_a_CLOSED_case_does_not_count_as_done(self):
+        """The tracker reports outstanding work, and a closed case is not in force."""
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self._case(
+            "Social Service Case Management", case_type="eligibility",
+            status="closed",
+        )
+        self.assertEqual(self._track("core")["items"][0]["state"], "todo")
+
+    def test_a_DRAFT_case_does_not_count_either(self):
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self._case(
+            "Social Service Case Management", case_type="eligibility",
+            status="draft",
+        )
+        self.assertEqual(self._track("core")["items"][0]["state"], "todo")
+
+    def test_pending_authorization_DOES_count(self):
+        """It is a live case: the work has been done and is awaiting a decision."""
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self._case(
+            "Social Service Case Management", case_type="eligibility",
+            status="pending_authorization",
+        )
+        self.assertEqual(self._track("core")["items"][0]["state"], "done")
+
+    # ── rule 1 ──────────────────────────────────────────────────────────────
+    def test_rule_1_fires_on_screened_housing_plus_ECM_ALONE(self):
+        """No housing eligibility result is required -- those are what the dwelling
+        assessment goes on to recommend."""
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+        track = self._track("housing")
+        self.assertIsNotNone(track)
+        self.assertEqual(track["items"][0]["label"], "Environmental Exposure Assessment")
+        self.assertEqual(track["items"][0]["state"], "todo")
+
+    def test_rule_1_does_not_fire_when_housing_was_never_screened(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM])
+        self.assertIsNone(self._track("housing"))
+
+    def test_the_dwelling_case_marks_rule_1a_done(self):
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+        self._case("Environmental Exposure Assessment")
+        self.assertEqual(self._track("housing")["items"][0]["state"], "done")
+
+    def test_recommendations_WAIT_until_the_assessment_is_submitted(self):
+        """Listing them earlier would ask an agent to open cases for work nobody
+        has assessed."""
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+        self._case("Environmental Exposure Assessment")
+        states = [i["state"] for i in self._track("housing")["items"]]
+        self.assertIn("waiting", states)
+
+    # ── rules 2 and 3 ───────────────────────────────────────────────────────
+    def test_rule_2_needs_the_food_prescription_result(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        labels = [i["label"] for i in self._track("food")["items"]]
+        self.assertIn("Produce Prescription / Voucher", labels)
+
+    def test_rule_2_is_satisfied_by_a_produce_prescription_case(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._case("Produce Prescription/Voucher")
+        item = next(
+            i for i in self._track("food")["items"]
+            if i["label"] == "Produce Prescription / Voucher"
+        )
+        self.assertEqual(item["state"], "done")
+
+    def test_rule_3_treats_CAM_and_MTM_as_the_same_case(self):
+        """Unite Us has no Clinically Appropriate Meals case service type -- all
+        3,893 cases on a CAM programme are filed as Medically Tailored Meals."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Clinically Appropriate Meals (Food)"])
+        self._case("Medically Tailored Meals")
+        item = next(
+            i for i in self._track("food")["items"]
+            if i["label"].startswith("Medically Tailored")
+        )
+        self.assertEqual(item["state"], "done")
+
+    def test_BOTH_spellings_of_a_result_are_accepted(self):
+        """The bare form appears on a few dozen older records and means the same."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM)"])
+        self.assertTrue(any(
+            i["label"].startswith("Medically Tailored")
+            for i in self._track("food")["items"]
+        ))
+
+    def test_the_food_track_is_ABSENT_when_no_food_result_applies(self):
+        """Rather than an empty track: a member screened for food but assessed for
+        nothing food-related has no food work outstanding."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Asthma Remediation (Housing)"])
+        self.assertIsNone(self._track("food"))
+
+    # ── which record the rules read ─────────────────────────────────────────
+    def test_the_LATEST_screening_wins(self):
+        from datetime import timedelta
+
+        old = timezone.now() - timedelta(days=90)
+        self._screen(["Asthma Remediation (Housing)"], when=old)
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        self.assertIsNone(self._track("housing"))
+        self.assertIsNotNone(self._track("food"))
+
+    def test_a_SUPERSEDED_domain_is_reported_not_hidden(self):
+        """229 of 53,678 members have an older screening naming a domain the newest
+        does not. Silence would make the tracker look wrong to whoever remembers."""
+        from datetime import timedelta
+
+        self._screen(
+            ["Asthma Remediation (Housing)"],
+            when=timezone.now() - timedelta(days=90),
+        )
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM])
+        self.assertEqual(
+            self._tracker()["superseded"]["screening_domains"], ["Housing"],
+        )
+
+    def test_a_member_with_NOTHING_gets_no_tracks_and_no_error(self):
+        self.assertEqual(self._tracker()["tracks"], [])
+        self.assertFalse(self._tracker()["phase1"]["screening"]["done"])
+
+    def test_the_gateway_lists_only_the_domains_we_SERVE(self):
+        """We screen for four and act on two. The others are reported separately so
+        the list does not look incomplete."""
+        self._screen([
+            "Clinically Appropriate Meals (Food)",
+            "Private Transportation (must also have at least one other HRSN need) (Transportation)",
+        ])
+        phase1 = self._tracker()["phase1"]["screening"]
+        self.assertEqual(phase1["domains"], ["Food"])
+        self.assertEqual(phase1["other_domains"], ["Transportation"])
