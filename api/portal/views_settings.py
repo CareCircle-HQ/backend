@@ -26,7 +26,7 @@ from ..models import (
     MenuTypeTag,
     ProductType,
     ProgramMainCategory,
-    ProductTypeKind,
+    ProgramParentKind,
 )
 from .base import PortalAPIView, current_agent
 
@@ -411,7 +411,7 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
         parent = (params.get("parent_program") or "").strip().lower()
         if parent == "none":
             qs = qs.filter(parent_program="")
-        elif parent in ProductTypeKind.values:
+        elif parent in ProgramParentKind.values:
             qs = qs.filter(parent_program=parent)
         # Active: the programmes we offer. NOT applied by default -- 209 of the 324
         # are inactive, and silently hiding two thirds of the table would leave an

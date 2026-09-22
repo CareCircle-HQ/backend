@@ -34941,13 +34941,69 @@ class ProgramParentProgramTest(TestCase):
             "Food Prescriptions (Voucher / Boxes)",
         )
 
-    def test_parent_program_reuses_the_existing_product_enum(self):
-        """Rather than a parallel vocabulary -- two enums meaning the same thing is
-        how they end up disagreeing."""
-        from .models import ActiveProgram, ProductTypeKind
+    def test_parent_program_has_its_OWN_enum_not_the_product_one(self):
+        """It reused ProductTypeKind while the only answers were meals and boxes.
+        Home Remediation broke that: ProductTypeKind drives FOOD DELIVERY -- reports,
+        the logistics dashboard and order handling all branch on
+        ``== ProductTypeKind.BOXES`` -- so a housing value there would leak into
+        code that packs and delivers food."""
+        from .models import ActiveProgram, ProductTypeKind, ProgramParentKind
 
         field = ActiveProgram._meta.get_field("parent_program")
-        self.assertEqual(list(field.choices), list(ProductTypeKind.choices))
+        self.assertEqual(list(field.choices), list(ProgramParentKind.choices))
+        self.assertNotIn("home_remediation", ProductTypeKind.values)
+
+    def test_the_shared_values_are_IDENTICAL_between_the_two_enums(self):
+        """Deliberately: existing rows needed no data migration, and anything
+        comparing the two strings still agrees."""
+        from .models import ProductTypeKind, ProgramParentKind
+
+        self.assertEqual(ProgramParentKind.MEALS, ProductTypeKind.MEALS)
+        self.assertEqual(ProgramParentKind.BOXES, ProductTypeKind.BOXES)
+
+    def test_HOME_REMEDIATION_is_a_valid_parent(self):
+        from .models import ActiveProgram
+
+        program = ActiveProgram.objects.create(
+            program_name="Home Remediation - Heater - Queens",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            parent_program="home_remediation",
+        )
+        program.full_clean()
+        resp = self.api.get(f"/api/portal/settings/programs/{program.id}/")
+        self.assertEqual(resp.data["parent_program_label"], "Home Remediation")
+
+    def test_filtering_by_HOME_REMEDIATION(self):
+        from .models import ActiveProgram
+
+        ActiveProgram.objects.create(
+            program_name="Home Remediation - Heater - Queens",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            parent_program="home_remediation",
+        )
+        names = self._filter("?parent_program=home_remediation")
+        self.assertIn("Home Remediation - Heater - Queens", names)
+        self.assertNotIn(self.mtm.program_name, names)
+
+    def test_the_migration_needs_MORE_than_the_name_prefix(self):
+        """"Home Remediation Assistance: Mold and Pest" and similar exist as
+        EXTERNAL services, so a name prefix alone would eventually sweep one in.
+        Mirrors migration 0296's three conditions."""
+        from .models import ActiveProgram
+
+        external = ActiveProgram.objects.create(
+            program_name="Home Remediation Assistance: Mold and Pest - Brooklyn",
+            case_category="External Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+        )
+        matched = ActiveProgram.objects.filter(
+            case_category__icontains="internal",
+            case_type="housing",
+            program_name__istartswith="Home Remediation",
+        )
+        self.assertNotIn(external, matched)
 
     def test_BLANK_is_allowed_and_is_the_default(self):
         """Navigation, case management, housing and every external programme have

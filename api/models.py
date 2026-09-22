@@ -1037,6 +1037,25 @@ class ProductTypeKind(models.TextChoices):
     BOXES = "boxes", "Boxes"
 
 
+class ProgramParentKind(models.TextChoices):
+    """The parent program a service belongs to -- what it ultimately delivers.
+
+    SEPARATE FROM ProductTypeKind, which this field originally reused. That was
+    right while the only answers were meals and boxes, but ProductTypeKind drives
+    FOOD DELIVERY: reports, the logistics dashboard and order handling all branch
+    on ``== ProductTypeKind.BOXES``. Adding "Home Remediation" there would push a
+    housing concept into code that packs and delivers food.
+
+    The meals and boxes VALUES are deliberately identical to ProductTypeKind's, so
+    existing rows needed no data migration and anything comparing the two strings
+    still agrees.
+    """
+
+    MEALS = "meals", "Meals"
+    BOXES = "boxes", "Boxes"
+    HOME_REMEDIATION = "home_remediation", "Home Remediation"
+
+
 class DeliveryCadence(models.TextChoices):
     """How often a product type is delivered each week."""
 
@@ -3337,10 +3356,9 @@ class ActiveProgram(models.Model):
         default="", db_default="",
     )
 
-    # THE PARENT PROGRAM: which product this service ultimately delivers, meals or
-    # boxes. Reuses ProductTypeKind rather than inventing a parallel vocabulary --
-    # it is already "the kind of product an Internal Service program delivers", and
-    # two enums meaning the same thing is how they end up disagreeing.
+    # THE PARENT PROGRAM: what this service ultimately delivers -- meals, boxes or
+    # home remediation. See ProgramParentKind for why this is NOT ProductTypeKind,
+    # which it originally reused.
     #
     # It exists so a programme can be matched to the eligibility assessment's
     # result: the assessment says a member is eligible for Medically Tailored Meals
@@ -3351,8 +3369,11 @@ class ActiveProgram(models.Model):
     # carry a value: navigation, case management, housing and every external
     # programme have no parent product, and guessing one would file a housing
     # assessment under "meals".
+    # 32, not 16: "home_remediation" is exactly 16 and Django refuses a
+    # max_length that cannot hold its own longest choice. Headroom so the next
+    # parent program does not need a schema migration.
     parent_program = models.CharField(
-        max_length=16, choices=ProductTypeKind.choices, blank=True,
+        max_length=32, choices=ProgramParentKind.choices, blank=True,
         default="", db_default="", db_index=True,
     )
 
