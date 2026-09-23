@@ -390,45 +390,64 @@ def rule_1_housing(ctx, client):
 
 
 def rule_2_and_3_food(ctx):
-    """Screened for Food + ECM -> a voucher case and/or a meals case.
+    """Screened for Food + ECM -> a FOOD CASE. Meals or boxes; either satisfies it.
 
-    One track, two rules: they share a trigger and an agent thinks of them as
-    "the food side".
+    ⚠ REBUILT. This used to expect a SPECIFIC service -- a voucher case when the
+    assessment named Food Prescriptions, a meals case when it named MTM or CAM --
+    and flagged the other as the wrong case. The authorisation data says that is
+    simply not how the programme works:
+
+        meals-eligible, holding a BOX case      219    218 approved
+        boxes-eligible, holding a MEALS case    103    102 approved
+        NO food eligibility, holding either     217    212 approved
+
+    320 of 322 "wrong service" cases are APPROVED BY THE PAYER, and so are 212 of
+    the 217 whose assessment names no food service at all. Nor is it a timing
+    artefact: 198 of those cases were opened AFTER the assessment that supposedly
+    forbids them.
+
+    So the assessment's service list does not gate which food case may be opened.
+    A food-eligible member may hold meals or boxes, and may move between them --
+    106 of the 219 had a meals case at some point, though 113 never did and 25 hold
+    both at once, so "they switch" only describes part of it.
+
+    What the tracker can honestly say is whether a food case EXISTS.
     """
     if "Food" not in ctx["screened_domains"] or not ctx["ecm"]:
         return None
 
     eligible = set(ctx["eligible"])
-    items = []
-
-    if eligible & set(FOOD_PRESCRIPTION):
-        case = _find_case(ctx["live_cases"], "Produce Prescription/Voucher")
-        items.append({
-            **_item(
-                "Produce Prescription / Voucher", case is not None, case=case,
-                home_borough=ctx["home_borough"],
-            ),
-            "rule": "Rule 2",
-        })
-        items += _scheduled_reauth_rows(ctx, "Produce Prescription/Voucher")
-
-    if eligible & set(MEALS):
-        case = _find_case(ctx["live_cases"], "Medically Tailored Meals")
-        items.append({
-            # Said explicitly because it looks wrong otherwise: a member eligible
-            # for Clinically Appropriate Meals gets an MTM case, since Unite Us has
-            # no CAM case service type.
-            **_item(
-                "Medically Tailored Meals (MTM)", case is not None, case=case,
-                detail="Covers Clinically Appropriate Meals too",
-                home_borough=ctx["home_borough"],
-            ),
-            "rule": "Rule 3",
-        })
-        items += _scheduled_reauth_rows(ctx, "Medically Tailored Meals")
-
-    if not items:
+    if not (eligible & (set(MEALS) | set(FOOD_PRESCRIPTION))):
+        # No food service named at all. The track is absent rather than showing a
+        # to-do: 116 such members hold an APPROVED food case, so demanding one would
+        # be inventing a requirement the programme does not have.
         return None
+
+    meals = _find_case(ctx["live_cases"], "Medically Tailored Meals")
+    boxes = _find_case(ctx["live_cases"], "Produce Prescription/Voucher")
+    case = meals or boxes
+
+    # Which one they actually have, because "a food case" is the rule but an agent
+    # still wants to know whether it is meals or boxes.
+    if meals and boxes:
+        detail = "Meals and voucher cases are both open"
+    elif meals:
+        detail = "Medically Tailored Meals"
+    elif boxes:
+        detail = "Produce Prescription / Voucher"
+    else:
+        detail = "Meals or voucher — either satisfies this"
+
+    items = [{
+        **_item(
+            "Food service case", case is not None, case=case, detail=detail,
+            home_borough=ctx["home_borough"],
+        ),
+        "rule": "Rules 2 & 3",
+    }]
+    items += _scheduled_reauth_rows(ctx, "Produce Prescription/Voucher")
+    items += _scheduled_reauth_rows(ctx, "Medically Tailored Meals")
+
     return {
         "code": "food",
         "label": "Food Program",
@@ -627,38 +646,20 @@ def detect_alerts(ctx):
                 ))
         return alerts
 
-    # THE WRONG KIND OF FOOD CASE.
+    # ⚠ THE "WRONG KIND OF FOOD CASE" ALERTS WERE REMOVED, and deliberately so.
     #
-    # ⚠ BOTH may be allowed at once, and then NEITHER is wrong -- which is the whole
-    # reason this compares against what the assessment permits rather than against a
-    # single expected answer. (No member in a 600-strong sample had both, so the
-    # tempting shortcut "one or the other" would have passed every test and been
-    # wrong the first time it mattered.)
-    if "Food" in domains:
-        boxes_allowed = bool(eligible & set(FOOD_PRESCRIPTION))
-        meals_allowed = bool(eligible & set(MEALS))
-
-        meals_case = _find_case(ctx["live_cases"], "Medically Tailored Meals")
-        if meals_case is not None and not meals_allowed:
-            alerts.append(_alert(
-                "wrong_food_case_meals",
-                "Meals case open, but the assessment does not allow meals",
-                "The eligibility result permits "
-                + ("a produce prescription / voucher" if boxes_allowed
-                   else "no food service")
-                + ", so this case is on the wrong service.",
-                program=meals_case.program_name or "",
-            ))
-
-        boxes_case = _find_case(ctx["live_cases"], "Produce Prescription/Voucher")
-        if boxes_case is not None and not boxes_allowed:
-            alerts.append(_alert(
-                "wrong_food_case_boxes",
-                "Voucher case open, but the assessment does not allow vouchers",
-                "The eligibility result permits "
-                + ("medically tailored meals" if meals_allowed
-                   else "no food service")
-                + ", so this case is on the wrong service.",
-                program=boxes_case.program_name or "",
-            ))
+    # They fired when a member held a meals case with voucher eligibility, or the
+    # reverse. The authorisation data shows both are normal:
+    #
+    #     meals-eligible, holding a BOX case      219    218 approved
+    #     boxes-eligible, holding a MEALS case    103    102 approved
+    #
+    # 320 of 322 approved by the payer. An alert that calls 320 approved cases an
+    # error is not a check, it is noise -- and it would have been the loudest thing
+    # on the tracker.
+    #
+    # I built them from the eligibility strings without ever asking whether the
+    # payer agreed. Approval was one query away and it answers the question
+    # outright. Before adding another rule of this shape, check the authorisation
+    # status first.
     return alerts

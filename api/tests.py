@@ -35743,42 +35743,46 @@ class ServiceTrackerTest(TestCase):
         self.assertIn("waiting", states)
 
     # ── rules 2 and 3 ───────────────────────────────────────────────────────
-    def test_rule_2_needs_the_food_prescription_result(self):
+    def test_EITHER_food_case_satisfies_the_rule(self):
+        """⚠ REBUILT. The rule used to expect a SPECIFIC service and flagged the
+        other as wrong. The authorisation data says otherwise: of 322 members holding
+        the "wrong" food service, 320 are APPROVED by the payer."""
         self._screen(["Clinically Appropriate Meals (Food)"])
-        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
-        labels = [i["label"] for i in self._track("food")["items"]]
-        self.assertIn("Produce Prescription / Voucher", labels)
+        for eligibility, service in (
+            ("Food Prescriptions (Voucher / Boxes) (Food)", "Medically Tailored Meals"),
+            ("Medically Tailored Meals (MTM) (Food)", "Produce Prescription/Voucher"),
+            ("Clinically Appropriate Meals (Food)", "Produce Prescription/Voucher"),
+        ):
+            with self.subTest(eligibility=eligibility, service=service):
+                self.member.cases.all().delete()
+                self.member.assessments.all().delete()
+                self._assess([self.ECM, eligibility])
+                self._case(service)
+                row = self._track("food")["items"][0]
+                self.assertEqual(row["label"], "Food service case")
+                self.assertEqual(row["state"], "done")
 
-    def test_rule_2_is_satisfied_by_a_produce_prescription_case(self):
+    def test_the_row_names_WHICH_food_case_is_open(self):
+        """"A food case" is the rule, but an agent still wants to know which."""
         self._screen(["Clinically Appropriate Meals (Food)"])
-        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
         self._case("Produce Prescription/Voucher")
-        item = next(
-            i for i in self._track("food")["items"]
-            if i["label"] == "Produce Prescription / Voucher"
+        self.assertIn(
+            "Produce Prescription", self._track("food")["items"][0]["detail"],
         )
-        self.assertEqual(item["state"], "done")
 
-    def test_rule_3_treats_CAM_and_MTM_as_the_same_case(self):
-        """Unite Us has no Clinically Appropriate Meals case service type -- all
-        3,893 cases on a CAM programme are filed as Medically Tailored Meals."""
+    def test_NO_food_case_is_still_outstanding(self):
         self._screen(["Clinically Appropriate Meals (Food)"])
-        self._assess([self.ECM, "Clinically Appropriate Meals (Food)"])
-        self._case("Medically Tailored Meals")
-        item = next(
-            i for i in self._track("food")["items"]
-            if i["label"].startswith("Medically Tailored")
-        )
-        self.assertEqual(item["state"], "done")
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        row = self._track("food")["items"][0]
+        self.assertEqual(row["state"], "todo")
+        self.assertIn("either satisfies", row["detail"])
 
     def test_BOTH_spellings_of_a_result_are_accepted(self):
         """The bare form appears on a few dozen older records and means the same."""
         self._screen(["Clinically Appropriate Meals (Food)"])
         self._assess([self.ECM, "Medically Tailored Meals (MTM)"])
-        self.assertTrue(any(
-            i["label"].startswith("Medically Tailored")
-            for i in self._track("food")["items"]
-        ))
+        self.assertIsNotNone(self._track("food"))
 
     def test_the_food_track_is_ABSENT_when_no_food_result_applies(self):
         """Rather than an empty track: a member screened for food but assessed for
@@ -35838,7 +35842,7 @@ class ServiceTrackerTest(TestCase):
         self._serving()
         self._reauth()
         labels = self._food_labels()
-        self.assertEqual(labels[0], "Medically Tailored Meals (MTM)")
+        self.assertEqual(labels[0], "Food service case")
         self.assertEqual(labels[1], "Reauthorization scheduled")
 
     def test_it_is_WAITING_not_outstanding(self):
@@ -35859,13 +35863,15 @@ class ServiceTrackerTest(TestCase):
         self.assertTrue(detail.startswith("Starts "))
         self.assertNotEqual(detail, detail.lower())
 
-    def test_a_reauth_for_a_DIFFERENT_service_does_not_appear_here(self):
-        """A voucher reauthorization belongs under the voucher row, not the meals
-        one."""
+    def test_a_reauth_for_EITHER_food_service_appears(self):
+        """⚠ REVERSED by the rebuild, and correctly. There used to be a row per
+        service, so a voucher reauthorization under the meals row was wrong. There is
+        now ONE food row -- meals and boxes are interchangeable -- so a scheduled
+        reauthorization of either belongs in it."""
         self._food_setup()
-        self._serving()
+        self._serving(service_type="Produce Prescription/Voucher")
         self._reauth(service_type="Produce Prescription/Voucher")
-        self.assertNotIn("Reauthorization scheduled", self._food_labels())
+        self.assertIn("Reauthorization scheduled", self._food_labels())
 
     def test_a_CLOSED_reauth_case_never_appears(self):
         """It will never activate, so it is not scheduled."""
@@ -36633,71 +36639,42 @@ class ServiceTrackerAlertsTest(TestCase):
         self.assertNotIn("no_ecm_food", codes)
         self.assertNotIn("no_ecm_housing", codes)
 
-    # ── 4: the wrong kind of food case ──────────────────────────────────────
-    def test_4a_a_MEALS_case_when_only_vouchers_are_allowed(self):
-        self._screen([self.MTM])
-        self._assess([self.ECM, self.VOUCHER])
-        self._case(
-            "Medically Tailored Meals",
-            program="Medically Tailored Meals (MTM) - Other - Queens",
-        )
-        alert = self._alerts()["wrong_food_case_meals"]
-        self.assertEqual(alert["severity"], "error")
-        self.assertIn("produce prescription", alert["detail"])
-        # Names the case at fault: the difference between "something is wrong" and
-        # "this is the case to go and fix".
-        self.assertIn("Medically Tailored Meals (MTM) - Other", alert["program_name"])
+    # ── 4: the wrong kind of food case -- REMOVED ─────────────────────────
+    def test_a_food_case_on_EITHER_service_raises_NOTHING(self):
+        """⚠ THE ALERTS WERE REMOVED, and this asserts their absence.
 
-    def test_4b_a_VOUCHER_case_when_only_meals_are_allowed(self):
-        self._screen([self.MTM])
-        self._assess([self.ECM, self.MTM])
-        self._case(
-            "Produce Prescription/Voucher",
-            program="… Food Prescriptions: Voucher - Other - Queens",
-        )
-        alert = self._alerts()["wrong_food_case_boxes"]
-        self.assertIn("medically tailored meals", alert["detail"])
+        They fired when a member held a meals case with voucher eligibility, or the
+        reverse. The authorisation data says both are normal:
 
-    def test_when_BOTH_are_allowed_NEITHER_case_is_wrong(self):
-        """⚠ The reason this compares against what the assessment PERMITS rather than
-        a single expected answer. No member in a 600-strong sample had both, so the
-        shortcut "one or the other" would have passed every test and been wrong the
-        first time it mattered."""
-        self._screen([self.MTM])
-        self._assess([self.ECM, self.MTM, self.VOUCHER])
-        self._case("Medically Tailored Meals")
-        self._case("Produce Prescription/Voucher")
-        self.assertEqual(self._codes(), [])
+            meals-eligible, holding a BOX case      219    218 approved
+            boxes-eligible, holding a MEALS case    103    102 approved
+            NO food eligibility, holding either     217    212 approved
 
-    def test_the_RIGHT_case_raises_nothing(self):
-        self._screen([self.MTM])
-        self._assess([self.ECM, self.MTM])
-        self._case("Medically Tailored Meals")
-        self.assertEqual(self._codes(), [])
+        320 of 322 approved by the payer -- and 198 of the third group were opened
+        AFTER the assessment that supposedly forbids them, so it is not a timing
+        artefact either. An alert that calls 320 approved cases an error is noise.
 
-    def test_a_CLOSED_wrong_case_is_not_flagged(self):
-        """The alert is about what is in force. A closed case on the wrong service is
-        history, and nobody can act on it."""
-        from .models import Case, CaseType
+        I built them from the eligibility strings without asking whether the payer
+        agreed. That was one query away.
+        """
+        for eligibility, service in (
+            (self.VOUCHER, "Medically Tailored Meals"),
+            (self.MTM, "Produce Prescription/Voucher"),
+        ):
+            with self.subTest(eligibility=eligibility, service=service):
+                self.member.cases.all().delete()
+                self.member.assessments.all().delete()
+                self._screen([self.MTM])
+                self._assess([self.ECM, eligibility])
+                self._case(service)
+                self.assertEqual(self._codes(), [])
 
-        self._screen([self.MTM])
-        self._assess([self.ECM, self.VOUCHER])
-        Case.objects.create(
-            case_id=uuid.uuid4(), client=self.member,
-            case_type=CaseType.INTERNAL_SERVICE, case_status="closed",
-            service_type="Medically Tailored Meals",
-            case_created_at=timezone.now(),
-        )
-        self.assertEqual(self._codes(), [])
-
-    def test_a_case_with_NO_food_eligibility_at_all_is_flagged(self):
-        """Screened for food, qualified for ECM, but the assessment named no food
-        service -- yet a food case is open."""
+    def test_a_food_case_with_NO_food_eligibility_raises_nothing_either(self):
+        """116 such members hold an APPROVED food case."""
         self._screen([self.MTM])
         self._assess([self.ECM])
         self._case("Medically Tailored Meals")
-        alert = self._alerts()["wrong_food_case_meals"]
-        self.assertIn("no food service", alert["detail"])
+        self.assertEqual(self._codes(), [])
 
     # ── 2: deliberately NOT an alert ────────────────────────────────────────
     def test_2_a_missing_dwelling_case_is_a_ROW_not_an_alert(self):
