@@ -1051,7 +1051,7 @@ def apply_consent_withdrawal(client, *, actor=None, actor_label=""):
 
 @transaction.atomic
 def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note="",
-                       force=False, trigger=""):
+                       force=False, trigger="", hold_reason=""):
     """Move an enrollment to ``to_stage`` with guard checks. Logs a StageEvent.
 
     Raises :class:`InvalidTransition` for illegal transitions or unmet process
@@ -1164,6 +1164,30 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
     is_system = actor is None and (
         not actor_label or actor_label.strip().lower().startswith("system:")
     )
+    # THE HOLD CATEGORY, on the event AND on the enrollment.
+    #
+    # Done here rather than at each of the fourteen call sites: the event is written
+    # here, so this is the only place both can be kept in step. The event carries the
+    # history -- a household held in July, resumed, then held again in September --
+    # while the enrollment carries only the CURRENT reason, which is what any queue
+    # or filter reads.
+    #
+    # Cleared when LEAVING On Hold: a reason on a serving enrollment reads as a
+    # current problem.
+    hold_reason_obj_ = None
+    if to_stage == EnrollmentStage.ON_HOLD:
+        from api.services.hold_reasons import UNCATEGORIZED, hold_reason_obj
+
+        # Uncategorized rather than NULL for a caller that names nothing: a reason
+        # the backfill can find later, unlike an empty column.
+        hold_reason_obj_ = hold_reason_obj(hold_reason or UNCATEGORIZED)
+        if enrollment.hold_reason_id != getattr(hold_reason_obj_, "pk", None):
+            enrollment.hold_reason = hold_reason_obj_
+            enrollment.save(update_fields=["hold_reason"])
+    elif enrollment.hold_reason_id:
+        enrollment.hold_reason = None
+        enrollment.save(update_fields=["hold_reason"])
+
     stage_event = StageEvent.objects.create(
         entity_type=StageEntityType.ENROLLMENT,
         enrollment=enrollment,
@@ -1173,6 +1197,7 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
         source=StageEventSource.AUTO if is_system else StageEventSource.MANUAL,
         actor=stage_event_actor(actor),
         note=note,
+        hold_reason=hold_reason_obj_,
         metadata=stage_meta,
     )
 
@@ -2352,6 +2377,10 @@ _DENIAL_PAUSE_STAGES = {
 # Stamped on the auto-pause StageEvent so the reverse (auto-resume on a later
 # favorable authorization) only ever un-pauses enrollments THIS rule paused --
 # never a manual Place-on-Hold.
+from api.services import hold_reasons as hr  # noqa: E402
+
+from api.services import hold_reasons as _hr
+
 _DENIAL_HOLD_NOTE = "Auto-paused: sole internal-service meal/box case denied."
 
 # Objective 3 / task 4.1: a governing meal/box authorization DENIED while the
@@ -2531,6 +2560,7 @@ def _full_stop_close_out(client, governing, *, actor=None, actor_label=""):
                     actor=actor,
                     actor_label=actor_label,
                     note=_CLOSURE_HOLD_NOTE,
+                    hold_reason=_hr.GOVERNING_CASE_CLOSED,
                     trigger="reconcile.governing_case_closed",
                 )
                 result["paused"] = True
@@ -6182,6 +6212,7 @@ def reconcile_internal_service_authorization(client, *, actor=None, actor_label=
                     advance_enrollment(
                         enr, EnrollmentStage.ON_HOLD, actor=actor,
                         actor_label=actor_label, note=_DENIAL_HOLD_NOTE,
+                        hold_reason=_hr.GOVERNING_CASE_DENIED,
                         trigger="reconcile.authorization_denied",
                     )
                     result["paused"] = True

@@ -881,3 +881,33 @@ class PauseReasonListView(PortalAPIView):
             }
             for r in qs
         ])
+
+
+class HoldReasonListView(PortalAPIView):
+    """GET: the on-hold reasons an agent may choose.
+
+    ``?all=1`` includes the SYSTEM-owned ones for a filter dropdown, which must be
+    able to name a reason it cannot set. The default excludes them: choosing
+    "Governing Case Denied" by hand would assert something the case data has not
+    said, and each has its own remedy.
+
+    ``resume_policy`` and ``resume_detail`` ride along so the UI can tell an agent
+    what will lift the hold -- or that nothing will.
+    """
+
+    def get(self, request):
+        from ..models import HoldReason
+
+        qs = HoldReason.objects.filter(is_active=True)
+        if (request.query_params.get("all") or "").lower() not in ("1", "true", "yes"):
+            qs = qs.filter(is_system=False)
+        return Response([
+            {
+                "code": r.code,
+                "label": r.label,
+                "resume_policy": r.resume_policy,
+                "resume_detail": r.resume_detail,
+                "is_system": r.is_system,
+            }
+            for r in qs
+        ])

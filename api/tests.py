@@ -37751,3 +37751,324 @@ class NutritionistDrawerEnrollmentTest(TestCase):
         )
         self.assertEqual(resp.status_code, 200, resp.content)
         self.assertEqual(len(resp.data["members"]), 1)
+
+
+class HoldReasonTest(TestCase):
+    """The on-hold reason catalogue.
+
+    Replaces free text: 7,379 holds across 443 distinct notes, 1,961 of them agent
+    free text with 1,556 distinct reasons.
+    """
+
+    SEED = [
+        ("pending_case_closure", "Pending Case Closure", "none", False),
+        ("wrong_case_type", "Wrong Case Type Opened", "auto", False),
+        ("not_enhanced_member", "Not an Enhanced Member", "none", False),
+        ("governing_case_denied", "Governing Case Denied", "auto", True),
+        ("governing_case_closed", "Governing Case Closed", "auto", True),
+        ("social_coverage_invalid", "Social care coverage expired/missing", "auto", True),
+        ("insurance_invalid", "Insurance expired/missing", "auto", True),
+        ("member_requested", "Member wants to pause", "manual", False),
+        ("zip_out_of_coverage", "Delivery ZIP outside coverage", "none", True),
+        ("medicaid_type_not_served", "Medicaid plan type not served", "none", True),
+        ("all_members_paused", "All household members paused", "auto", True),
+        ("uncategorized", "Uncategorized", "none", False),
+    ]
+
+    def setUp(self):
+        from .models import HoldReason
+
+        # Migrations are disabled under the test runner, so the seed migration has
+        # NOT run -- build the catalogue here or every lookup returns None and the
+        # assertions pass for the wrong reason.
+        for order, (code, label, policy, is_system) in enumerate(self.SEED, 1):
+            HoldReason.objects.create(
+                code=code, label=label, resume_policy=policy,
+                is_system=is_system, sort_order=order,
+            )
+
+    def _enrollment(self, stage=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Hold", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Hold HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        return EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=stage or EnrollmentStage.SERVICE_ACTIVE,
+        )
+
+    # ── advance_enrollment stamps both places ───────────────────────────────
+    def test_holding_stamps_the_enrollment_AND_the_event(self):
+        """The enrollment carries the CURRENT reason for filtering; the event
+        carries history, so "why was this held in July" stays answerable."""
+        from .models import EnrollmentStage, StageEvent
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True,
+            hold_reason="governing_case_denied",
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "governing_case_denied")
+        event = StageEvent.objects.filter(
+            enrollment=enr, to_stage=EnrollmentStage.ON_HOLD,
+        ).first()
+        self.assertEqual(event.hold_reason.code, "governing_case_denied")
+
+    def test_a_hold_with_NO_reason_named_is_Uncategorized_not_NULL(self):
+        """A reason the backfill can find, unlike an empty column."""
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True)
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "uncategorized")
+
+    def test_LEAVING_on_hold_clears_the_reason(self):
+        """A reason on a serving enrollment reads as a current problem, and any hold
+        queue filters on this field."""
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True, hold_reason="member_requested",
+        )
+        advance_enrollment(enr, EnrollmentStage.SERVICE_ACTIVE, force=True)
+        enr.refresh_from_db()
+        self.assertIsNone(enr.hold_reason)
+
+    def test_the_HISTORY_survives_a_resume(self):
+        """The whole reason the event is stamped too."""
+        from .models import EnrollmentStage, StageEvent
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True,
+            hold_reason="governing_case_closed",
+        )
+        advance_enrollment(enr, EnrollmentStage.SERVICE_ACTIVE, force=True)
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True, hold_reason="member_requested",
+        )
+        codes = list(
+            StageEvent.objects.filter(
+                enrollment=enr, to_stage=EnrollmentStage.ON_HOLD,
+            ).order_by("entered_at").values_list("hold_reason__code", flat=True)
+        )
+        self.assertEqual(codes, ["governing_case_closed", "member_requested"])
+
+    def test_an_UNKNOWN_code_does_not_break_the_hold(self):
+        """Stopping the household's deliveries is the operative half; the reason is
+        the label on it."""
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True, hold_reason="no_such_code",
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+    def test_retiring_a_reason_does_NOT_delete_the_enrollment(self):
+        """SET_NULL, not CASCADE -- the alternative loses an enrollment because
+        somebody tidied a dropdown."""
+        from .models import EnrollmentStage, EnrollmentVerification, HoldReason
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True, hold_reason="member_requested",
+        )
+        HoldReason.objects.filter(code="member_requested").delete()
+        self.assertTrue(
+            EnrollmentVerification.objects.filter(pk=enr.pk).exists(),
+        )
+
+    # ── the picker ──────────────────────────────────────────────────────────
+    def test_the_picker_HIDES_system_reasons(self):
+        """Choosing "Governing Case Denied" by hand would assert something the case
+        data has not said, and each system reason has its own remedy."""
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Hr Agent", agent_code="893", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        rows = api.get("/api/portal/settings/hold-reasons/").data
+        codes = [r["code"] for r in rows]
+        self.assertIn("pending_case_closure", codes)
+        for system in ("governing_case_denied", "governing_case_closed",
+                       "insurance_invalid", "zip_out_of_coverage",
+                       "medicaid_type_not_served", "all_members_paused",
+                       "social_coverage_invalid"):
+            self.assertNotIn(system, codes)
+        # The resume policy rides along, so the UI can say what will lift the hold.
+        self.assertIn("resume_policy", rows[0])
+
+        all_codes = [
+            r["code"] for r in
+            api.get("/api/portal/settings/hold-reasons/?all=1").data
+        ]
+        self.assertIn("governing_case_denied", all_codes)
+
+    # ── the four-way ineligible split ───────────────────────────────────────
+    def test_the_INELIGIBLE_note_is_split_by_the_stored_reasons(self):
+        """⚠ One note covers FOUR gates -- expired insurance, missing insurance, an
+        unserved Medicaid plan type and an out-of-coverage ZIP -- so it cannot be
+        classified from the note at all."""
+        from .models import Client
+        from .services.hold_reasons import reason_for_ineligibility
+
+        cases = [
+            (["Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MAP"],
+             "medicaid_type_not_served"),
+            (["all medical insurance plans are expired"], "insurance_invalid"),
+            (["no medical insurance on file"], "insurance_invalid"),
+            (["home ZIP 33314 is outside the coverage area"], "zip_out_of_coverage"),
+            (["home state NJ is not served"], "zip_out_of_coverage"),
+            (["something nobody has seen before"], "uncategorized"),
+            ([], "uncategorized"),
+        ]
+        for stored, expected in cases:
+            with self.subTest(stored=stored):
+                client = Client.objects.create(
+                    client_id=str(uuid.uuid4()), first_name="I", last_name="N",
+                    ineligible_reasons=stored,
+                )
+                self.assertEqual(reason_for_ineligibility(client), expected)
+
+    def test_MEDICAID_is_checked_before_insurance(self):
+        """The Medicaid string contains "FFS" and sits beside insurance wording;
+        matching insurance first would swallow all 16,898 of them."""
+        from .models import Client
+        from .services.hold_reasons import reason_for_ineligibility
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="M", last_name="X",
+            ineligible_reasons=[
+                "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MAP",
+                "all medical insurance plans are expired",
+            ],
+        )
+        self.assertEqual(
+            reason_for_ineligibility(client), "medicaid_type_not_served",
+        )
+
+    # ── the backfill ────────────────────────────────────────────────────────
+    def _classify(self, note, *, ineligible_reasons=None):
+        from api.management.commands.backfill_hold_reasons import Command
+        from .models import Client, EnrollmentStage, StageEvent
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="B", last_name="F",
+            ineligible_reasons=ineligible_reasons or [],
+        )
+        event = StageEvent.objects.create(
+            entity_type="enrollment", client=client,
+            to_stage=EnrollmentStage.ON_HOLD, note=note,
+        )
+        return Command()._classify(event)
+
+    def test_the_machine_written_notes_classify(self):
+        for note, expected in (
+            ("Auto-paused: sole internal-service meal/box case denied.",
+             "governing_case_denied"),
+            ("Auto-paused: last open internal-service meal/box case closed.",
+             "governing_case_closed"),
+            ("Automatically placed on hold — all household members paused.",
+             "all_members_paused"),
+            ("Automatically placed on hold — delivery ZIP outside coverage area "
+             "(Out of Range).", "zip_out_of_coverage"),
+            ("Auto-hold: social care coverage expired/missing by import.",
+             "social_coverage_invalid"),
+            ("Roster import: placed on hold. Reason: Pending Closure",
+             "pending_case_closure"),
+        ):
+            with self.subTest(note=note[:40]):
+                self.assertEqual(self._classify(note)[0], expected)
+
+    def test_the_AGREED_uncategorized_ones_stay_uncategorized(self):
+        """⚠ By DECISION, not failure. Over-interpreting a July spreadsheet's
+        wording is how a category stops meaning anything."""
+        for note in (
+            "Cancelled reconcile -> on_hold: governing case open + authorization "
+            "approved.",
+            "Bulk hold 9/23: governing household case.",
+            "Bulk pause: Services paused per Unite Us cases list.",
+            "Kept On Hold: the prior household was paused; a new governing case "
+            "must not auto-resume it.",
+            "Roster import: placed on hold. Reason: Reason Unknown (Potentially "
+            "Authorization Status)",
+        ):
+            with self.subTest(note=note[:40]):
+                self.assertEqual(self._classify(note)[0], "uncategorized")
+
+    def test_an_agent_note_is_keyword_matched_and_labelled_HONESTLY(self):
+        code, how = self._classify(
+            "Placed on hold by A. Reason: member wants to pause, too much food",
+        )
+        self.assertEqual(code, "member_requested")
+        self.assertEqual(how, "agent free text")
+
+    def test_an_agent_note_saying_out_of_range_is_NOT_called_machine_written(self):
+        """A bare /Out of Range/ pattern matched agent text too -- same verdict,
+        but reported as machine-written, and it would equally have matched an agent
+        writing "not out of range"."""
+        code, how = self._classify(
+            "Placed on hold by A. Reason: OUT OF RANGE zip",
+        )
+        self.assertEqual(code, "zip_out_of_coverage")
+        self.assertEqual(how, "agent free text")
+
+    def test_an_unmatched_agent_note_is_uncategorized(self):
+        code, how = self._classify("Placed on hold by A. Reason: qqq zzz")
+        self.assertEqual(code, "uncategorized")
+        self.assertIn("matched nothing", how)
+
+    def test_the_backfill_REFUSES_an_incomplete_catalogue(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import HoldReason
+
+        HoldReason.objects.filter(code="member_requested").delete()
+        out = StringIO()
+        call_command("backfill_hold_reasons", stdout=out, stderr=out)
+        self.assertIn("catalogue is missing", out.getvalue())
+
+    def test_the_backfill_is_idempotent(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="member_requested")
+        out = StringIO()
+        call_command("backfill_hold_reasons", "--apply", stdout=out, stderr=out)
+        self.assertIn("already set, skipped", out.getvalue())
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "member_requested")

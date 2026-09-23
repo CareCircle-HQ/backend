@@ -2346,6 +2346,18 @@ class EnrollmentVerification(models.Model):
     # tracks which cycle the enrollment is on (1 = initial, 2 = first renewal…).
     renewal_number = models.PositiveSmallIntegerField(default=1)
     stage_at = models.DateTimeField(null=True, blank=True)
+    # WHY this programme is On Hold, when it is. Set by whichever check or agent
+    # placed the hold, and CLEARED on resume -- a reason left on a serving
+    # enrollment reads as a current problem.
+    #
+    # Only meaningful while stage == ON_HOLD. Kept on the enrollment rather than
+    # derived from the latest StageEvent note because the Program tab, the Members
+    # page and any future hold queue all need to FILTER on it, and parsing 443
+    # distinct note strings is how this was unanswerable in the first place.
+    hold_reason = models.ForeignKey(
+        "HoldReason", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enrollments",
+    )
     opened_at = models.DateTimeField(auto_now_add=True)
     # The agent who REQUESTED the verification -- i.e. submitted the E-Form that
     # created this enrollment (opened_at is the request time). Set on creation
@@ -2465,6 +2477,58 @@ MEMBER_MEDICATIONS = SELECTABLE_MEMBER_MEDICATIONS + RETIRED_MEMBER_MEDICATIONS
 def default_member_conditions():
     """Default value for MemberDietaryProfile.conditions (nothing selected)."""
     return ["No Restriction"]
+
+
+class HoldResumePolicy(models.TextChoices):
+    """What it takes to come OFF a hold. Descriptive, not behaviour.
+
+    Recorded on the reason so the catalogue carries the decision -- an agent looking
+    at a held household can see whether to wait, act, or that nothing will clear it.
+    No code acts on this yet; the auto-resume rules are a separate piece.
+    """
+
+    NONE = "none", "No resume — an agent must close or re-open the case"
+    AUTO = "auto", "Resumes automatically when the situation changes"
+    MANUAL = "manual", "An agent resumes when ready"
+
+
+class HoldReason(models.Model):
+    """WHY a household's programme is On Hold -- a catalogue, not free text.
+
+    The same problem PauseReason solved for members, one level up: 7,379 holds across
+    443 distinct notes, of which 1,961 are agent free text with 1,556 distinct
+    reasons. "How many households are held pending case closure?" could not be asked.
+
+    ``is_system`` marks the reasons a CHECK sets -- a denied case, a closed case, an
+    expired insurance, an out-of-coverage ZIP. They are hidden from the agent's
+    picker: choosing "Governing Case Denied" by hand would assert something the case
+    data has not said.
+    """
+
+    hold_reason_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False,
+    )
+    code = models.CharField(max_length=40, unique=True)
+    label = models.CharField(max_length=80)
+    # What clears it. See HoldResumePolicy -- descriptive only.
+    resume_policy = models.CharField(
+        max_length=10, choices=HoldResumePolicy.choices,
+        default=HoldResumePolicy.NONE,
+    )
+    # What clears it, in words an agent reads. The policy says "auto"; this says
+    # "when a new governing case is saved", which is the useful half.
+    resume_detail = models.CharField(max_length=200, blank=True)
+    is_system = models.BooleanField(default=False)
+    # Retired reasons stop being offered but still render on the holds citing them.
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sort_order", "label"]
+
+    def __str__(self):
+        return self.label
 
 
 class PauseReason(models.Model):
@@ -3003,6 +3067,15 @@ class StageEvent(models.Model):
         related_name="stage_events",
     )
     note = models.TextField(blank=True)
+    # The hold CATEGORY for a "to On Hold" event. Stamped here as well as on the
+    # enrollment because the enrollment only carries the CURRENT reason -- a
+    # household held in July, resumed, and held again in September would otherwise
+    # lose why July happened, and 443 distinct note strings is what made that
+    # unanswerable. NULL on every other kind of transition.
+    hold_reason = models.ForeignKey(
+        "HoldReason", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="stage_events",
+    )
     metadata = models.JSONField(default=dict, blank=True)
     entered_at = models.DateTimeField(auto_now_add=True)
 

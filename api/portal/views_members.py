@@ -332,6 +332,7 @@ def _hold_household_for_range(enrollment, author):
                 f"Automatically placed on hold — delivery ZIP outside coverage "
                 f"area (Out of Range).{f' Actioned via {author}.' if author else ''}"
             ),
+            hold_reason=_hold.ZIP_OUT_OF_COVERAGE,
         )
         return True
     except InvalidTransition:
@@ -519,6 +520,8 @@ _ALL_PAUSED_RESUME_NOTE = "Service resumed — a household member returned from 
 # for service). A not-yet-verified enrollment isn't serving anyone, so pausing its
 # members must NOT drive it to On Hold -- otherwise a later resume would advance it
 # to Service Active and strand it Active without ever being verified.
+from api.services import hold_reasons as _hold
+
 _ALL_PAUSED_HOLDABLE_STAGES = {
     EnrollmentStage.VERIFIED,
     EnrollmentStage.KITCHEN_ASSIGNMENT,
@@ -546,6 +549,7 @@ def _reconcile_all_paused_hold(enrollment):
         try:
             advance_enrollment(
                 enrollment, EnrollmentStage.ON_HOLD, note=_ALL_PAUSED_HOLD_NOTE,
+                hold_reason=_hold.ALL_MEMBERS_PAUSED,
             )
         except InvalidTransition:
             pass
@@ -5556,12 +5560,21 @@ class MemberServiceHoldView(PortalAPIView):
                 {"reason": "A reason is required to place service on hold."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
+        # The CATEGORY, alongside the free-text note. Both, not either: the category
+        # is what can be counted and filtered, the note is what an agent reads six
+        # months later.
+        #
+        # Not required, and deliberately so: a hold that somebody needs to place now
+        # must not 400 on a missing dropdown. Missing falls back to Uncategorized --
+        # a reason the backfill can find, unlike a NULL.
+        hold_reason_code = (request.data.get("hold_reason_code") or "").strip()
         agent = current_agent(request)
         author = agent.name if agent else ""
         try:
             advance_enrollment(
                 enr, EnrollmentStage.ON_HOLD,
                 note=f"Placed on hold by {author or 'support portal'}. Reason: {reason}",
+                hold_reason=hold_reason_code or _hold.UNCATEGORIZED,
             )
         except InvalidTransition as exc:
             return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)

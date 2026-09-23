@@ -240,6 +240,22 @@ def _stop_future_deliveries(client, *, to_hold=True, note=_INELIGIBLE_HOLD_NOTE,
     else:
         trigger = "eligibility.hold"
 
+    # THE HOLD CATEGORY.
+    #
+    # ⚠ The ineligible note covers FOUR different gates -- expired insurance, missing
+    # insurance, an unserved Medicaid plan type and an out-of-coverage ZIP -- so the
+    # note cannot tell them apart and the client's STORED reasons have to.
+    # reason_for_ineligibility does that split; on the clone it separates 16,898
+    # Medicaid-type from 3,622 insurance and 3,122 ZIP.
+    from api.services import hold_reasons as _hr
+
+    if note.startswith(_COVERAGE_HOLD_NOTE):
+        hold_reason = _hr.SOCIAL_COVERAGE_INVALID
+    elif note.startswith(_INELIGIBLE_HOLD_NOTE):
+        hold_reason = _hr.reason_for_ineligibility(client)
+    else:
+        hold_reason = _hr.UNCATEGORIZED
+
     paused = []
     for enr in _governing_enrollments(client):
         try:
@@ -254,6 +270,7 @@ def _stop_future_deliveries(client, *, to_hold=True, note=_INELIGIBLE_HOLD_NOTE,
             try:
                 advance_enrollment(
                     enr, EnrollmentStage.ON_HOLD, actor=actor, note=note,
+                    hold_reason=hold_reason,
                     trigger=trigger,
                 )
                 paused.append(enr)

@@ -209,6 +209,7 @@ from .views_dispatch import (
     MemberDispatchOrdersView,
 )
 from .views_settings import (
+    HoldReasonListView,
     PauseReasonListView,
     BillableItemViewSet,
     ActiveProgramViewSet,
@@ -512,6 +513,10 @@ urlpatterns = [
     path(
         "settings/pause-reasons/",
         PauseReasonListView.as_view(), name="portal-pause-reasons",
+    ),
+    path(
+        "settings/hold-reasons/",
+        HoldReasonListView.as_view(), name="portal-hold-reasons",
     ),
     path(
         "settings/imports/", ImportRunsView.as_view(), name="portal-import-runs"),
