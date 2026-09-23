@@ -3875,6 +3875,114 @@ class PausedMembersListView(UnlinkedMembersListView):
         return self.get_paginated_response(rows)
 
 
+class OnHoldMembersListView(UnlinkedMembersListView):
+    """Urgent Care -> On Hold. Every household whose programme is On Hold, and WHY.
+
+    The unit is the HOUSEHOLD, not the member: a hold lives on the enrollment and
+    drops the whole household off every Purchase Order. Listing each member would
+    show the same hold four times and make the backlog look four times its size.
+
+    Reuses the row serialization and the eligibility/navigation columns from
+    :class:`UnlinkedMembersListView`; the hold columns are the point of the tab.
+    """
+
+    def get_queryset(self):
+        params = self.request.query_params
+        qs = Client.objects.filter(
+            enrollments__stage=EnrollmentStage.ON_HOLD,
+        ).distinct().prefetch_related(
+            "insurances", "cases", "assessments", "tags",
+            "enrollments__hold_reason",
+        )
+
+        # ?reason=<code>, or ?reason=none for holds nobody has classified -- which is
+        # the filter that gets used, because it IS the backlog.
+        reason = (params.get("reason") or "").strip()
+        if reason == "none":
+            qs = qs.filter(
+                enrollments__stage=EnrollmentStage.ON_HOLD,
+                enrollments__hold_reason__isnull=True,
+            )
+        elif reason:
+            qs = qs.filter(
+                enrollments__stage=EnrollmentStage.ON_HOLD,
+                enrollments__hold_reason__code=reason,
+            )
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+        return qs.order_by("last_name", "first_name").distinct()
+
+    def _held_enrollment(self, client):
+        """The held enrollment to report on.
+
+        A client can hold several enrollments; the one that matters is the On Hold
+        one. Taking the first would show a serving programme beside a member the page
+        listed precisely because they are not being served.
+        """
+        held = [
+            e for e in client.enrollments.all()
+            if e.stage == EnrollmentStage.ON_HOLD
+        ]
+        held.sort(key=lambda e: e.stage_at or e.opened_at, reverse=True)
+        return held[0] if held else None
+
+    def get(self, request):
+        page = self.paginate_queryset(self.get_queryset())
+        rows = []
+        for c in page or []:
+            enr = self._held_enrollment(c)
+            reason = getattr(enr, "hold_reason", None) if enr else None
+            # The note the hold was placed with -- the detail no catalogue carries.
+            note = ""
+            if enr is not None:
+                event = (
+                    StageEvent.objects.filter(
+                        enrollment=enr, to_stage=EnrollmentStage.ON_HOLD,
+                    ).order_by("-entered_at").first()
+                )
+                body = (event.note or "") if event else ""
+                note = (
+                    body.split("Reason:", 1)[1].strip()
+                    if "Reason:" in body else body
+                )
+            rows.append({
+                "id": str(c.client_id),
+                "name": s._full_name(c),
+                "medicaid_id": s.medicaid_member_id(c) or "",
+                "eligible_services": self._eligible_services(c),
+                "tags": _client_tags_payload(c),
+                "program_name": (enr.program_name if enr else "") or "",
+                "held_since": (
+                    (enr.stage_at or enr.opened_at).isoformat()
+                    if enr and (enr.stage_at or enr.opened_at) else None
+                ),
+                "hold_reason_code": reason.code if reason else "",
+                "hold_reason_label": reason.label if reason else "",
+                # What it takes to come off the hold. The catalogue knows; an agent
+                # working a backlog of 3,969 needs it on the row, not two clicks away.
+                "resume_policy": reason.resume_policy if reason else "",
+                "resume_detail": reason.resume_detail if reason else "",
+                "hold_note": note,
+            })
+        return self.get_paginated_response(rows)
+
+
 class NoNavigationMembersListView(UnlinkedMembersListView):
     """Urgent Care -> No Navigation tab.
 

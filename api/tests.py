@@ -38129,3 +38129,163 @@ class HoldReasonTest(TestCase):
         self.assertIn("already set, skipped", out.getvalue())
         enr.refresh_from_db()
         self.assertEqual(enr.hold_reason.code, "member_requested")
+
+
+class OnHoldTabTest(TestCase):
+    """Urgent Care -> On Hold: every held household, and what will lift it."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, HoldReason
+
+        for code, label, policy, is_system in (
+            ("pending_case_closure", "Pending Case Closure", "none", False),
+            ("all_members_paused", "All household members paused", "auto", True),
+            ("member_requested", "Member wants to pause", "manual", False),
+            ("uncategorized", "Uncategorized", "none", False),
+        ):
+            HoldReason.objects.create(
+                code=code, label=label, resume_policy=policy, is_system=is_system,
+            )
+        agent = Agent.objects.create(
+            name="Oh Agent", agent_code="896", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _household(self, name, stage, reason_code=None, *, members=1):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, HoldReason, Household,
+            HouseholdMember, MemberDietaryProfile,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Held",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name=f"{name} HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=stage,
+            program_name="Medically Tailored Meals (MTM) - Other - Brooklyn",
+            hold_reason=(
+                HoldReason.objects.get(code=reason_code) if reason_code else None
+            ),
+        )
+        for i in range(members):
+            member = primary if i == 0 else Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=f"{name}{i}",
+                last_name="Held", client_added_at=timezone.now(),
+            )
+            if i:
+                HouseholdMember.objects.create(
+                    household=hh, client=member, is_primary=False,
+                )
+            MemberDietaryProfile.objects.create(
+                enrollment=enr, client=member, member_name=f"{member.first_name} Held",
+            )
+        return primary, enr
+
+    def _get(self, query=""):
+        resp = self.api.get(f"/api/portal/members/on-hold/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_it_lists_held_households_with_the_reason(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        row = data["results"][0]
+        self.assertEqual(row["hold_reason_label"], "Pending Case Closure")
+        self.assertEqual(row["resume_policy"], "none")
+
+    def test_a_SERVING_household_is_absent(self):
+        from .models import EnrollmentStage
+
+        self._household("Act", EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_a_household_appears_ONCE_however_many_members(self):
+        """⚠ The unit is the HOUSEHOLD. A hold lives on the enrollment and drops the
+        whole household off every PO, so listing each member would show one hold four
+        times and make the backlog look four times its size."""
+        from .models import EnrollmentStage
+
+        self._household("Big", EnrollmentStage.ON_HOLD, "pending_case_closure",
+                        members=4)
+        self.assertEqual(self._get()["count"], 1)
+
+    def test_filtering_by_a_SYSTEM_reason(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self._household("Sys", EnrollmentStage.ON_HOLD, "all_members_paused")
+        data = self._get("?reason=all_members_paused")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["name"], "Sys Held")
+
+    def test_filtering_by_NO_reason_finds_the_backlog(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self._household("Nul", EnrollmentStage.ON_HOLD)
+        data = self._get("?reason=none")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["name"], "Nul Held")
+
+    def test_it_reports_the_HELD_enrollment_not_just_the_first(self):
+        """A client can hold several enrollments. Reporting the first would show a
+        serving programme beside a household the page listed precisely because it is
+        not being served."""
+        from .models import EnrollmentStage, EnrollmentVerification, HoldReason
+
+        # ⚠ Two enrollments on the SAME household, which is the real shape: a
+        # client can only belong to one household (HouseholdMember.client is
+        # unique), so a "second enrollment" is always a second row against the
+        # same household -- exactly what the production data showed.
+        primary, serving = self._household("Duo", EnrollmentStage.SERVICE_ACTIVE)
+        EnrollmentVerification.objects.create(
+            client=primary, household=serving.household,
+            stage=EnrollmentStage.ON_HOLD,
+            hold_reason=HoldReason.objects.get(code="member_requested"),
+        )
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["hold_reason_label"], "Member wants to pause")
+
+    def test_the_hold_NOTE_rides_along(self):
+        """The detail no catalogue carries."""
+        from .models import EnrollmentStage, StageEvent
+
+        _primary, enr = self._household(
+            "Ntx", EnrollmentStage.ON_HOLD, "member_requested",
+        )
+        StageEvent.objects.create(
+            entity_type="enrollment", enrollment=enr, client=enr.client,
+            to_stage=EnrollmentStage.ON_HOLD,
+            note="Placed on hold by A. Reason: away until December",
+        )
+        self.assertEqual(
+            self._get()["results"][0]["hold_note"], "away until December",
+        )
+
+    def test_an_unknown_reason_is_ignored_not_rejected(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self.assertEqual(self._get("?reason=nonsense")["count"], 0)
+
+    def test_searching_by_name(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self._household("Bob", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self.assertEqual(self._get("?search=Ada")["count"], 1)

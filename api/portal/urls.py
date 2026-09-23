@@ -118,6 +118,7 @@ from .views_members import (
     NeedAttestationMembersListView,
     NoNavigationMembersListView,
     NeedReviewMembersListView,
+    OnHoldMembersListView,
     PausedMembersListView,
     UnlinkedMembersListView,
     MenuTypesListView,
@@ -288,6 +289,7 @@ urlpatterns = [
     path("members/need-attestation/", NeedAttestationMembersListView.as_view(), name="portal-members-need-attestation"),
     path("members/need-review/", NeedReviewMembersListView.as_view(), name="portal-members-need-review"),
     path("members/paused/", PausedMembersListView.as_view(), name="portal-members-paused"),
+    path("members/on-hold/", OnHoldMembersListView.as_view(), name="portal-members-on-hold"),
     path("menu-types/", MenuTypesListView.as_view(), name="portal-menu-types"),
     path("food-allergies/", FoodAllergiesListView.as_view(), name="portal-food-allergies"),
     path(
