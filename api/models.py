@@ -2113,6 +2113,19 @@ SERVICE_EXCLUDED_MEMBER_STATUSES = (
 # genuine pause / off-ramp (NOT the pre-kitchen PENDING, which is still active in
 # the pipeline). Used to decide when the LAST real member has been paused so the
 # whole household should be held.
+# The statuses that count as a PAUSE for paused_at / resumed_at.
+#
+# ⚠ NARROWER than MEMBER_PAUSED_STATUSES, which also contains INACTIVE. Inactive is a
+# terminal end state -- "their service ended" -- not a pause anybody resumes from, and
+# including it would stamp paused_at on 1,353 members the Paused tab does not even
+# list. Same call the tab and the backfill make.
+MEMBER_PAUSE_TIMESTAMP_STATUSES = (
+    MemberStatus.OUT_OF_ORBIT,
+    MemberStatus.OUT_OF_RANGE,
+    MemberStatus.PAUSED,
+    MemberStatus.NUTRITIONIST_PAUSED,
+)
+
 MEMBER_PAUSED_STATUSES = (
     MemberStatus.OUT_OF_ORBIT,
     MemberStatus.OUT_OF_RANGE,
@@ -2358,6 +2371,14 @@ class EnrollmentVerification(models.Model):
         "HoldReason", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="enrollments",
     )
+    # WHEN the programme was held, and when it came back. Stamped in
+    # advance_enrollment, the single place a stage transition is written.
+    #
+    # held_at survives the resume, so "held on the 3rd, resumed on the 11th" is
+    # answerable. Current cycle only -- the full history is in the StageEvents,
+    # which each carry their own hold_reason.
+    held_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    hold_resumed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     opened_at = models.DateTimeField(auto_now_add=True)
     # The agent who REQUESTED the verification -- i.e. submitted the E-Form that
     # created this enrollment (opened_at is the request time). Set on creation
@@ -2661,6 +2682,16 @@ class MemberDietaryProfile(models.Model):
     # Distinct from ``updated_at`` (any edit); stamped in ``save()`` only when the
     # status value actually flips, so the UI can show "Paused/Out of Orbit since".
     status_changed_at = models.DateTimeField(null=True, blank=True)
+    # WHEN the member was paused, and when they came back. Stamped by save() off the
+    # status transition, so every pause path gets them without eleven call sites
+    # having to remember -- which is exactly how pause_reason was silently dropped
+    # in two places earlier.
+    #
+    # Both are kept after the fact: paused_at survives the resume, so "paused on the
+    # 3rd, resumed on the 11th" is answerable. They are the CURRENT cycle only -- the
+    # full history lives in the notes and the status timeline.
+    paused_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    resumed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Set True when a governing-case Household->Individual switch auto-pauses this
     # (additional) member: the member is PINNED so an agent cannot un-pause them
     # from the Program tab. Cleared ONLY when Customer Service dismisses the
@@ -2728,10 +2759,26 @@ class MemberDietaryProfile(models.Model):
         loaded = getattr(self, "_loaded_status", None)
         changed = self._state.adding or loaded is None or loaded != self.status
         if changed:
-            self.status_changed_at = timezone.now()
+            now = timezone.now()
+            self.status_changed_at = now
+            extra = ["status_changed_at"]
+            # INTO a pause, or OUT of one. Read from the loaded status, so a save
+            # that does not move the member in or out of a pause leaves both alone.
+            was_paused = loaded in MEMBER_PAUSE_TIMESTAMP_STATUSES
+            now_paused = self.status in MEMBER_PAUSE_TIMESTAMP_STATUSES
+            if now_paused and not was_paused:
+                self.paused_at = now
+                # Cleared, so a member paused again does not look resumed.
+                self.resumed_at = None
+                extra += ["paused_at", "resumed_at"]
+            elif was_paused and not now_paused:
+                self.resumed_at = now
+                extra += ["resumed_at"]
             update_fields = kwargs.get("update_fields")
-            if update_fields is not None and "status_changed_at" not in update_fields:
-                kwargs["update_fields"] = list(update_fields) + ["status_changed_at"]
+            if update_fields is not None:
+                missing = [f for f in extra if f not in update_fields]
+                if missing:
+                    kwargs["update_fields"] = list(update_fields) + missing
         super().save(*args, **kwargs)
         self._loaded_status = self.status
 

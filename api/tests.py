@@ -38783,3 +38783,236 @@ class InternalServiceRulesTriggerTest(TestCase):
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
         self.assertEqual(enr.hold_reason.code, "wrong_case_type")
+
+
+class HoldPauseDatesTest(TestCase):
+    """paused_at / resumed_at on the member, held_at / hold_resumed_at on the
+    enrollment, and the date-range filters over both."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, HoldReason, PauseReason
+
+        PauseReason.objects.create(code="member_cancelled", label="Member cancelled")
+        for code, label in (
+            ("member_requested", "Member wants to pause"),
+            ("uncategorized", "Uncategorized"),
+        ):
+            HoldReason.objects.create(code=code, label=label)
+        agent = Agent.objects.create(
+            name="Dt Agent", agent_code="898", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _profile(self, status=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dt", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Dt HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        return MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Dt Member",
+            status=status or MemberStatus.ACTIVE,
+        )
+
+    # ── the member timestamps ───────────────────────────────────────────────
+    def test_pausing_stamps_paused_at(self):
+        from .models import MemberStatus
+
+        profile = self._profile()
+        self.assertIsNone(profile.paused_at)
+        profile.status = MemberStatus.PAUSED
+        profile.save()
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.paused_at)
+
+    def test_EVERY_pause_status_stamps_it(self):
+        """Stamped in save() off the status transition, so all four get it without
+        eleven call sites remembering -- which is exactly how pause_reason was
+        silently dropped in two places."""
+        from .models import MemberStatus
+
+        for status in (MemberStatus.PAUSED, MemberStatus.NUTRITIONIST_PAUSED,
+                       MemberStatus.OUT_OF_ORBIT, MemberStatus.OUT_OF_RANGE):
+            with self.subTest(status=status):
+                profile = self._profile()
+                profile.status = status
+                profile.save()
+                profile.refresh_from_db()
+                self.assertIsNotNone(profile.paused_at)
+
+    def test_INACTIVE_does_NOT_stamp_paused_at(self):
+        """⚠ Narrower than MEMBER_PAUSED_STATUSES on purpose. Inactive is terminal,
+        not a pause anybody resumes from, and including it would stamp 1,353 members
+        the Paused tab does not even list."""
+        from .models import MemberStatus
+
+        profile = self._profile()
+        profile.status = MemberStatus.INACTIVE
+        profile.save()
+        profile.refresh_from_db()
+        self.assertIsNone(profile.paused_at)
+
+    def test_resuming_stamps_resumed_at_and_KEEPS_paused_at(self):
+        """So "paused on the 3rd, resumed on the 11th" is answerable."""
+        from .models import MemberStatus
+
+        profile = self._profile()
+        profile.status = MemberStatus.PAUSED
+        profile.save()
+        profile.refresh_from_db()
+        paused_at = profile.paused_at
+
+        profile.status = MemberStatus.ACTIVE
+        profile.save()
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.resumed_at)
+        self.assertEqual(profile.paused_at, paused_at)
+
+    def test_pausing_AGAIN_clears_the_old_resume_date(self):
+        """Otherwise a currently-paused member reads as resumed."""
+        from .models import MemberStatus
+
+        profile = self._profile()
+        for status in (MemberStatus.PAUSED, MemberStatus.ACTIVE, MemberStatus.PAUSED):
+            profile.status = status
+            profile.save()
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.paused_at)
+        self.assertIsNone(profile.resumed_at)
+
+    def test_a_save_with_update_fields_still_stamps_them(self):
+        """⚠ The failure mode that bit pause_reason twice: save() adds the fields to
+        update_fields itself rather than trusting every caller to list them."""
+        from .models import MemberStatus
+
+        profile = self._profile()
+        profile.status = MemberStatus.PAUSED
+        profile.save(update_fields=["status"])
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.paused_at)
+
+    def test_a_status_change_that_is_NOT_a_pause_touches_neither(self):
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PENDING)
+        profile.status = MemberStatus.ACTIVE
+        profile.save()
+        profile.refresh_from_db()
+        self.assertIsNone(profile.paused_at)
+        self.assertIsNone(profile.resumed_at)
+
+    # ── the enrollment timestamps ───────────────────────────────────────────
+    def test_holding_stamps_held_at_and_resuming_stamps_hold_resumed_at(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        profile = self._profile()
+        enr = profile.enrollment
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="member_requested")
+        enr.refresh_from_db()
+        self.assertIsNotNone(enr.held_at)
+        held_at = enr.held_at
+
+        advance_enrollment(enr, EnrollmentStage.SERVICE_ACTIVE, force=True)
+        enr.refresh_from_db()
+        self.assertIsNotNone(enr.hold_resumed_at)
+        self.assertEqual(enr.held_at, held_at)
+
+    def test_a_RE_HOLD_does_not_move_held_at(self):
+        """⚠ "How long has this been held?" is the question the field exists to
+        answer, and it would reset every time an import re-held the enrollment."""
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        profile = self._profile()
+        enr = profile.enrollment
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="member_requested")
+        enr.refresh_from_db()
+        held_at = enr.held_at
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="uncategorized")
+        enr.refresh_from_db()
+        self.assertEqual(enr.held_at, held_at)
+
+    # ── the filters ─────────────────────────────────────────────────────────
+    def _paused_on(self, when):
+        from .models import MemberDietaryProfile, MemberStatus, PauseReason
+
+        profile = self._profile()
+        profile.status = MemberStatus.PAUSED
+        profile.pause_reason = PauseReason.objects.get(code="member_cancelled")
+        profile.save()
+        MemberDietaryProfile.objects.filter(pk=profile.pk).update(paused_at=when)
+        return profile
+
+    def test_the_paused_range_is_INCLUSIVE_at_both_ends(self):
+        """⚠ A naive __lte on a DateTimeField compares against midnight and excludes
+        everything that happened during the chosen day -- which reads as missing data,
+        not as an off-by-one."""
+        from datetime import timedelta
+
+        when = timezone.now().replace(hour=15, minute=30)
+        self._paused_on(when)
+        day = when.date().isoformat()
+        resp = self.api.get(
+            f"/api/portal/members/paused/?paused_from={day}&paused_to={day}"
+        )
+        self.assertEqual(resp.data["count"], 1)
+        # And excluded by a range that ends the day before.
+        before = (when.date() - timedelta(days=1)).isoformat()
+        resp = self.api.get(f"/api/portal/members/paused/?paused_to={before}")
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_a_MALFORMED_date_is_ignored_not_rejected(self):
+        """A stale bookmark should show the list, matching every other filter here."""
+        self._paused_on(timezone.now())
+        resp = self.api.get("/api/portal/members/paused/?paused_from=nonsense")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["count"], 1)
+
+    def test_the_held_range_filters_the_on_hold_tab(self):
+        from datetime import timedelta
+
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import advance_enrollment
+
+        profile = self._profile()
+        enr = profile.enrollment
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="member_requested")
+        when = timezone.now() - timedelta(days=10)
+        EnrollmentVerification.objects.filter(pk=enr.pk).update(held_at=when)
+
+        day = when.date().isoformat()
+        resp = self.api.get(
+            f"/api/portal/members/on-hold/?held_from={day}&held_to={day}"
+        )
+        self.assertEqual(resp.data["count"], 1)
+        today = timezone.localdate().isoformat()
+        resp = self.api.get(f"/api/portal/members/on-hold/?held_from={today}")
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_the_rows_carry_the_dates(self):
+        self._paused_on(timezone.now())
+        row = self.api.get("/api/portal/members/paused/").data["results"][0]
+        self.assertIsNotNone(row["paused_at"])
+        self.assertIn("resumed_at", row)

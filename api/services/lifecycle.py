@@ -1175,18 +1175,27 @@ def advance_enrollment(enrollment, to_stage, *, actor=None, actor_label="", note
     # Cleared when LEAVING On Hold: a reason on a serving enrollment reads as a
     # current problem.
     hold_reason_obj_ = None
+    _now = timezone.now()
     if to_stage == EnrollmentStage.ON_HOLD:
         from api.services.hold_reasons import UNCATEGORIZED, hold_reason_obj
 
         # Uncategorized rather than NULL for a caller that names nothing: a reason
         # the backfill can find later, unlike an empty column.
         hold_reason_obj_ = hold_reason_obj(hold_reason or UNCATEGORIZED)
-        if enrollment.hold_reason_id != getattr(hold_reason_obj_, "pk", None):
-            enrollment.hold_reason = hold_reason_obj_
-            enrollment.save(update_fields=["hold_reason"])
-    elif enrollment.hold_reason_id:
+        # ⚠ Only on ENTERING the hold. A re-hold of an already-held enrollment must
+        # not move held_at, or "how long has this been held?" resets every time an
+        # import touches it -- and that is the question the field exists to answer.
+        if from_stage != EnrollmentStage.ON_HOLD:
+            enrollment.held_at = _now
+            enrollment.hold_resumed_at = None
+        enrollment.hold_reason = hold_reason_obj_
+        enrollment.save(update_fields=[
+            "hold_reason", "held_at", "hold_resumed_at",
+        ])
+    elif from_stage == EnrollmentStage.ON_HOLD:
         enrollment.hold_reason = None
-        enrollment.save(update_fields=["hold_reason"])
+        enrollment.hold_resumed_at = _now
+        enrollment.save(update_fields=["hold_reason", "hold_resumed_at"])
 
     stage_event = StageEvent.objects.create(
         entity_type=StageEntityType.ENROLLMENT,

@@ -3707,6 +3707,31 @@ class UnlinkedMembersListView(PortalGenericAPIView):
         return self.get_paginated_response(rows)
 
 
+def _date_range_filter(qs, params, field, prefix):
+    """Apply ``?<prefix>_from`` / ``?<prefix>_to`` as an inclusive date range.
+
+    Inclusive at BOTH ends, using __date so a caller passing today's date gets
+    today's rows. A naive ``__lte`` on a DateTimeField would compare against
+    midnight and silently exclude everything that happened during the chosen day --
+    which reads as missing data, not as an off-by-one.
+
+    A malformed date is IGNORED rather than 400'd, matching every other filter here:
+    a stale bookmark should show the list.
+    """
+    from datetime import date as _date
+
+    for suffix, lookup in (("from", "gte"), ("to", "lte")):
+        raw = (params.get(f"{prefix}_{suffix}") or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = _date.fromisoformat(raw)
+        except ValueError:
+            continue
+        qs = qs.filter(**{f"{field}__date__{lookup}": parsed})
+    return qs
+
+
 class PausedMembersListView(UnlinkedMembersListView):
     """Urgent Care -> Paused tab.
 
@@ -3756,6 +3781,15 @@ class PausedMembersListView(UnlinkedMembersListView):
         status = (params.get("status") or "").strip()
         if status in [s_.value for s_ in self.PAUSED_STATUSES]:
             qs = qs.filter(member_profiles__status=status)
+
+        # WHEN they were paused, and when they came back.
+        #
+        # ⚠ Both ranges filter the SAME member_profiles join as the status/reason
+        # filters above, so a household is matched only when ONE profile satisfies
+        # everything -- not when one member was paused in July and another resumed
+        # in September.
+        qs = _date_range_filter(qs, params, "member_profiles__paused_at", "paused")
+        qs = _date_range_filter(qs, params, "member_profiles__resumed_at", "resumed")
 
         search = (params.get("search") or "").strip()
         if search:
@@ -3855,6 +3889,14 @@ class PausedMembersListView(UnlinkedMembersListView):
                 ),
                 "pause_reason_code": reason.code if reason else "",
                 "pause_reason_label": reason.label if reason else "",
+                "paused_at": (
+                    profile.paused_at.isoformat()
+                    if profile and profile.paused_at else None
+                ),
+                "resumed_at": (
+                    profile.resumed_at.isoformat()
+                    if profile and profile.resumed_at else None
+                ),
                 # An agent cannot lift this one from the Program tab -- Customer
                 # Service must dismiss the CaseMismatchFlag -- so it is worth
                 # showing rather than leaving them to find out by clicking.
@@ -3908,6 +3950,13 @@ class OnHoldMembersListView(UnlinkedMembersListView):
                 enrollments__stage=EnrollmentStage.ON_HOLD,
                 enrollments__hold_reason__code=reason,
             )
+
+        # WHEN it was held, and when it was resumed. Same join as the reason filter
+        # above, so one enrollment must satisfy both rather than two different ones.
+        qs = _date_range_filter(qs, params, "enrollments__held_at", "held")
+        qs = _date_range_filter(
+            qs, params, "enrollments__hold_resumed_at", "resumed",
+        )
 
         search = (params.get("search") or "").strip()
         if search:
@@ -3974,6 +4023,13 @@ class OnHoldMembersListView(UnlinkedMembersListView):
                 ),
                 "hold_reason_code": reason.code if reason else "",
                 "hold_reason_label": reason.label if reason else "",
+                "held_at": (
+                    enr.held_at.isoformat() if enr and enr.held_at else None
+                ),
+                "hold_resumed_at": (
+                    enr.hold_resumed_at.isoformat()
+                    if enr and enr.hold_resumed_at else None
+                ),
                 # What it takes to come off the hold. The catalogue knows; an agent
                 # working a backlog of 3,969 needs it on the row, not two clicks away.
                 "resume_policy": reason.resume_policy if reason else "",
