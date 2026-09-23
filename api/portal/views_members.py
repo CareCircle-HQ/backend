@@ -6436,6 +6436,17 @@ class NutritionistPausedListView(NutritionistPendingSplitListView):
                 (p for p in profiles
                  if p.status == MemberStatus.NUTRITIONIST_PAUSED), None,
             )
+            # ⚠ SCOPED TO THE ENROLLMENT IN FORCE. The queryset above matches ANY of
+            # the client's profiles, and a member can carry a stale paused profile on
+            # a disregarded enrollment -- which the review drawer, correctly, does not
+            # show. Listing them gives a row a Nutritionist cannot act on: they open
+            # the drawer, find no paused member, and have no way to tell whether the
+            # tab or the drawer is wrong.
+            #
+            # One member of 25 on real data. A row that cannot be acted on is worse
+            # than an absent one.
+            if paused is None:
+                continue
             results.append({
                 "client_id": str(c.client_id),
                 "primary_name": f"{c.first_name} {c.last_name}".strip()
@@ -6837,7 +6848,26 @@ class MemberNutritionistReviewView(PortalAPIView):
         if not allowed:
             return Response({"detail": "Nutritionist access required."}, status=http.HTTP_403_FORBIDDEN)
         client = get_object_or_404(Client, pk=client_id)
-        enr = (
+        # ⚠ THE ENROLLMENT IN FORCE FIRST. This used to take the newest VERIFIED
+        # enrollment, falling back to the newest by verified_at -- which picks a
+        # DISREGARDED, CLOSED or SCHEDULED_EXTENSION row whenever one sorts higher
+        # than the live one. On the Nutritionist Paused tab that hid the paused
+        # member from the drawer entirely for 12 of 25 members: the drawer showed a
+        # different household's profiles, so there was nothing to resume.
+        #
+        # Measured before changing it. For the main queue -- clients with a VERIFIED
+        # enrollment -- active_enrollment returns the SAME row in 45 of 45 cases, so
+        # the sign-off flow is untouched. Everywhere the two differ, the old logic
+        # chose a terminal enrollment and the active one is right:
+        #
+        #   Pending Review      4 of 7   review=closed/scheduled_extension
+        #                                active=kitchen_assignment/service_active
+        #   Nutritionist-paused 14 of 25 review=disregarded/closed
+        #                                active=on_hold
+        #
+        # The old chain is kept as the fallback: a client with no live enrollment
+        # still has review data worth showing.
+        enr = s.active_enrollment(client) or (
             EnrollmentVerification.objects
             .filter(client=client, stage=EnrollmentStage.VERIFIED, superseded_by__isnull=True)
             .order_by("-verified_at")

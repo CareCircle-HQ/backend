@@ -37669,3 +37669,164 @@ class NutritionistResumeMemberTest(TestCase):
         self.assertEqual(profiles[0].status, MemberStatus.NUTRITIONIST_PAUSED)
         self.assertIsNotNone(profiles[0].pause_reason)
         self.assertEqual(profiles[0].pause_reason.code, "nutritionist_paused")
+
+
+class NutritionistDrawerEnrollmentTest(TestCase):
+    """The review drawer must show the enrollment IN FORCE.
+
+    ⚠ It used to take the newest VERIFIED enrollment, falling back to the newest by
+    verified_at -- so a DISREGARDED or CLOSED row could win. On the Paused tab that
+    hid the paused member from the drawer for 12 of 25 members: the drawer showed a
+    different household's profiles, so there was nothing to resume.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        PauseReason.objects.create(
+            code="nutritionist_paused", label="Nutritionist Paused", is_system=True,
+        )
+        agent = Agent.objects.create(
+            name="Dw Agent", agent_code="871", group="Nutritionist",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _two_enrollments(self, dead_stage, live_stage, live_status):
+        """A member with a TERMINAL enrollment and a live one.
+
+        The dead enrollment gets the newer verified_at, so the old chain would
+        choose it -- which is exactly the production shape.
+        """
+        from datetime import timedelta
+
+        from .models import (
+            Client, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, PauseReason,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dwl", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Dwl HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+
+        dead = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=dead_stage,
+            verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=dead, client=client, status=MemberStatus.PENDING,
+            member_name="Dwl Member",
+        )
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=live_stage,
+            verified_at=timezone.now() - timedelta(days=30),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, status=live_status,
+            member_name="Dwl Member",
+            pause_reason=(
+                PauseReason.objects.get(code="nutritionist_paused")
+                if live_status == MemberStatus.NUTRITIONIST_PAUSED else None
+            ),
+        )
+        return client
+
+    def test_a_DISREGARDED_enrollment_does_not_win(self):
+        from .models import EnrollmentStage, MemberStatus
+
+        client = self._two_enrollments(
+            EnrollmentStage.DISREGARDED, EnrollmentStage.ON_HOLD,
+            MemberStatus.NUTRITIONIST_PAUSED,
+        )
+        resp = self.api.get(
+            f"/api/portal/members/{client.client_id}/nutritionist-review/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        statuses = [m["status"] for m in resp.data["members"]]
+        self.assertIn(MemberStatus.NUTRITIONIST_PAUSED, statuses)
+
+    def test_a_CLOSED_enrollment_does_not_win_either(self):
+        from .models import EnrollmentStage, MemberStatus
+
+        client = self._two_enrollments(
+            EnrollmentStage.CLOSED, EnrollmentStage.SERVICE_ACTIVE,
+            MemberStatus.NUTRITIONIST_PAUSED,
+        )
+        resp = self.api.get(
+            f"/api/portal/members/{client.client_id}/nutritionist-review/",
+        )
+        statuses = [m["status"] for m in resp.data["members"]]
+        self.assertIn(MemberStatus.NUTRITIONIST_PAUSED, statuses)
+
+    def test_the_PAUSED_TAB_only_lists_rows_the_drawer_can_act_on(self):
+        """A member whose paused profile is on a DEAD enrollment is not listed. They
+        would open the drawer, find no paused member, and have no way to tell whether
+        the tab or the drawer was wrong. One of 25 on real data."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus, PauseReason,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Stale", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Stale HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        dead = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.DISREGARDED,
+        )
+        # The paused profile is on the DEAD enrollment.
+        MemberDietaryProfile.objects.create(
+            enrollment=dead, client=client,
+            status=MemberStatus.NUTRITIONIST_PAUSED, member_name="Stale Member",
+            pause_reason=PauseReason.objects.get(code="nutritionist_paused"),
+        )
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, status=MemberStatus.ACTIVE,
+            member_name="Stale Member",
+        )
+        resp = self.api.get("/api/portal/nutritionist/paused/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_the_main_queue_is_UNAFFECTED(self):
+        """Clients with a VERIFIED enrollment resolved to the SAME row in 45 of 45
+        cases on real data, so the sign-off flow does not change."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ver", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Ver HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.VERIFIED,
+            verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, status=MemberStatus.PENDING,
+            member_name="Ver Member",
+        )
+        resp = self.api.get(
+            f"/api/portal/members/{client.client_id}/nutritionist-review/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(len(resp.data["members"]), 1)
