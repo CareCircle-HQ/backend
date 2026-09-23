@@ -389,11 +389,35 @@ def _pause_members_for_eligibility(client, reasons, *, kind, actor, author, toda
         if newly:
             mv.status = MemberStatus.PAUSED
             mv.eligibility_paused = True
+            # WHICH gate failed. Insurance is the only one of the four that maps to a
+            # catalogue reason: an out-of-range ZIP has its own (set on the
+            # verification and address paths), and a Medicaid-type or missing-coverage
+            # failure has none yet -- so those fall back to Uncategorized rather than
+            # being mislabelled as an insurance problem.
+            #
+            # overwrite=False because this reconcile runs on EVERY import: a
+            # re-import must not relabel a pause an agent has already explained.
+            from api.services.pause_reasons import (
+                INSURANCE_INVALID, UNCATEGORIZED, set_pause_reason,
+            )
+
+            set_pause_reason(
+                mv,
+                INSURANCE_INVALID
+                if any("insurance" in r.lower() for r in (reasons or []))
+                else UNCATEGORIZED,
+                save=False, overwrite=False,
+            )
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
             mv.save(update_fields=[
+                # pause_reason is in this list because set_pause_reason above is
+                # called with save=False -- omit it and the reason is silently
+                # dropped, which is the quietest possible way for this feature to
+                # not work.
                 "status", "eligibility_paused", "kitchen_meal_type",
-                "kitchen_food_notes", "status_changed_at", "updated_at",
+                "kitchen_food_notes", "pause_reason", "status_changed_at",
+                "updated_at",
             ])
         # Paused members are excluded from the schedule; resync drops their future
         # (non-batched) occurrences so they leave the next Purchase Order.
@@ -476,8 +500,12 @@ def _unpause_members_for_eligibility(client, *, actor, author, today_str):
         enr = mv.enrollment
         mv.status = MemberStatus.ACTIVE
         mv.eligibility_paused = False
+        # Cleared on the way back in: a reason left on an ACTIVE member reads as a
+        # current problem, and the Members page filters on this field.
+        mv.pause_reason = None
         mv.save(update_fields=[
-            "status", "eligibility_paused", "status_changed_at", "updated_at",
+            "status", "eligibility_paused", "pause_reason", "status_changed_at",
+            "updated_at",
         ])
         # Resume the program first (if it was held because everyone was paused),
         # then rebuild this member's plan + calendar so they rejoin the next PO.

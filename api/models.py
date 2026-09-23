@@ -2467,6 +2467,45 @@ def default_member_conditions():
     return ["No Restriction"]
 
 
+class PauseReason(models.Model):
+    """WHY a member is not being served -- a catalogue, not free text.
+
+    Replaces a free-text box that produced 200 DISTINCT STRINGS across 1,341
+    pauses, of which one bulk campaign ("9/1 HH Close") was 937 and one entry was a
+    pasted UUID. Nothing could be counted, filtered or acted on.
+
+    A TABLE rather than TextChoices because agents add and retire reasons without a
+    deploy -- the same call Settings > Tags makes. ``code`` is the stable key the
+    code refers to; ``label`` is what an agent sees and may be renamed freely.
+
+    ``is_system`` marks the reasons only the SYSTEM sets (Out of Orbit, Out of
+    Range, Nutritionist Paused, Case Type Switch, Insurance expired or invalid).
+    They are hidden from the agent's picker: an agent choosing "Out of Range" by
+    hand would assert something the ZIP check has not found, and the remedy for
+    each is specific.
+    """
+
+    pause_reason_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False,
+    )
+    code = models.CharField(max_length=40, unique=True)
+    label = models.CharField(max_length=80)
+    # Reasons the SYSTEM owns -- not offered in the agent picker.
+    is_system = models.BooleanField(default=False)
+    # Hidden from selection but kept on historical rows, the same treatment
+    # ActiveProgram.is_active gives a retired programme: a pause that cites a
+    # retired reason must still render rather than go blank.
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sort_order", "label"]
+
+    def __str__(self):
+        return self.label
+
+
 class MemberDietaryProfile(models.Model):
     """Per-household-member dietary profile captured during the household
     verification (wizard Step 2).
@@ -2564,6 +2603,19 @@ class MemberDietaryProfile(models.Model):
     # matching CaseMismatchFlag (never auto-cleared on a switch back to
     # household). See api.services.lifecycle governing-case switch handling.
     pause_locked = models.BooleanField(default=False)
+    # WHY this member is not being served. Set for every pause, whoever caused it:
+    # an agent picking from the Program tab, the import eligibility gate, a
+    # case-type switch, the Nutritionist, or an Out of Orbit / Out of Range check.
+    #
+    # NOT redundant with `status`. Out of Orbit and Out of Range are statuses AND
+    # reasons, but PAUSED is 1,513 members with a dozen different causes -- and one
+    # field that always answers "why is this member not being served?" is worth more
+    # than a status an agent has to interpret. SET_NULL so retiring a reason cannot
+    # delete a member's profile.
+    pause_reason = models.ForeignKey(
+        "PauseReason", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="member_profiles",
+    )
     # The status this member held BEFORE an agent paused them, so an unpause puts
     # them back where they were. Without it, unpause re-runs the meal rule and
     # lands everyone on ACTIVE -- which would make pause+unpause a way to

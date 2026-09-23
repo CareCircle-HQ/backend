@@ -852,3 +852,32 @@ class BillableItemViewSet(viewsets.ModelViewSet):
             "admin_fee_percent": str(settings_row.admin_fee_percent),
             "updated_at": settings_row.updated_at,
         })
+
+
+class PauseReasonListView(PortalAPIView):
+    """GET: the pause reasons an agent may choose.
+
+    ``?all=1`` includes the SYSTEM-owned ones (Out of Orbit, Out of Range,
+    Nutritionist Paused, Case Type Switch, Insurance expired or invalid) for a
+    filter dropdown, which must be able to name a reason it cannot set. The default
+    excludes them: an agent choosing "Out of Range" by hand would assert something
+    the ZIP check has not found, and each has its own specific remedy.
+
+    Inactive reasons are always excluded -- retiring one stops it being offered
+    without disturbing the pauses that already cite it.
+    """
+
+    def get(self, request):
+        from ..models import PauseReason
+
+        qs = PauseReason.objects.filter(is_active=True)
+        if (request.query_params.get("all") or "").lower() not in ("1", "true", "yes"):
+            qs = qs.filter(is_system=False)
+        return Response([
+            {
+                "code": r.code,
+                "label": r.label,
+                "is_system": r.is_system,
+            }
+            for r in qs
+        ])

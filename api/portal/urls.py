@@ -206,6 +206,7 @@ from .views_dispatch import (
     MemberDispatchOrdersView,
 )
 from .views_settings import (
+    PauseReasonListView,
     BillableItemViewSet,
     ActiveProgramViewSet,
     CadenceViewSet,
@@ -498,7 +499,12 @@ urlpatterns = [
     path("po-blockers/fix/", POBlockersFixView.as_view(), name="portal-po-blockers-fix"),
 
     # Settings > Import: manual Unite Us CSV upload + run history
-    path("settings/imports/", ImportRunsView.as_view(), name="portal-import-runs"),
+    path(
+        "settings/pause-reasons/",
+        PauseReasonListView.as_view(), name="portal-pause-reasons",
+    ),
+    path(
+        "settings/imports/", ImportRunsView.as_view(), name="portal-import-runs"),
     path("settings/imports/upload/", ImportUploadView.as_view(), name="portal-import-upload"),
     # Async S3 flow: presign -> browser PUTs to S3 -> start (enqueue) -> poll detail
     path("settings/imports/presign/", ImportPresignView.as_view(), name="portal-import-presign"),

@@ -820,8 +820,11 @@ def sync_household_members(client, enrollment=None, agent=None):
         else:
             agent_actor = ""
         if oor_zip:
+            from api.services import pause_reasons as _pr
+
             profile.status = MemberStatus.OUT_OF_RANGE
-            profile.save(update_fields=["status"])
+            profile.pause_reason = _pr.reason_for(_pr.OUT_OF_RANGE)
+            profile.save(update_fields=["status", "pause_reason"])
             reason = service_area_note_body(oor_zip, oor_source)
             try:
                 Note.objects.create(

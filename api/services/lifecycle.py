@@ -3033,6 +3033,18 @@ def _pause_lock_additional_members(client, primary, *, actor=None, actor_label="
             mv.pause_locked = True
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
+            # A case-type switch, not a problem with the member: the governing case
+            # went household -> individual and this additional member has no case of
+            # their own. Worth labelling distinctly because an agent CANNOT lift this
+            # one -- Customer Service must dismiss the CaseMismatchFlag -- so an
+            # unexplained pause sends them to a button that will not work.
+            #
+            # BOTH the automatic (_pause_lock_additional_members) and the manual
+            # (_pause_additional_members_manual) paths, which are the same event
+            # reached two ways.
+            from api.services import pause_reasons as _pr
+
+            mv.pause_reason = _pr.reason_for(_pr.CASE_TYPE_SWITCH)
             try:
                 mv.save()
             except Exception:  # pragma: no cover - defensive
@@ -3122,6 +3134,18 @@ def _pause_additional_members_manual(client, primary, *, actor=None, actor_label
             mv.pause_locked = True
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
+            # A case-type switch, not a problem with the member: the governing case
+            # went household -> individual and this additional member has no case of
+            # their own. Worth labelling distinctly because an agent CANNOT lift this
+            # one -- Customer Service must dismiss the CaseMismatchFlag -- so an
+            # unexplained pause sends them to a button that will not work.
+            #
+            # BOTH the automatic (_pause_lock_additional_members) and the manual
+            # (_pause_additional_members_manual) paths, which are the same event
+            # reached two ways.
+            from api.services import pause_reasons as _pr
+
+            mv.pause_reason = _pr.reason_for(_pr.CASE_TYPE_SWITCH)
             try:
                 mv.save()
             except Exception:  # pragma: no cover - defensive

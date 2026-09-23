@@ -36697,3 +36697,278 @@ class ServiceTrackerAlertsTest(TestCase):
         self.assertEqual(tracker["alerts"], [])
         housing = next(t for t in tracker["tracks"] if t["code"] == "housing")
         self.assertEqual(housing["items"][0]["state"], "todo")
+
+
+class PauseReasonTest(TestCase):
+    """The pause-reason catalogue, and who sets what.
+
+    Replaces a free-text box that produced 200 distinct strings across 1,341 pauses,
+    of which one bulk campaign was 937 and one entry was a pasted UUID.
+    """
+
+    def setUp(self):
+        from .models import PauseReason
+
+        # Migrations are disabled under the test runner, so the seed migration has
+        # NOT run -- the catalogue must be built here or every lookup returns None
+        # and the assertions pass for the wrong reason.
+        # ALL THIRTEEN. The backfill command refuses to run against an incomplete
+        # catalogue -- which is correct, and caught a short fixture here.
+        for code, label, system in (
+            ("insurance_invalid", "Insurance expired or invalid", True),
+            ("member_cancelled", "Member cancelled", False),
+            ("address_problem", "Address problem", False),
+            ("away_travelling", "Away / traveling", False),
+            ("too_much_food", "Too much food", False),
+            ("not_home", "Not home", False),
+            ("delivery_issue", "Delivery issue", False),
+            ("pending_review", "Pending review", False),
+            ("case_type_switch", "Case Type Switch", True),
+            ("nutritionist_paused", "Nutritionist Paused", True),
+            ("out_of_orbit", "Out of Orbit", True),
+            ("out_of_range", "Out of Range", True),
+            ("uncategorized", "Uncategorized", False),
+        ):
+            PauseReason.objects.create(code=code, label=label, is_system=system)
+
+    def _profile(self, **kw):
+        """A member profile needs an ENROLLMENT -- enrollment_id is NOT NULL, so a
+        profile built from a client alone fails with an IntegrityError rather than
+        anything to do with pause reasons."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pause", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        household = Household.objects.create(name="Pause HH")
+        HouseholdMember.objects.create(
+            household=household, client=client, is_primary=True,
+        )
+        enrollment = EnrollmentVerification.objects.create(
+            client=client, household=household,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        return MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client,
+            status=kw.pop("status", MemberStatus.ACTIVE), **kw,
+        )
+
+    # ── the helper ──────────────────────────────────────────────────────────
+    def test_setting_a_reason(self):
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        pr.set_pause_reason(profile, pr.OUT_OF_ORBIT)
+        profile.refresh_from_db()
+        self.assertEqual(profile.pause_reason.code, "out_of_orbit")
+
+    def test_an_UNKNOWN_code_does_not_raise(self):
+        """A missing catalogue row must never break a pause: stopping the deliveries
+        is the important half and the reason is the label on it."""
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        self.assertIsNone(pr.set_pause_reason(profile, "no_such_reason"))
+        profile.refresh_from_db()
+        self.assertIsNone(profile.pause_reason)
+
+    def test_overwrite_False_keeps_an_AGENTS_reason(self):
+        """The eligibility reconcile runs on every import; a re-import must not
+        relabel a pause somebody already explained."""
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        pr.set_pause_reason(profile, pr.UNCATEGORIZED)
+        pr.set_pause_reason(profile, pr.INSURANCE_INVALID, overwrite=False)
+        profile.refresh_from_db()
+        self.assertEqual(profile.pause_reason.code, "uncategorized")
+
+    def test_clearing_on_the_way_back_to_service(self):
+        """A reason left on an ACTIVE member reads as a current problem."""
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        pr.set_pause_reason(profile, pr.OUT_OF_ORBIT)
+        pr.clear_pause_reason(profile)
+        profile.refresh_from_db()
+        self.assertIsNone(profile.pause_reason)
+
+    # ── the picker ──────────────────────────────────────────────────────────
+    def test_the_picker_HIDES_system_reasons(self):
+        """An agent choosing "Out of Range" by hand would assert something the ZIP
+        check has not found, and each system reason has its own remedy."""
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Pr Agent", agent_code="790", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        codes = [
+            r["code"] for r in
+            api.get("/api/portal/settings/pause-reasons/").data
+        ]
+        self.assertIn("member_cancelled", codes)
+        for system in ("out_of_range", "out_of_orbit", "nutritionist_paused",
+                       "case_type_switch", "insurance_invalid"):
+            self.assertNotIn(system, codes)
+
+        # ?all=1 for a FILTER, which must be able to name a reason it cannot set.
+        all_codes = [
+            r["code"] for r in
+            api.get("/api/portal/settings/pause-reasons/?all=1").data
+        ]
+        self.assertIn("out_of_range", all_codes)
+
+    def test_a_RETIRED_reason_is_not_offered(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        PauseReason.objects.filter(code="member_cancelled").update(is_active=False)
+        agent = Agent.objects.create(
+            name="Pr2", agent_code="791", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        codes = [r["code"] for r in api.get("/api/portal/settings/pause-reasons/").data]
+        self.assertNotIn("member_cancelled", codes)
+
+    def test_retiring_a_reason_does_NOT_delete_the_profile(self):
+        """SET_NULL, not CASCADE -- the alternative loses a member's dietary profile
+        because somebody tidied a dropdown."""
+        from .models import MemberDietaryProfile, PauseReason
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        pr.set_pause_reason(profile, pr.OUT_OF_ORBIT)
+        PauseReason.objects.filter(code="out_of_orbit").delete()
+        self.assertTrue(
+            MemberDietaryProfile.objects.filter(pk=profile.pk).exists(),
+        )
+
+    # ── the backfill's classification ───────────────────────────────────────
+    def _classify(self, profile, note=None):
+        from api.management.commands.backfill_pause_reasons import Command
+        from .models import MemberStatus
+
+        by_status = {
+            MemberStatus.OUT_OF_ORBIT: "out_of_orbit",
+            MemberStatus.OUT_OF_RANGE: "out_of_range",
+            MemberStatus.NUTRITIONIST_PAUSED: "nutritionist_paused",
+        }
+        notes = {profile.client_id: note} if note else {}
+        return Command()._classify(profile, by_status, notes)
+
+    def test_the_STATUS_wins_over_everything(self):
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.OUT_OF_ORBIT)
+        code, how = self._classify(profile, note="member cancelled")
+        self.assertEqual((code, how), ("out_of_orbit", "status"))
+
+    def test_the_BULK_CAMPAIGN_is_not_given_a_category(self):
+        """"9/1 HH Close" is 937 of 1,341 pause notes -- 70% -- and is one day's bulk
+        work, not a reason anybody chose. Letting it match a keyword would invent a
+        category that then dominates every report built on this field."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED)
+        code, _how = self._classify(profile, note="9/1 HH Close")
+        self.assertEqual(code, "uncategorized")
+
+    def test_a_ZIP_eligibility_failure_is_OUT_OF_RANGE(self):
+        """Even though the STATUS is PAUSED: the gate pauses a member individually
+        rather than setting the status. 403 members read as unclassifiable until this
+        was added, for a reason the catalogue already named."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.client.ineligible_reasons = ["home ZIP 33314 is outside the coverage area"]
+        profile.client.save(update_fields=["ineligible_reasons"])
+        code, how = self._classify(profile)
+        self.assertEqual(code, "out_of_range")
+        self.assertIn("ZIP", how)
+
+    def test_a_MEDICAID_TYPE_failure_stays_uncategorised(self):
+        """⚠ 497 members. It is the largest ineligibility gate in the system and the
+        catalogue has no reason for it -- calling it "insurance" would be a guess that
+        reads as a fact."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.client.ineligible_reasons = [
+            "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MAP",
+        ]
+        profile.client.save(update_fields=["ineligible_reasons"])
+        code, _how = self._classify(profile)
+        self.assertEqual(code, "uncategorized")
+
+    def test_pause_locked_means_a_CASE_TYPE_SWITCH(self):
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED, pause_locked=True)
+        code, _how = self._classify(profile)
+        self.assertEqual(code, "case_type_switch")
+
+    def test_insurance_before_cancel_in_the_note_patterns(self):
+        """"cancel policy" is an insurance problem, so the order of the patterns is
+        load-bearing rather than cosmetic."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED)
+        code, _how = self._classify(profile, note="had to cancel her insurance policy")
+        self.assertEqual(code, "insurance_invalid")
+
+    def test_a_note_matching_NOTHING_is_uncategorised_not_blank(self):
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED)
+        code, how = self._classify(profile, note="1d2903bc-e6a5-49a2-8c03-0062ac13c442")
+        self.assertEqual(code, "uncategorized")
+        self.assertIn("matched nothing", how)
+
+    def test_the_backfill_REFUSES_an_incomplete_catalogue(self):
+        """It caught a short test fixture. Better than running and quietly sending
+        every unmatched member to a reason that does not exist."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import PauseReason
+
+        PauseReason.objects.filter(code="too_much_food").delete()
+        out = StringIO()
+        call_command("backfill_pause_reasons", stdout=out, stderr=out)
+        self.assertIn("catalogue is missing", out.getvalue())
+
+    def test_INACTIVE_is_not_in_scope(self):
+        """It is a terminal end state, not a pause, and it has no pause note.
+        Including it put 1,339 members into Uncategorized and made the field
+        two-thirds noise."""
+        from api.management.commands.backfill_pause_reasons import Command
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus
+
+        self._profile(status=MemberStatus.INACTIVE)
+        out = StringIO()
+        call_command("backfill_pause_reasons", "--apply", stdout=out, stderr=out)
+        self.assertIn("0 profile(s)", out.getvalue())

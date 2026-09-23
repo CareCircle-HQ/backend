@@ -137,6 +137,7 @@ from ..services.lifecycle import (
     reopen_for_verification,
     split_dependent_into_own_enrollment,
 )
+from ..services import pause_reasons as pr
 from ..services import timeline
 from ..services.warnings import sync_household_warnings
 from ..serializers import (
@@ -498,6 +499,17 @@ def _resume_household_after_range(enrollment):
         return True
     except InvalidTransition:
         return False
+
+
+def pause_reason_obj(code, *, fallback=None):
+    """The PauseReason for ``code``, or the fallback. None when neither exists.
+
+    A thin wrapper so a view can assign to ``profile.pause_reason`` inline without
+    every call site importing the service and handling a missing catalogue row.
+    """
+    from ..services import pause_reasons as _pr
+
+    return _pr.reason_for(code) or (_pr.reason_for(fallback) if fallback else None)
 
 
 _ALL_PAUSED_HOLD_NOTE = "Automatically placed on hold — all household members paused."
@@ -4806,6 +4818,10 @@ class HouseholdMemberEditView(PortalAPIView):
         reactivate = data.pop("reactivate", False)
         deactivate = data.pop("deactivate", False)
         pause = data.pop("pause", False)
+        # Popped alongside `pause`: a control field, not a model field. Leaving it in
+        # `data` would make the generic assignment loop below try to set a `str` on
+        # the FK.
+        pause_reason_code = (data.pop("pause_reason_code", "") or "").strip()
         unpause = data.pop("unpause", False)
         restore_range = data.pop("restore_range", False)
         pause_reason = (data.pop("pause_reason", "") or "").strip()
@@ -4860,6 +4876,12 @@ class HouseholdMemberEditView(PortalAPIView):
             mv.status = MemberStatus.PAUSED
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
+            # The agent's chosen reason. Falls back to Uncategorized rather than
+            # blank: the whole point of the catalogue is that every pause has an
+            # answer, and a nullable field quietly fills with NULLs otherwise.
+            mv.pause_reason = pause_reason_obj(
+                pause_reason_code, fallback=pr.UNCATEGORIZED,
+            )
             mv.save()
             # Retract any already-committed upcoming delivery so the pause stops
             # shipments (+ billing) now, not just future PO generation.
@@ -4935,6 +4957,7 @@ class HouseholdMemberEditView(PortalAPIView):
             # the meal rule. Clear the kitchen meal result so they're excluded
             # from every delivery schedule / Purchase Order until reactivated.
             mv.status = MemberStatus.OUT_OF_ORBIT
+            mv.pause_reason = pause_reason_obj(pr.OUT_OF_ORBIT)
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
             mv.save()
@@ -6565,6 +6588,7 @@ class MemberNutritionistDenyMemberView(PortalAPIView):
         if mv.status == MemberStatus.NUTRITIONIST_PAUSED:
             return Response({"error": "Member is already Nutritionist Paused."}, status=http.HTTP_400_BAD_REQUEST)
         mv.status = MemberStatus.NUTRITIONIST_PAUSED
+        mv.pause_reason = pause_reason_obj(pr.NUTRITIONIST_PAUSED)
         mv.kitchen_meal_type = ""
         mv.kitchen_food_notes = ""
         mv.save(update_fields=["status", "kitchen_meal_type", "kitchen_food_notes"])
@@ -7601,6 +7625,7 @@ def assign_kitchen_to_household(
             # what the meal rule would decide.
             note = exclude_notes[profile.pk]
             profile.status = MemberStatus.OUT_OF_ORBIT
+            profile.pause_reason = pause_reason_obj(pr.OUT_OF_ORBIT)
             profile.kitchen_meal_type = ""
             profile.kitchen_food_notes = ""
             profile.save(update_fields=[

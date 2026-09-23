@@ -2421,8 +2421,18 @@ class PortalHouseholdMemberSerializer(serializers.ModelSerializer):
             "meal_category", "menu_type", "general_verification_notes",
             "status", "status_label", "kitchen_meal_type", "kitchen_food_notes",
             "is_primary", "pause_locked", "pause_prior_status",
+            "pause_reason_code", "pause_reason_label",
             "not_eligible", "not_eligible_reason",
         ]
+
+    # WHY this member is not being served, from the catalogue. The UI matches on the
+    # code and shows the label, so a rename in Settings breaks neither.
+    pause_reason_code = serializers.CharField(
+        source="pause_reason.code", read_only=True, default="",
+    )
+    pause_reason_label = serializers.CharField(
+        source="pause_reason.label", read_only=True, default="",
+    )
 
     def get_client_id(self, obj):
         return str(obj.client_id) if obj.client_id else None
@@ -2559,6 +2569,12 @@ class PortalMemberDietaryEditSerializer(serializers.Serializer):
     # members are excluded from delivery schedules / Purchase Orders until
     # unpaused. Control flag, popped by the view before assigning model fields.
     pause = serializers.BooleanField(required=False, default=False)
+    # The catalogue reason for that pause. Control field, popped by the view.
+    #
+    # NOT required, deliberately: an agent can pause from several places and a 400 on
+    # a missing reason would block a pause somebody needs to make now. Missing falls
+    # back to Uncategorized -- a reason the backfill can find later, unlike a NULL.
+    pause_reason_code = serializers.CharField(required=False, allow_blank=True)
     # When true, lift a member's manual pause. The view re-runs the meal rule so
     # the member returns to Active (or Out of Orbit if now unfulfillable).
     unpause = serializers.BooleanField(required=False, default=False)
