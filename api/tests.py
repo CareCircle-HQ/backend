@@ -36379,12 +36379,15 @@ class HousingRecommendationFamilyTest(TestCase):
 
 
 class ServiceTrackerBoroughTest(TestCase):
-    """Does each opened case sit in the borough the member lives in?
+    """Does each opened case sit in the borough the member's COVERAGE names?
 
-    A case opened in the wrong borough is billed against the wrong programme, and
-    nothing else on the profile compares the two. Real data has them: 36 mismatches
-    in a 500-member sample, including one member living in Manhattan whose care
-    management, eligibility and meals cases are all in Brooklyn.
+    ⚠ NOT their address. The coverage plan names the borough that is PAYING --
+    "Public Health Solutions - Brooklyn NY1115 Enhanced HRSN Services" -- and that is
+    the borough a case must be opened in, whatever address the member lives at.
+
+    The address version produced false positives: one member had all three cases
+    flagged wrong because she lives in Manhattan, when her coverage is Brooklyn and
+    the cases were right. Across 500 members the mismatch count fell from 36 to 9.
     """
 
     ECM = "Enhanced Care Management (Level 2)"
@@ -36406,6 +36409,15 @@ class ServiceTrackerBoroughTest(TestCase):
         self.member = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name="Bor", last_name="Member",
             client_added_at=timezone.now(),
+        )
+
+    def _coverage(self, borough, *, status="enrolled",
+                  plan="Enhanced HRSN Services"):
+        from .models import SocialCareCoverage
+
+        return SocialCareCoverage.objects.create(
+            client=self.member, coverage_id=uuid.uuid4(), status=status,
+            plan_name=f"Public Health Solutions - {borough} NY1115 {plan}",
         )
 
     def _address(self, zip_code, kind="current"):
@@ -36442,22 +36454,63 @@ class ServiceTrackerBoroughTest(TestCase):
         track = next(t for t in tracker["tracks"] if t["code"] == "core")
         return tracker, track["items"][0]
 
-    def test_a_case_in_the_SAME_borough_matches(self):
-        self._address("11103")            # Queens
+    def test_a_case_in_the_COVERAGE_borough_matches(self):
+        self._coverage("Queens")
         self._setup_ecm("Queens")
         tracker, row = self._care_row()
         self.assertEqual(tracker["home_borough"], "Queens")
-        self.assertEqual(row["borough"], "Queens")
         self.assertIs(row["borough_match"], True)
 
     def test_a_case_in_ANOTHER_borough_is_flagged(self):
-        self._address("11103")            # Queens
+        self._coverage("Queens")
         self._setup_ecm("Brooklyn")
         _tracker, row = self._care_row()
-        self.assertEqual(row["borough"], "Brooklyn")
         self.assertIs(row["borough_match"], False)
 
-    def test_with_NO_ADDRESS_the_check_is_UNKNOWN_not_wrong(self):
+    def test_the_ADDRESS_is_IGNORED(self):
+        """⚠ The whole point of the change. A member living in Manhattan whose
+        coverage is Brooklyn belongs to Brooklyn, and her Brooklyn cases are right --
+        the address version flagged all three as wrong."""
+        self._address("10002")                 # Manhattan
+        self._coverage("Brooklyn")
+        self._setup_ecm("Brooklyn")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "Brooklyn")
+        self.assertIs(row["borough_match"], True)
+
+    def test_a_NON_ENROLLED_coverage_does_not_count(self):
+        self._coverage("Queens", status="non_enrolled")
+        self._setup_ecm("Brooklyn")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "")
+        self.assertIsNone(row["borough_match"])
+
+    def test_an_EXPIRED_coverage_does_not_count(self):
+        self._coverage("Queens", status="expired")
+        self._setup_ecm("Brooklyn")
+        self.assertEqual(self._care_row()[0]["home_borough"], "")
+
+    def test_SCREENING_AND_NAVIGATION_plans_do_not_count(self):
+        """⚠ The rule is Enhanced HRSN SPECIFICALLY, and it costs coverage: 1,799 of
+        3,000 sampled members have no enrolled Enhanced HRSN row, and 1,491 of them
+        hold an enrolled Screening and Navigation plan that names a borough. Widening
+        the rule would answer most of them -- recorded here so the trade-off is
+        visible rather than rediscovered."""
+        self._coverage("Queens", plan="MCO Screening and Navigation")
+        self._coverage("Queens", plan="FFS Screening and Navigation")
+        self._setup_ecm("Brooklyn")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "")
+        self.assertIsNone(row["borough_match"])
+
+    def test_a_NON_NYC_region_is_not_treated_as_a_borough(self):
+        """The same plan shape covers Hudson Valley, Long Island and the Southern
+        Tier -- 57 rows. They are not boroughs we can compare a programme against."""
+        self._coverage("Hudson Valley Region")
+        self._setup_ecm("Brooklyn")
+        self.assertEqual(self._care_row()[0]["home_borough"], "")
+
+    def test_with_NO_coverage_the_check_is_UNKNOWN_not_wrong(self):
         """Painting "we could not tell" red accuses good data of being wrong."""
         self._setup_ecm("Brooklyn")
         tracker, row = self._care_row()
@@ -36467,9 +36520,8 @@ class ServiceTrackerBoroughTest(TestCase):
     def test_a_programme_with_no_borough_is_UNKNOWN_too(self):
         from .models import Case, CaseType
 
-        self._address("11103")
+        self._coverage("Queens")
         self._setup_ecm("Queens")
-        # A real example: "Care Management Services" names no borough at all.
         self.member.cases.all().delete()
         Case.objects.create(
             case_id=uuid.uuid4(), client=self.member, case_type=CaseType.NAVIGATION,
@@ -36481,49 +36533,12 @@ class ServiceTrackerBoroughTest(TestCase):
         self.assertEqual(row["borough"], "")
         self.assertIsNone(row["borough_match"])
 
-    def test_CURRENT_beats_the_other_address_types(self):
-        """It is the one the profile header shows, so the tracker and the profile
-        cannot disagree about where somebody lives."""
-        self._address("11236", kind="home")       # Brooklyn
-        self._address("11103", kind="current")    # Queens
-        self._setup_ecm("Queens")
-        tracker, _row = self._care_row()
-        self.assertEqual(tracker["home_borough"], "Queens")
-
-    def test_a_MAILING_address_is_not_used_when_a_home_one_exists(self):
-        """A PO box in another borough says nothing about where a member lives."""
-        self._address("10002", kind="mailing")    # Manhattan
-        self._address("11103", kind="home")       # Queens
-        self._setup_ecm("Queens")
-        tracker, _row = self._care_row()
-        self.assertEqual(tracker["home_borough"], "Queens")
-
-    def test_a_mailing_address_is_BETTER_THAN_NOTHING(self):
-        """A member with only a mailing address still lives somewhere, and answering
-        "unknown" would disable the check entirely."""
-        self._address("10002", kind="mailing")
-        self._setup_ecm("Brooklyn")
-        tracker, row = self._care_row()
-        self.assertEqual(tracker["home_borough"], "Manhattan")
-        self.assertIs(row["borough_match"], False)
-
-    def test_an_OUT_OF_AREA_zip_yields_no_borough(self):
-        self._address("33314")            # Florida
-        self._setup_ecm("Queens")
-        tracker, row = self._care_row()
-        self.assertEqual(tracker["home_borough"], "")
-        self.assertIsNone(row["borough_match"])
-
     def test_service_boroughs_knows_the_three_without_a_ZIP_table(self):
-        """A borough decoder that knows no boroughs answers "" for everything rather
-        than failing, so the fallback is load-bearing on a fresh database."""
         from .models import ServiceZipCode
         from .services.service_area import service_boroughs
 
         ServiceZipCode.objects.all().delete()
-        self.assertEqual(
-            service_boroughs(), {"Brooklyn", "Manhattan", "Queens"},
-        )
+        self.assertEqual(service_boroughs(), {"Brooklyn", "Manhattan", "Queens"})
 
 
 class ServiceTrackerAlertsTest(TestCase):

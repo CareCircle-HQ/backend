@@ -130,35 +130,53 @@ def _find_case(cases, service_type, case_type=None):
 
 
 # ── the borough check ────────────────────────────────────────────────────────
-# Which address decides where a member LIVES. The same set the eligibility gate
-# judges, minus "mailing": a PO box in another borough says nothing about where the
-# member is, and "current" first because that is the one the profile header shows --
-# so the tracker and the profile cannot disagree about where somebody lives.
-_HOME_ADDRESS_TYPES = ("current", "home", "delivery")
+# WHERE A MEMBER BELONGS comes from their SOCIAL CARE COVERAGE, not their address.
+#
+# The coverage names the borough that is paying:
+#
+#     Public Health Solutions - Brooklyn NY1115 Enhanced HRSN Services
+#                               ^^^^^^^^
+#
+# and that is the borough a case must be opened in, whatever address the member
+# happens to live at. An address can be stale, a mailing address, or simply
+# somewhere else -- the coverage is the contractual answer.
+#
+# ⚠ ENROLLED, AND "Enhanced HRSN Services" SPECIFICALLY. A member may also hold
+# "MCO Screening and Navigation" or "FFS Screening and Navigation" coverage naming
+# the same borough, and those are NOT accepted. The consequence is large and worth
+# knowing: of 3,000 sampled members with any social care coverage, 1,799 have no
+# ENROLLED Enhanced HRSN row, so their borough is now UNKNOWN and the check is
+# silent for them. Almost all of those hold a Screening and Navigation plan that
+# names a borough -- 1,491 of them enrolled -- so widening the rule would answer
+# most of them if that is ever wanted.
+_HRSN_PLAN = re.compile(
+    r"^Public Health Solutions - (.+?) NY1115 Enhanced HRSN Services$", re.I,
+)
 
 
 def member_home_borough(client):
-    """The borough the member lives in, from their primary address ZIP, or "".
+    """The borough from the member's ENROLLED Enhanced HRSN coverage, or "".
 
-    Derived from ServiceZipCode -- the same table the service-area check and the
-    programme borough decoder use, so all three agree about what a borough is.
+    Not the address. The plan names the borough that is paying for the service, and
+    that is the one a case has to be opened in.
+
+    Only a borough the ZIP table knows is accepted, so the three non-NYC regions
+    that use the same plan shape -- Hudson Valley, Long Island, Southern Tier, 57
+    rows between them -- answer "" rather than being reported as a borough we
+    could compare a programme against.
     """
-    from .service_area import housing_area_check
+    from .service_area import service_boroughs
 
-    addresses = list(client.addresses.all())
-    for wanted in _HOME_ADDRESS_TYPES:
-        for address in addresses:
-            if (address.type or "").lower() == wanted and address.zip:
-                borough = housing_area_check(address.zip)["borough"]
-                if borough:
-                    return borough
-    # Any address with a usable ZIP, rather than nothing: a member with only a
-    # mailing address still lives somewhere, and "unknown" disables the check.
-    for address in addresses:
-        if address.zip:
-            borough = housing_area_check(address.zip)["borough"]
-            if borough:
-                return borough
+    known = service_boroughs()
+    for coverage in client.social_care_coverages.all():
+        if (coverage.status or "").strip().lower() != "enrolled":
+            continue
+        match = _HRSN_PLAN.match((coverage.plan_name or "").strip())
+        if not match:
+            continue
+        borough = match.group(1).strip()
+        if borough in known:
+            return borough
     return ""
 
 
