@@ -6687,13 +6687,50 @@ class MemberNutritionistApproveView(PortalAPIView):
         # One SEPARATE signed PDF per member (the signature is collected once and
         # embedded in each). Stored on S3 + keyed on each member's dietary profile.
         # Best-effort: when S3 isn't configured the approval still proceeds.
+        # THE SIGNATURE RESUMES A NUTRITIONIST-PAUSED MEMBER, when the caller asks.
+        #
+        # ⚠ GATED ON AN EXPLICIT FLAG, not applied to every approval. A Nutritionist
+        # working the main queue pauses one member of a household and approves the
+        # rest -- which is why the PDF loop below skips a paused member at all. If
+        # approval always resumed, that pause would be undone by the very next click
+        # and the Pause action would be meaningless.
+        #
+        # So the Paused tab sends resume_paused=true: there, the signature IS the
+        # approval that returns the member to service. Anywhere else, a pause stands.
+        resumed_members = []
+        if str(request.data.get("resume_paused") or "").lower() in ("1", "true", "yes"):
+            from ..services.meal_rules import reconcile_member_kitchen_output
+
+            for mv in enr.member_profiles.select_related("client").all():
+                if mv.status != MemberStatus.NUTRITIONIST_PAUSED:
+                    continue
+                # The meal rule decides where they land -- Active, or Out of Orbit
+                # when the assigned kitchen cannot fulfil them. Forcing Active would
+                # put an unfulfillable member on the next Purchase Order.
+                reconcile_member_kitchen_output(
+                    mv, enr.kitchen, save=False, allow_resume=True,
+                )
+                mv.pause_reason = None
+                mv.save(update_fields=[
+                    "status", "pause_reason", "kitchen_meal_type",
+                    "kitchen_food_notes",
+                ])
+                resumed_members.append({
+                    "member_id": str(mv.client_id or ""),
+                    "name": mv.member_name or "",
+                    "status": mv.status,
+                    "status_label": MemberStatus(mv.status).label,
+                })
+
         from ..services import import_storage
         from ..services.nutrition_pdf import render_member_nutrition_pdf
         from django.utils import timezone as _tz
         if import_storage.s3_enabled():
             signed_at = _tz.now()
             for mv in enr.member_profiles.select_related("client").all():
-                # Never generate a PDF for a Nutritionist-Paused member.
+                # Never generate a PDF for a member who is STILL paused. A member
+                # resumed just above is no longer paused, so they DO get one -- which
+                # is the point: the signature approved them.
                 if mv.status == MemberStatus.NUTRITIONIST_PAUSED:
                     continue
                 pdf_bytes = render_member_nutrition_pdf(
@@ -6727,7 +6764,14 @@ class MemberNutritionistApproveView(PortalAPIView):
         # An individual nutritionist review is now done -> drop the client off the
         # Pending Review queue.
         set_pending_nutritionist(client, False)
-        return Response({"ok": True, "client_id": str(client.client_id)})
+        # The resumed members are REPORTED, because the meal rule may have landed
+        # them Out of Orbit rather than Active -- the drawer says which rather than
+        # claiming they are back in service.
+        return Response({
+            "ok": True,
+            "client_id": str(client.client_id),
+            "resumed": resumed_members,
+        })
 
 
 class MemberNutritionistClearPendingView(PortalAPIView):
