@@ -147,65 +147,54 @@ Not a timing artefact either — **198** of the third group were opened *after* 
 assessment that supposedly forbids them, and **116** hold an approved food case
 although no assessment they have ever had named a food service.
 
-### The asymmetric rule 🟡
+### The asymmetric rule — NOW ENFORCED ✅
 
-Agreed, not yet built. `Food Prescriptions (Voucher / Boxes) (Food)` is the
-eligibility result that corresponds to **boxes** cases.
+`api/services/internal_service_rules.py`, called from
+`reconcile_client_eligibility`, so it applies on **both** the extension save and the
+CSV import. **It only ever HOLDS** — no auto-resume yet, by decision.
 
-```
-meals_eligible  =  Medically Tailored Meals (MTM) (Food) | Medically Tailored Meals (MTM)
-                 | Clinically Appropriate Meals (Food)   | Clinically Appropriate Meals
-boxes_eligible  =  Food Prescriptions (Voucher / Boxes) (Food)
-```
+Judged against the **GOVERNING case only**, and against the **latest** assessment
+only.
 
-| Eligibility | Meals case | Boxes case |
-|---|---|---|
-| meals | ✓ | ✓ *(stepping DOWN is fine)* |
-| boxes only | ✗ **warn** | ✓ |
-| both | ✓ | ✓ |
-| neither | ❔ | ❔ |
+| Rule | Condition | Action | Category | Households |
+|---|---|---|---|---|
+| **1** | only the most recent assessment counts | — | — | — |
+| **2** | latest assessment has no `Enhanced Care Management (Level 2)` | **HOLD** | Not an Enhanced Member | **60** |
+| **3** | boxes-only eligibility + a **MEALS** governing case | **HOLD** | Wrong Case Type Open | **94** |
+| **4** | meals-only eligibility + a **BOXES** governing case | **warn only** | — | 196 |
 
-**The asymmetry is the rule.** Meals eligibility permits stepping down to boxes;
-boxes eligibility does not permit stepping up to meals. MTM is the expensive
-service, so over-servicing is the risk worth catching.
+Rule 2 is checked **first**: there is no point judging which food case is right for a
+member not entitled to internal services at all.
 
-**Action:** review the meals case — the member was assessed for a produce
-prescription only.
+The reasons written onto the hold:
 
 ```
-a. MEALS eligible — either is fine        9,061
-b. BOXES-ONLY + a MEALS case → WARN         101     ← all 101 approved
-c. BOXES-ONLY + boxes only — fine         1,645
-d. NO food eligibility at all               217
-z. no assessment — no verdict             6,004
+rule 2   Member is ineligible for company Internal services. Eligibility Assessment
+         results show the member is not an Enhanced Care Management (Level 2).
+
+rule 3   Only a Food Prescriptions (Voucher / Boxes) (Food) case is allowed, agent
+         opened the wrong case.
 ```
 
-⚠️ **All 101 are approved and being paid today.** Approval shows the payer *paid*,
-not that the member was *entitled* — stepping up to a more expensive service is
-exactly what an approval would not catch but an audit would. Expect the question.
-
-#### Evidence that the meals → boxes direction is legitimate
-
-Of the 219 meals-eligible members holding a box case, **every one is on a `Boxes`
-programme, none on `Voucher`** — a deliberate route, not scattered error. And:
+### ⚠️ Why rule 4 warns instead of holding
 
 ```
-had a meals case at some point   106     consistent with switching
-NEVER had a meals case           113     opened as boxes from the start
-holds a LIVE meals case too       25     both at once
+meals-eligible members holding a BOXES case    219    218 APPROVED, 0 denied
+   ... every one on a "Food Prescriptions: Boxes" programme, none on Voucher
+   ... 106 previously held a meals case -- a deliberate switch
+   ... 113 never did · 25 hold both at once
 ```
 
-So "they switch" describes only part of it.
+Meals eligibility permits stepping **down** to boxes; boxes-only does not permit
+stepping **up** to meals. Holding the 196 governing boxes cases would stop deliveries
+for members whose case the payer has approved. It surfaces as the
+`boxes_case_meals_only` tracker warning instead.
 
-#### Open questions ❔
+### ⚠️ No assessment means NO VERDICT
 
-1. **Group d (217, 212 approved)** — a food case with no food eligibility at all.
-   No verdict, warn for a meals case only, or warn for any food case?
-2. **Which case** — flag any live meals case, or only when it is the governing one?
-   25 members hold both a live meals and a live boxes case.
-3. **Severity** — error (red) or warning (amber)?
-
----
+**6,002 of 17,028** members with a live governing case — 35% — have no eligibility
+assessment. Reading silence as "not qualified" would hold a third of the book on the
+next import.
 
 ## The borough check ✅
 

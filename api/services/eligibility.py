@@ -33,6 +33,10 @@ from dataclasses import dataclass, field
 
 from django.utils import timezone
 
+import logging
+
+_log = logging.getLogger(__name__)
+
 from api.models import AddressType, ClientStage, InsurancePlanType
 
 # Coverage end-date sentinel: year 9999 means "never expires".
@@ -647,6 +651,27 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
         _unpause_members_for_eligibility(
             client, actor=actor, author=author, today_str=today_str,
         )
+
+    # INTERNAL-SERVICE RULES: hold the programme when the GOVERNING case is not
+    # supported by the member's LATEST eligibility assessment -- no ECM at all, or
+    # a meals case where only a produce prescription is allowed.
+    #
+    # Last, and only after the hard gates have had their say: an already-ineligible
+    # member is off-ramped above and does not need a second, quieter hold for the
+    # same underlying problem.
+    #
+    # It only ever HOLDS. No auto-resume yet, by decision -- a held programme waits
+    # for an agent.
+    try:
+        from api.services.internal_service_rules import (
+            apply_internal_service_rules,
+        )
+
+        apply_internal_service_rules(
+            client, actor=actor, actor_label=actor_label, source=src,
+        )
+    except Exception:  # pragma: no cover - never break an import over this
+        _log.exception('internal-service rules failed for client %s', client.pk)
 
     return client.lifecycle_stage
 

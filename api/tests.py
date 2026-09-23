@@ -36657,17 +36657,30 @@ class ServiceTrackerAlertsTest(TestCase):
         I built them from the eligibility strings without asking whether the payer
         agreed. That was one query away.
         """
-        for eligibility, service in (
-            (self.VOUCHER, "Medically Tailored Meals"),
-            (self.MTM, "Produce Prescription/Voucher"),
-        ):
-            with self.subTest(eligibility=eligibility, service=service):
-                self.member.cases.all().delete()
-                self.member.assessments.all().delete()
-                self._screen([self.MTM])
-                self._assess([self.ECM, eligibility])
-                self._case(service)
-                self.assertEqual(self._codes(), [])
+        # ⚠ ONLY the boxes-eligible + MEALS case direction is silent here. The
+        # reverse -- meals-only eligibility holding a BOXES case -- became a WARNING
+        # (rule 4), and is asserted in its own test below. The programme is still not
+        # HELD for it, which is the part that matters.
+        self.member.cases.all().delete()
+        self.member.assessments.all().delete()
+        self._screen([self.MTM])
+        self._assess([self.ECM, self.VOUCHER])
+        self._case("Medically Tailored Meals")
+        self.assertEqual(self._codes(), [])
+
+    def test_rule4_meals_only_with_a_BOXES_case_WARNS_but_does_not_hold(self):
+        """⚠ A warning, never a hold: 218 of 219 such cases are APPROVED by the
+        payer, so holding them would stop deliveries for members whose case is
+        fine."""
+        self._screen([self.MTM])
+        self._assess([self.ECM, self.MTM])
+        self._case("Produce Prescription/Voucher")
+        codes = self._codes()
+        self.assertEqual(codes, ["boxes_case_meals_only"])
+        # _alerts() is keyed BY CODE in this class, not a list.
+        self.assertEqual(
+            self._alerts()["boxes_case_meals_only"]["severity"], "warning",
+        )
 
     def test_a_food_case_with_NO_food_eligibility_raises_nothing_either(self):
         """116 such members hold an APPROVED food case."""
@@ -38289,3 +38302,278 @@ class OnHoldTabTest(TestCase):
         self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
         self._household("Bob", EnrollmentStage.ON_HOLD, "pending_case_closure")
         self.assertEqual(self._get("?search=Ada")["count"], 1)
+
+
+class InternalServiceRulesTest(TestCase):
+    """Holding a programme whose GOVERNING case the latest assessment won't support.
+
+    Runs from reconcile_client_eligibility, so it applies on the extension save AND
+    the CSV import.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+    MTM = "Medically Tailored Meals (MTM) (Food)"
+    CAM = "Clinically Appropriate Meals (Food)"
+    BOXES = "Food Prescriptions (Voucher / Boxes) (Food)"
+
+    def setUp(self):
+        from .models import HoldReason
+
+        for code, label in (
+            ("not_enhanced_member", "Not an Enhanced Member"),
+            ("wrong_case_type", "Wrong Case Type Opened"),
+            ("uncategorized", "Uncategorized"),
+        ):
+            HoldReason.objects.create(code=code, label=label)
+
+    def _member(self, *, eligible, case_service, stage=None, assessments=None):
+        from .models import (
+            Assessment, Case, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Isr", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        # ⚠ The member must PASS the hard eligibility gates, or those fire first and
+        # hold the enrollment for a missing insurance -- which is correct behaviour
+        # and means this rule is never reached. That is what my first version of
+        # test_it_runs_from_the_shared_reconcile_path actually proved.
+        from .models import (
+            Insurance, InsurancePlanType, RecordStatus, SocialCareCoverage,
+            SocialCareCoverageStatus,
+        )
+
+        Insurance.objects.create(
+            client=client, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE, plan_name="NY Medicaid",
+        )
+        SocialCareCoverage.objects.create(
+            client=client, coverage_id=uuid.uuid4(),
+            status=SocialCareCoverageStatus.ENROLLED, plan_name="Social Care",
+        )
+        hh = Household.objects.create(name="Isr HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+
+        # Older assessments first, so "latest" is unambiguous.
+        from datetime import timedelta
+
+        for offset, services in enumerate(assessments or []):
+            Assessment.objects.create(
+                assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+                eligible_services=services,
+                screen_created_at=timezone.now() - timedelta(days=90 - offset),
+            )
+        if eligible is not None:
+            Assessment.objects.create(
+                assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+                eligible_services=eligible, screen_created_at=timezone.now(),
+            )
+        case = None
+        if case_service:
+            case = Case.objects.create(
+                case_id=uuid.uuid4(), client=client,
+                case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+                service_type=case_service, program_name=f"{case_service} - Brooklyn",
+                case_created_at=timezone.now(),
+            )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=stage or EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Isr Member",
+        )
+        return client, enr
+
+    def _apply(self, client):
+        from .services.internal_service_rules import apply_internal_service_rules
+
+        return apply_internal_service_rules(client, actor_label="system: test")
+
+    # ── rule 2: the ECM gateway ─────────────────────────────────────────────
+    def test_rule2_no_ECM_holds_as_NOT_ENHANCED(self):
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_rule2_writes_the_agreed_reason_text(self):
+        from .models import Note
+
+        client, _enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self._apply(client)
+        note = Note.objects.filter(client=client).first()
+        self.assertIn("not an Enhanced Care Management (Level 2)", note.body)
+
+    def test_rule2_is_checked_BEFORE_the_case_type(self):
+        """The gateway. There is no point judging WHICH food case is right for a
+        member who is not entitled to internal services at all."""
+        client, enr = self._member(
+            eligible=[self.BOXES],           # no ECM, and a wrong-type case
+            case_service="Medically Tailored Meals",
+        )
+        self._apply(client)
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_ECM_present_and_a_matching_case_is_left_alone(self):
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.ECM, self.MTM], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(self._apply(client), [])
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+
+    # ── rule 3: boxes-only cannot hold a meals case ─────────────────────────
+    def test_rule3_boxes_only_with_a_MEALS_case_holds(self):
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.ECM, self.BOXES],
+            case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "wrong_case_type")
+        event = enr.stage_events.filter(to_stage=EnrollmentStage.ON_HOLD).first()
+        self.assertIn("wrong case", event.note)
+
+    def test_rule3_leaves_a_BOXES_case_alone(self):
+        client, enr = self._member(
+            eligible=[self.ECM, self.BOXES],
+            case_service="Produce Prescription/Voucher",
+        )
+        self.assertEqual(self._apply(client), [])
+
+    # ── rule 4 is NOT a hold ────────────────────────────────────────────────
+    def test_rule4_meals_only_with_a_BOXES_case_does_NOT_hold(self):
+        """⚠ The asymmetry, and the most important test here. 218 of 219 such cases
+        are APPROVED by the payer, so holding them would stop deliveries for members
+        whose case is fine. It is a Service Tracker warning instead."""
+        from .models import EnrollmentStage
+
+        for eligibility in ([self.ECM, self.MTM], [self.ECM, self.CAM]):
+            with self.subTest(eligibility=eligibility):
+                client, enr = self._member(
+                    eligible=eligibility,
+                    case_service="Produce Prescription/Voucher",
+                )
+                self.assertEqual(self._apply(client), [])
+                enr.refresh_from_db()
+                self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+
+    # ── rule 1: only the latest assessment counts ───────────────────────────
+    def test_rule1_an_EARLIER_assessment_does_not_rescue_the_member(self):
+        """"A client may qualify in a previous case for a food program but not in
+        the last one, so now he gets on hold."""
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            assessments=[[self.ECM, self.MTM]],     # qualified before
+            eligible=[self.MTM],                    # latest has NO ECM
+            case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_rule1_an_earlier_FAILING_assessment_does_not_condemn_the_member(self):
+        """The mirror. The newest assessment governs in both directions."""
+        client, enr = self._member(
+            assessments=[[self.MTM]],               # no ECM back then
+            eligible=[self.ECM, self.MTM],          # latest is fine
+            case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(self._apply(client), [])
+
+    # ── scope limits ────────────────────────────────────────────────────────
+    def test_NO_assessment_means_no_verdict(self):
+        """⚠ 6,002 of 17,028 members with a live governing case -- 35% -- have no
+        assessment. Reading silence as "not qualified" would hold a third of the book
+        on the next import."""
+        client, enr = self._member(
+            eligible=None, case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(self._apply(client), [])
+
+    def test_an_assessment_with_an_EMPTY_service_list_is_also_no_verdict(self):
+        client, _enr = self._member(
+            eligible=[], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(self._apply(client), [])
+
+    def test_NO_governing_case_means_nothing_to_judge(self):
+        client, _enr = self._member(eligible=[self.MTM], case_service=None)
+        self.assertEqual(self._apply(client), [])
+
+    def test_an_ALREADY_HELD_enrollment_is_left_alone_reason_and_all(self):
+        """Re-importing must not relabel a hold an agent has explained, nor rewrite
+        the same StageEvent on every run."""
+        from .models import EnrollmentStage, HoldReason
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+            stage=EnrollmentStage.ON_HOLD,
+        )
+        enr.hold_reason = HoldReason.objects.get(code="uncategorized")
+        enr.save(update_fields=["hold_reason"])
+        self.assertEqual(self._apply(client), [])
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "uncategorized")
+
+    def test_it_is_idempotent(self):
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        self.assertEqual(self._apply(client), [])
+        self.assertEqual(
+            enr.stage_events.filter(to_stage=EnrollmentStage.ON_HOLD).count(), 1,
+        )
+
+    def test_it_runs_from_the_shared_reconcile_path(self):
+        """The one that both the extension save and the CSV import call."""
+        from .models import EnrollmentStage
+        from .services.eligibility import reconcile_client_eligibility
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        reconcile_client_eligibility(client)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_there_is_NO_auto_resume(self):
+        """By decision. Releasing members automatically is a separate, riskier
+        piece: a held programme waits for an agent."""
+        from .models import Assessment, EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self._apply(client)
+        # The member now passes: a newer assessment WITH ECM.
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+            eligible_services=[self.ECM, self.MTM],
+            screen_created_at=timezone.now(),
+        )
+        self._apply(client)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)

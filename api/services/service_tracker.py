@@ -646,7 +646,36 @@ def detect_alerts(ctx):
                 ))
         return alerts
 
-    # ⚠ THE "WRONG KIND OF FOOD CASE" ALERTS WERE REMOVED, and deliberately so.
+    # RULE 4 -- meals-only eligibility holding a BOXES case. A WARNING, never a hold.
+    #
+    # ⚠ The distinction is the whole point. Rule 3 (boxes-only eligibility + a MEALS
+    # case) HOLDS the programme in internal_service_rules.py, because stepping UP to
+    # the expensive service without eligibility is a real problem. This one does not,
+    # because the payer plainly disagrees that it is one:
+    #
+    #     meals-eligible members holding a BOXES case   219   218 APPROVED, 0 denied
+    #     ... every one on a "Food Prescriptions: Boxes" programme, none on Voucher
+    #     ... 106 previously held a meals case -- a deliberate switch
+    #
+    # So it is surfaced for review and nobody's deliveries stop. 196 governing cases
+    # on the clone.
+    if "Food" in domains:
+        meals_only = bool(eligible & set(MEALS)) and not (
+            eligible & set(FOOD_PRESCRIPTION)
+        )
+        boxes_case = _find_case(ctx["live_cases"], "Produce Prescription/Voucher")
+        if meals_only and boxes_case is not None:
+            alerts.append(_alert(
+                "boxes_case_meals_only",
+                "Boxes case open, but the assessment names meals only",
+                "The latest eligibility assessment permits medically tailored meals "
+                "and not a produce prescription. Worth checking — though this is "
+                "common and usually approved, so the programme is NOT held.",
+                program=boxes_case.program_name or "",
+                severity="warning",
+            ))
+
+    # ⚠ THE OPPOSITE ALERT WAS REMOVED, and deliberately so.
     #
     # They fired when a member held a meals case with voucher eligibility, or the
     # reverse. The authorisation data shows both are normal:
