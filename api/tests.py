@@ -37353,3 +37353,117 @@ class HoldHouseholdCasesCommandTest(TestCase):
         events = StageEvent.objects.filter(client=client, to_stage="on_hold")
         self.assertTrue(events.exists())
         self.assertIn("9/23", events.first().note)
+
+
+class NutritionistPausedTabTest(TestCase):
+    """The Nutritionist queue's second tab: members THEY paused."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        self.reason = PauseReason.objects.create(
+            code="nutritionist_paused", label="Nutritionist Paused", is_system=True,
+        )
+        PauseReason.objects.create(code="member_cancelled", label="Member cancelled")
+
+        def api_for(group):
+            agent = Agent.objects.create(
+                name=f"N {group}", agent_code=str(abs(hash(group)) % 9000 + 800),
+                group=group,
+            )
+            acc = AccessToken()
+            acc["agent_id"] = str(agent.id)
+            acc["agent_code"] = agent.agent_code
+            acc["agent_name"] = agent.name
+            acc["agent_group"] = agent.group
+            client = APIClient()
+            client.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+            return client
+
+        self.api = api_for("Nutritionist")
+        self.api_for = api_for
+
+    def _member(self, name, status, reason=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Nut",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name=f"{name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enrollment = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client, status=status,
+            member_name=f"{name} Nut", pause_reason=reason,
+        )
+        return client
+
+    def _get(self, query=""):
+        resp = self.api.get(f"/api/portal/nutritionist/paused/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_it_lists_nutritionist_paused_members(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["pause_reason_label"], "Nutritionist Paused")
+
+    def test_an_AGENT_pause_is_NOT_listed(self):
+        """Not the Nutritionist's to lift. Listing it would invite them to act on a
+        pause somebody else owns, for a reason they cannot see."""
+        from .models import MemberStatus, PauseReason
+
+        self._member(
+            "Agt", MemberStatus.PAUSED,
+            PauseReason.objects.get(code="member_cancelled"),
+        )
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_OUT_OF_ORBIT_and_active_members_are_absent(self):
+        from .models import MemberStatus
+
+        self._member("Orb", MemberStatus.OUT_OF_ORBIT)
+        self._member("Act", MemberStatus.ACTIVE)
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_the_shape_MATCHES_pending_review(self):
+        """The two tabs share a row component and the review drawer, so a missing
+        key renders as a blank row rather than an error."""
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        row = self._get()["results"][0]
+        for key in ("client_id", "primary_name", "program_name", "verified_at",
+                    "authorization_status", "members"):
+            self.assertIn(key, row)
+
+    def test_searching_by_name(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        self._member("Bob", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        self.assertEqual(self._get("?search=Ada")["count"], 1)
+
+    def test_MANAGEMENT_may_see_it_too(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        resp = self.api_for("Management").get("/api/portal/nutritionist/paused/")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_another_group_is_REFUSED(self):
+        """Same gate as Pending Review -- a queue that leaks to every agent is not a
+        Nutritionist queue."""
+        resp = self.api_for("Logistics").get("/api/portal/nutritionist/paused/")
+        self.assertEqual(resp.status_code, 403)

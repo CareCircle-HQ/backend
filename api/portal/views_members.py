@@ -6377,6 +6377,89 @@ class NutritionistPendingSplitListView(PortalAPIView):
         return Response({"count": len(results), "results": results})
 
 
+class NutritionistPausedListView(NutritionistPendingSplitListView):
+    """GET: members the NUTRITIONIST paused -- the other half of their queue.
+
+    Only ``NUTRITIONIST_PAUSED``. An agent pause, an Out of Orbit or an eligibility
+    pause are not the Nutritionist's to lift, and listing them here would invite a
+    Nutritionist to act on a pause somebody else owns for a reason they cannot see.
+
+    Same response shape and the same review drawer as Pending Review, so the two
+    tabs behave identically. Nutritionist + Management only -- inherited, along with
+    the search.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        allowed = bool(agent and (
+            agent.group in ("Nutritionist", "Management")
+            or getattr(agent, "is_manager", False)
+        ))
+        if not allowed:
+            return Response(
+                {"detail": "Nutritionist access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        from ..services.lifecycle import governing_internal_case
+        from .serializers import active_enrollment
+
+        clients = Client.objects.filter(
+            member_profiles__status=MemberStatus.NUTRITIONIST_PAUSED,
+        ).distinct()
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search) | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, AttributeError, TypeError):
+                pass
+            clients = clients.filter(cond).distinct()
+
+        results = []
+        for c in clients:
+            gov = active_enrollment(c)
+            case = (gov.case or governing_internal_case(gov)) if gov else None
+            profiles = list(gov.member_profiles.all()) if gov else []
+            members = [
+                {"name": p.member_name or "", "status": p.status} for p in profiles
+            ]
+            paused = next(
+                (p for p in profiles
+                 if p.status == MemberStatus.NUTRITIONIST_PAUSED), None,
+            )
+            results.append({
+                "client_id": str(c.client_id),
+                "primary_name": f"{c.first_name} {c.last_name}".strip()
+                or str(c.client_id),
+                "program_name": (gov.program_name if gov else "")
+                or getattr(case, "program_name", "") or "",
+                "verified_at": gov.verified_at.isoformat()
+                if (gov and gov.verified_at) else None,
+                "authorization_status": getattr(
+                    case, "service_authorization_status", "",
+                ) or "",
+                "members": members,
+                # WHY, from the catalogue -- the tab exists so a Nutritionist can see
+                # their own paused members and act, and "paused" without a reason is
+                # the thing they would have to go and look up.
+                "pause_reason_label": (
+                    paused.pause_reason.label
+                    if paused is not None and paused.pause_reason_id else ""
+                ),
+            })
+        results.sort(key=lambda r: r["primary_name"].lower())
+        return Response({"count": len(results), "results": results})
+
+
 class MeSignatureView(PortalAPIView):
     """GET/PUT the logged-in agent's SAVED signature image (a PNG data URL).
 
