@@ -6460,6 +6460,129 @@ class NutritionistPausedListView(NutritionistPendingSplitListView):
         return Response({"count": len(results), "results": results})
 
 
+class MemberNutritionistResumeMemberView(PortalAPIView):
+    """POST: return a NUTRITIONIST_PAUSED member to service.
+
+    The mirror of MemberNutritionistDenyMemberView, and deliberately narrow: it
+    refuses any other status. An agent pause, an Out of Orbit or an eligibility
+    pause are not the Nutritionist's to lift -- each has its own remedy, and lifting
+    one from here would put a member back into service past a gate that is still
+    failing.
+
+    Resuming re-runs the KITCHEN-AWARE meal rule rather than assuming Active. A
+    member paused weeks ago may have a menu or allergy set the assigned kitchen can
+    no longer fulfil, and forcing them Active would put an unfulfillable member on
+    the next Purchase Order.
+    """
+
+    def post(self, request, client_id):
+        from ..services.lifecycle import advance_enrollment
+        from ..services.timeline import emit_timeline_event
+
+        agent = current_agent(request)
+        if not (agent and (
+            agent.group in ("Nutritionist", "Management")
+            or getattr(agent, "is_manager", False)
+        )):
+            return Response(
+                {"detail": "Only a Nutritionist can resume a member."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        member_id = request.data.get("member_id") or ""
+        note_text = (request.data.get("reason") or "").strip()
+
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response(
+                {"error": "This household has no active enrollment."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+        mv = (
+            enr.member_profiles.filter(client_id=member_id).first()
+            if member_id else None
+        )
+        if mv is None:
+            return Response(
+                {"error": "Member not found in this household."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if mv.status != MemberStatus.NUTRITIONIST_PAUSED:
+            # Names the status, because "cannot resume" without it sends an agent
+            # looking for a bug rather than to the right remedy.
+            return Response(
+                {
+                    "error": (
+                        "This member is not Nutritionist Paused "
+                        f"(currently {MemberStatus(mv.status).label}), so a "
+                        "Nutritionist cannot resume them."
+                    ),
+                },
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        # The meal rule decides where they land: Active, or Out of Orbit when the
+        # assigned kitchen cannot fulfil them. allow_resume lets it move the member
+        # OFF a paused status, which it otherwise refuses.
+        reconcile_member_kitchen_output(
+            mv, enr.kitchen, save=False, allow_resume=True,
+        )
+        # The reason goes with the pause. Leaving it set on a serving member reads as
+        # a current problem, and the Paused tab filters on it.
+        mv.pause_reason = None
+        mv.save(update_fields=[
+            "status", "pause_reason", "kitchen_meal_type", "kitchen_food_notes",
+        ])
+
+        # Lift the household hold this member's pause caused -- but ONLY that one.
+        # Note-scoped, so a hold placed by a different rule, or by hand, survives.
+        resumed = False
+        if enr.stage == EnrollmentStage.ON_HOLD:
+            still_paused = enr.member_profiles.filter(
+                status__in=MEMBER_PAUSED_STATUSES,
+            ).exists()
+            if not still_paused:
+                try:
+                    advance_enrollment(
+                        enr, EnrollmentStage.SERVICE_ACTIVE,
+                        actor_label=agent.name or "Nutritionist",
+                        note="Nutritionist resumed the last paused member.",
+                    )
+                    resumed = True
+                except Exception:  # noqa: BLE001 - the member resume already stuck
+                    logger.warning(
+                        "could not resume enrollment %s after a nutritionist "
+                        "resume", enr.pk,
+                    )
+
+        member_name = (mv.member_name or "").strip()
+        if mv.client_id:
+            Note.objects.create(
+                client=mv.client, source=NoteSource.AGENT,
+                author_name=agent.name or "",
+                body=(
+                    f"Member resumed by Nutritionist."
+                    + (f" Note: {note_text}" if note_text else "")
+                ),
+            )
+            emit_timeline_event(
+                client=mv.client,
+                event_type=TimelineEventType.NUTRITIONIST_PAUSED,
+                occurred_at=timezone.now(),
+                title="Nutritionist Resumed",
+                subtitle=(
+                    f"{member_name} \u00b7 {note_text}" if member_name and note_text
+                    else member_name or note_text
+                ),
+            )
+        return Response({
+            "member_id": str(mv.client_id or ""),
+            "status": mv.status,
+            "status_label": MemberStatus(mv.status).label,
+            "enrollment_resumed": resumed,
+        })
+
+
 class MeSignatureView(PortalAPIView):
     """GET/PUT the logged-in agent's SAVED signature image (a PNG data URL).
 
@@ -6842,7 +6965,12 @@ class MemberNutritionistDenyMemberView(PortalAPIView):
         mv.pause_reason = pause_reason_obj(pr.NUTRITIONIST_PAUSED)
         mv.kitchen_meal_type = ""
         mv.kitchen_food_notes = ""
-        mv.save(update_fields=["status", "kitchen_meal_type", "kitchen_food_notes"])
+        mv.save(update_fields=[
+            # pause_reason IS in this list. It was assigned two lines above and
+            # omitted here, so every Nutritionist pause silently discarded its
+            # reason -- the exact failure the eligibility path was fixed for.
+            "status", "pause_reason", "kitchen_meal_type", "kitchen_food_notes",
+        ])
         from ..services.timeline import emit_timeline_event
         if mv.client_id:
             member_name = (mv.member_name or "").strip()
@@ -7880,7 +8008,8 @@ def assign_kitchen_to_household(
             profile.kitchen_meal_type = ""
             profile.kitchen_food_notes = ""
             profile.save(update_fields=[
-                "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
+                "status", "pause_reason", "kitchen_meal_type",
+                "kitchen_food_notes", "updated_at",
             ])
             out_of_orbit += 1
             reason = note or "Excluded from kitchen assignment by agent."

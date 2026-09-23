@@ -37467,3 +37467,205 @@ class NutritionistPausedTabTest(TestCase):
         Nutritionist queue."""
         resp = self.api_for("Logistics").get("/api/portal/nutritionist/paused/")
         self.assertEqual(resp.status_code, 403)
+
+
+class NutritionistResumeMemberTest(TestCase):
+    """Returning a NUTRITIONIST_PAUSED member to service."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        self.reason = PauseReason.objects.create(
+            code="nutritionist_paused", label="Nutritionist Paused", is_system=True,
+        )
+
+        def api_for(group, code):
+            agent = Agent.objects.create(name=f"R {group}", agent_code=code, group=group)
+            acc = AccessToken()
+            acc["agent_id"] = str(agent.id)
+            acc["agent_code"] = agent.agent_code
+            acc["agent_name"] = agent.name
+            acc["agent_group"] = agent.group
+            api = APIClient()
+            api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+            return api
+
+        self.api = api_for("Nutritionist", "861")
+        self.api_for = api_for
+
+    def _household(self, statuses, stage=None, menu_type="Regular"):
+        """⚠ `menu_type` matters more than it looks. Resuming re-runs the meal rule,
+        and "no menu type is assigned yet" is one of its Out of Orbit conditions --
+        so a fixture without one lands OUT_OF_ORBIT and never reaches the behaviour
+        under test. No kitchen is assigned deliberately: the capability check is
+        skipped when there is none, which keeps these tests about resuming rather
+        than about kitchen configuration."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pri", last_name="Res",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Res HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh,
+            stage=stage or EnrollmentStage.SERVICE_ACTIVE,
+        )
+        profiles = []
+        for i, status in enumerate(statuses):
+            member = primary if i == 0 else Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=f"M{i}", last_name="Res",
+                client_added_at=timezone.now(),
+            )
+            if i:
+                HouseholdMember.objects.create(
+                    household=hh, client=member, is_primary=False,
+                )
+            profiles.append(MemberDietaryProfile.objects.create(
+                enrollment=enr, client=member, status=status,
+                menu_type=menu_type,
+                member_name=f"{member.first_name} Res",
+                pause_reason=(
+                    self.reason if status == "nutritionist_paused" else None
+                ),
+            ))
+        return primary, enr, profiles
+
+    def _resume(self, primary, member, api=None):
+        return (api or self.api).post(
+            f"/api/portal/members/{primary.client_id}/nutritionist/resume-member/",
+            {"member_id": str(member.client_id)}, format="json",
+        )
+
+    def test_it_resumes_the_member(self):
+        from .models import MemberStatus
+
+        primary, _enr, profiles = self._household([MemberStatus.NUTRITIONIST_PAUSED])
+        resp = self._resume(primary, profiles[0].client)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        profiles[0].refresh_from_db()
+        self.assertNotEqual(profiles[0].status, MemberStatus.NUTRITIONIST_PAUSED)
+
+    def test_the_pause_REASON_is_cleared(self):
+        """Left on a serving member it reads as a current problem -- and the Paused
+        tab filters on it."""
+        from .models import MemberStatus
+
+        primary, _enr, profiles = self._household([MemberStatus.NUTRITIONIST_PAUSED])
+        self._resume(primary, profiles[0].client)
+        profiles[0].refresh_from_db()
+        self.assertIsNone(profiles[0].pause_reason)
+
+    def test_it_REFUSES_any_other_paused_status(self):
+        """An agent pause, Out of Orbit or an eligibility pause are not the
+        Nutritionist's to lift, and each has its own remedy. Lifting one here would
+        return a member to service past a gate that is still failing."""
+        from .models import MemberStatus
+
+        for status in (MemberStatus.PAUSED, MemberStatus.OUT_OF_ORBIT,
+                       MemberStatus.OUT_OF_RANGE, MemberStatus.ACTIVE):
+            primary, _enr, profiles = self._household([status])
+            resp = self._resume(primary, profiles[0].client)
+            self.assertEqual(resp.status_code, 400, f"{status}: {resp.content}")
+            profiles[0].refresh_from_db()
+            self.assertEqual(profiles[0].status, status)
+
+    def test_the_refusal_NAMES_the_current_status(self):
+        """"Cannot resume" alone sends an agent looking for a bug rather than to the
+        right remedy."""
+        from .models import MemberStatus
+
+        primary, _enr, profiles = self._household([MemberStatus.OUT_OF_ORBIT])
+        resp = self._resume(primary, profiles[0].client)
+        self.assertIn("Out of Orbit", resp.data["error"])
+
+    def test_resuming_the_LAST_paused_member_lifts_the_household_hold(self):
+        from .models import EnrollmentStage, MemberStatus
+
+        primary, enr, profiles = self._household(
+            [MemberStatus.NUTRITIONIST_PAUSED], stage=EnrollmentStage.ON_HOLD,
+        )
+        resp = self._resume(primary, profiles[0].client)
+        self.assertTrue(resp.data["enrollment_resumed"], resp.data)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_a_resume_the_MEAL_RULE_cannot_fulfil_lands_OUT_OF_ORBIT(self):
+        """⚠ Resuming does NOT guarantee a return to service. The meal rule decides,
+        and a member with no menu type -- or whose menu the assigned kitchen cannot
+        fulfil -- lands Out of Orbit. Forcing them Active instead would put an
+        unfulfillable member on the next Purchase Order.
+
+        The response reports the status for exactly this reason, so the caller can
+        say what actually happened rather than "resumed"."""
+        from .models import EnrollmentStage, MemberStatus
+
+        primary, enr, profiles = self._household(
+            [MemberStatus.NUTRITIONIST_PAUSED],
+            stage=EnrollmentStage.ON_HOLD, menu_type="",
+        )
+        resp = self._resume(primary, profiles[0].client)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["status"], MemberStatus.OUT_OF_ORBIT)
+        # And the hold STAYS, because there is still nobody servable.
+        self.assertFalse(resp.data["enrollment_resumed"])
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+    def test_it_does_NOT_lift_the_hold_while_another_member_is_paused(self):
+        """Resuming one of two paused members leaves nobody to serve either."""
+        from .models import EnrollmentStage, MemberStatus
+
+        primary, enr, profiles = self._household(
+            [MemberStatus.NUTRITIONIST_PAUSED, MemberStatus.PAUSED],
+            stage=EnrollmentStage.ON_HOLD,
+        )
+        resp = self._resume(primary, profiles[0].client)
+        self.assertFalse(resp.data["enrollment_resumed"])
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+    def test_another_group_is_REFUSED(self):
+        from .models import MemberStatus
+
+        primary, _enr, profiles = self._household([MemberStatus.NUTRITIONIST_PAUSED])
+        resp = self._resume(
+            primary, profiles[0].client, api=self.api_for("Logistics", "862"),
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_it_is_recorded_on_the_member(self):
+        from .models import MemberStatus, Note
+
+        primary, _enr, profiles = self._household([MemberStatus.NUTRITIONIST_PAUSED])
+        self._resume(primary, profiles[0].client)
+        self.assertTrue(
+            Note.objects.filter(
+                client=profiles[0].client,
+                body__startswith="Member resumed by Nutritionist",
+            ).exists(),
+        )
+
+    def test_the_PAUSE_stores_its_reason(self):
+        """⚠ REGRESSION. The pause assigned pause_reason but its update_fields
+        omitted it, so every Nutritionist pause silently discarded the reason -- the
+        same failure the eligibility path was fixed for, in a second place."""
+        from .models import MemberStatus
+
+        primary, _enr, profiles = self._household([MemberStatus.ACTIVE])
+        resp = self.api.post(
+            f"/api/portal/members/{primary.client_id}/nutritionist-deny-member/",
+            {"member_id": str(profiles[0].client.client_id), "reason": "renal review"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        profiles[0].refresh_from_db()
+        self.assertEqual(profiles[0].status, MemberStatus.NUTRITIONIST_PAUSED)
+        self.assertIsNotNone(profiles[0].pause_reason)
+        self.assertEqual(profiles[0].pause_reason.code, "nutritionist_paused")
