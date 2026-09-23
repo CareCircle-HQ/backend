@@ -36972,3 +36972,166 @@ class PauseReasonTest(TestCase):
         out = StringIO()
         call_command("backfill_pause_reasons", "--apply", stdout=out, stderr=out)
         self.assertIn("0 profile(s)", out.getvalue())
+
+
+class PausedMembersTabTest(TestCase):
+    """Urgent Care -> Paused: every member not receiving service, and why."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        for code, label in (
+            ("out_of_range", "Out of Range"),
+            ("member_cancelled", "Member cancelled"),
+            ("uncategorized", "Uncategorized"),
+        ):
+            PauseReason.objects.create(code=code, label=label)
+        agent = Agent.objects.create(
+            name="Pm Agent", agent_code="792", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _member(self, name, status, reason_code=None, **kw):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, PauseReason,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        household = Household.objects.create(name=f"{name} HH")
+        HouseholdMember.objects.create(
+            household=household, client=client, is_primary=True,
+        )
+        enrollment = EnrollmentVerification.objects.create(
+            client=client, household=household,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client, status=status,
+            pause_reason=(
+                PauseReason.objects.get(code=reason_code) if reason_code else None
+            ),
+            **kw,
+        )
+        return client
+
+    def _get(self, query=""):
+        resp = self.api.get(f"/api/portal/members/paused/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_it_lists_paused_members_with_the_reason(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        row = data["results"][0]
+        self.assertEqual(row["member_status_label"], "Paused")
+        self.assertEqual(row["pause_reason_label"], "Member cancelled")
+
+    def test_ACTIVE_members_are_absent(self):
+        from .models import MemberStatus
+
+        self._member("Grace", MemberStatus.ACTIVE)
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_INACTIVE_and_REMOVED_are_EXCLUDED(self):
+        """They stop service too, but they are terminal -- "their service ended" and
+        "they were split into their own case" -- not a pause anyone should act on.
+        ~1,350 rows nobody can do anything about, on a page for work needing
+        attention."""
+        from .models import MemberStatus
+
+        self._member("Inez", MemberStatus.INACTIVE)
+        self._member("Remi", MemberStatus.REMOVED)
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_the_other_three_paused_statuses_are_included(self):
+        from .models import MemberStatus
+
+        self._member("Orb", MemberStatus.OUT_OF_ORBIT, "uncategorized")
+        self._member("Rng", MemberStatus.OUT_OF_RANGE, "out_of_range")
+        self._member("Nut", MemberStatus.NUTRITIONIST_PAUSED)
+        self.assertEqual(self._get()["count"], 3)
+
+    def test_filtering_by_reason(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        self._member("Bob", MemberStatus.OUT_OF_RANGE, "out_of_range")
+        data = self._get("?reason=out_of_range")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["name"], "Bob Member")
+
+    def test_filtering_by_NO_REASON_finds_the_backlog(self):
+        """The filter an agent actually works through."""
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        self._member("Nul", MemberStatus.PAUSED)
+        data = self._get("?reason=none")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["name"], "Nul Member")
+
+    def test_an_unknown_reason_is_ignored_not_rejected(self):
+        """A stale bookmark should show the list, not a 400 -- matching how the
+        other filters in this codebase behave."""
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        self.assertEqual(self._get("?reason=nonsense")["count"], 0)
+
+    def test_it_reports_the_PAUSED_profile_not_just_the_first(self):
+        """A client can hold several profiles across enrollments. Reporting the
+        first would show "Active" beside a member the page listed precisely because
+        they are not."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, PauseReason,
+        )
+
+        client = self._member("Duo", MemberStatus.ACTIVE)
+        other_hh = Household.objects.create(name="Duo HH2")
+        HouseholdMember.objects.filter(client=client).delete()
+        HouseholdMember.objects.create(
+            household=other_hh, client=client, is_primary=True,
+        )
+        enrollment = EnrollmentVerification.objects.create(
+            client=client, household=other_hh,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client, status=MemberStatus.PAUSED,
+            pause_reason=PauseReason.objects.get(code="member_cancelled"),
+        )
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["member_status_label"], "Paused")
+
+    def test_a_LOCKED_pause_is_flagged(self):
+        """An agent cannot lift it from the Program tab -- Customer Service must
+        dismiss the CaseMismatchFlag."""
+        from .models import MemberStatus
+
+        self._member("Lok", MemberStatus.PAUSED, "uncategorized", pause_locked=True)
+        self.assertTrue(self._get()["results"][0]["pause_locked"])
+
+    def test_searching_by_name(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        self._member("Bob", MemberStatus.PAUSED, "member_cancelled")
+        data = self._get("?search=Ada")
+        self.assertEqual(data["count"], 1)

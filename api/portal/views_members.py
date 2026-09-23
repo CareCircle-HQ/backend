@@ -3703,6 +3703,122 @@ class UnlinkedMembersListView(PortalGenericAPIView):
         return self.get_paginated_response(rows)
 
 
+class PausedMembersListView(UnlinkedMembersListView):
+    """Urgent Care -> Paused tab.
+
+    Every member currently in a non-serving status, with WHY. Reuses the row
+    serialization and the eligibility/navigation columns from
+    :class:`UnlinkedMembersListView`; only the population and two extra columns
+    differ.
+
+    ⚠ INACTIVE AND REMOVED ARE EXCLUDED. They also stop service, but they are
+    terminal -- "their service ended" and "they were split into their own case" --
+    not a pause somebody is expected to act on. Including them would add ~1,350 rows
+    nobody can do anything about to a page whose whole purpose is work needing
+    attention.
+    """
+
+    # The same four the backfill treats as pauses, for exactly the same reason.
+    PAUSED_STATUSES = (
+        MemberStatus.PAUSED,
+        MemberStatus.NUTRITIONIST_PAUSED,
+        MemberStatus.OUT_OF_ORBIT,
+        MemberStatus.OUT_OF_RANGE,
+    )
+
+    def get_queryset(self):
+        params = self.request.query_params
+        qs = Client.objects.filter(
+            member_profiles__status__in=self.PAUSED_STATUSES,
+        ).prefetch_related(
+            "insurances", "cases", "assessments", "tags",
+            "member_profiles__pause_reason",
+        ).distinct()
+
+        # ?reason=<code>, or ?reason=none for the ones nobody has classified --
+        # which is the filter that actually gets used, because it IS the backlog.
+        reason = (params.get("reason") or "").strip()
+        if reason == "none":
+            qs = qs.filter(
+                member_profiles__status__in=self.PAUSED_STATUSES,
+                member_profiles__pause_reason__isnull=True,
+            )
+        elif reason:
+            qs = qs.filter(
+                member_profiles__status__in=self.PAUSED_STATUSES,
+                member_profiles__pause_reason__code=reason,
+            )
+
+        status = (params.get("status") or "").strip()
+        if status in [s_.value for s_ in self.PAUSED_STATUSES]:
+            qs = qs.filter(member_profiles__status=status)
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+        return qs.order_by("last_name", "first_name").distinct()
+
+    def _paused_profile(self, client):
+        """The paused profile to report on.
+
+        A client can hold several profiles across enrollments. The one that matters
+        is the paused one -- reporting the first profile would show "Active" beside a
+        member the page has listed precisely because they are not.
+        """
+        for profile in client.member_profiles.all():
+            if profile.status in self.PAUSED_STATUSES:
+                return profile
+        return None
+
+    def get(self, request):
+        page = self.paginate_queryset(self.get_queryset())
+        rows = []
+        for c in page or []:
+            profile = self._paused_profile(c)
+            reason = getattr(profile, "pause_reason", None) if profile else None
+            rows.append({
+                "id": str(c.client_id),
+                "name": s._full_name(c),
+                "date_of_birth": c.date_of_birth.isoformat()
+                if c.date_of_birth else None,
+                "medicaid_id": s.medicaid_member_id(c) or "",
+                "eligible_services": self._eligible_services(c),
+                "eligibility_case": self._case_cell(
+                    self._case_of_type(c, CaseType.ELIGIBILITY)
+                ),
+                "navigation_case": self._case_cell(
+                    self._case_of_type(c, CaseType.NAVIGATION)
+                ),
+                "tags": _client_tags_payload(c),
+                # The two columns this tab exists for.
+                "member_status": profile.status if profile else "",
+                "member_status_label": (
+                    MemberStatus(profile.status).label if profile else ""
+                ),
+                "pause_reason_code": reason.code if reason else "",
+                "pause_reason_label": reason.label if reason else "",
+                # An agent cannot lift this one from the Program tab -- Customer
+                # Service must dismiss the CaseMismatchFlag -- so it is worth
+                # showing rather than leaving them to find out by clicking.
+                "pause_locked": bool(profile.pause_locked) if profile else False,
+            })
+        return self.get_paginated_response(rows)
+
+
 class NoNavigationMembersListView(UnlinkedMembersListView):
     """Urgent Care -> No Navigation tab.
 
