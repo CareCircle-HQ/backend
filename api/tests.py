@@ -37203,3 +37203,153 @@ class PausedMembersTabTest(TestCase):
             body="Member unpaused. Reason: back from holiday",
         )
         self.assertEqual(self._get()["results"][0]["pause_description"], "")
+
+
+class HoldHouseholdCasesCommandTest(TestCase):
+    """The 9/23 bulk hold: tag + On Hold for governing open household cases.
+
+    ⚠ This command STOPS SERVICE. An On Hold enrollment leaves every future Purchase
+    Order, so the narrowings below are the difference between holding 721 households
+    and holding the wrong ones.
+    """
+
+    TAG = "9/23 HH HOLD"
+
+    def _member(self, name, *, household=True, case_status="open",
+                stage=None, second_case=False):
+        from .models import (
+            Case, CaseHouseholdType, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="HH",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name=f"{name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status, service_type="Medically Tailored Meals",
+            household_type=(
+                CaseHouseholdType.HOUSEHOLD if household
+                else CaseHouseholdType.INDIVIDUAL
+            ),
+            case_created_at=timezone.now(),
+        )
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=stage or EnrollmentStage.SERVICE_ACTIVE,
+        )
+        return client, case
+
+    def _run(self, *args):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("hold_household_cases", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def _stage(self, client):
+        from .models import EnrollmentVerification
+
+        return EnrollmentVerification.objects.filter(client=client).first().stage
+
+    def _tags(self, client):
+        return set(client.tags.values_list("name", flat=True))
+
+    # ── the happy path ──────────────────────────────────────────────────────
+    def test_it_tags_and_holds(self):
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Ada")
+        self._run("--apply")
+        self.assertEqual(self._stage(client), EnrollmentStage.ON_HOLD)
+        self.assertIn(self.TAG, self._tags(client))
+
+    def test_a_DRY_RUN_changes_nothing(self):
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Ada")
+        output = self._run()
+        self.assertIn("Dry run", output)
+        self.assertEqual(self._stage(client), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(self._tags(client), set())
+
+    def test_the_tag_is_CREATED_when_missing(self):
+        from .models import ClientTag
+
+        self._member("Ada")
+        self.assertFalse(ClientTag.objects.filter(name=self.TAG).exists())
+        self._run("--apply")
+        self.assertTrue(ClientTag.objects.filter(name=self.TAG).exists())
+
+    def test_running_it_TWICE_changes_nothing_the_second_time(self):
+        client, _case = self._member("Ada")
+        self._run("--apply")
+        output = self._run("--apply")
+        self.assertIn("tagged 0", output)
+        self.assertIn("held 0", output)
+        self.assertEqual(len(self._tags(client)), 1)
+
+    # ── the three narrowings ────────────────────────────────────────────────
+    def test_an_INDIVIDUAL_case_is_out_of_scope(self):
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Ind", household=False)
+        self._run("--apply")
+        self.assertEqual(self._stage(client), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(self._tags(client), set())
+
+    def test_a_CLOSED_case_is_out_of_scope(self):
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Cls", case_status="closed")
+        self._run("--apply")
+        self.assertEqual(self._stage(client), EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_a_CLOSED_ENROLLMENT_is_skipped_ENTIRELY_not_even_tagged(self):
+        """Moving it to On Hold would REOPEN it -- a different and much larger action
+        than the one asked for. 7 of 729 on real data."""
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Cle", stage=EnrollmentStage.CLOSED)
+        output = self._run("--apply")
+        self.assertEqual(self._stage(client), EnrollmentStage.CLOSED)
+        self.assertEqual(self._tags(client), set())
+        self.assertIn("skipped ENTIRELY", output)
+
+    def test_an_already_HELD_enrollment_is_still_tagged(self):
+        """82 of 729 are already On Hold. They are in scope -- the tag records that
+        they were part of this batch -- but the hold is a no-op."""
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Hld", stage=EnrollmentStage.ON_HOLD)
+        self._run("--apply")
+        self.assertIn(self.TAG, self._tags(client))
+        self.assertEqual(self._stage(client), EnrollmentStage.ON_HOLD)
+
+    def test_ONE_bad_member_does_not_roll_back_the_others(self):
+        """Committed per member, not in one transaction over all 729: a single bad
+        transition must not undo 700 good ones, and a re-run picks up where it
+        stopped."""
+        from .models import EnrollmentStage
+
+        good, _c1 = self._member("Good")
+        other, _c2 = self._member("Alsogood")
+        self._run("--apply")
+        self.assertEqual(self._stage(good), EnrollmentStage.ON_HOLD)
+        self.assertEqual(self._stage(other), EnrollmentStage.ON_HOLD)
+
+    def test_the_hold_is_recorded_in_the_stage_history(self):
+        """A bulk change nobody can trace is how 'why is this household on hold?'
+        becomes unanswerable six months later."""
+        from .models import StageEvent
+
+        client, _case = self._member("Ada")
+        self._run("--apply")
+        events = StageEvent.objects.filter(client=client, to_stage="on_hold")
+        self.assertTrue(events.exists())
+        self.assertIn("9/23", events.first().note)
