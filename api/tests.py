@@ -35771,6 +35771,118 @@ class ServiceTrackerTest(TestCase):
             "Produce Prescription", self._track("food")["items"][0]["detail"],
         )
 
+    def test_a_CLOSED_food_case_reads_as_ENDED_not_as_a_to_do(self):
+        """⚠ 1,461 members whose food programme had finished were showing "Food
+        service case — to-do", which reads as "nobody ever opened one". They did; it
+        ran and closed."""
+        from datetime import timedelta
+
+        from .models import Case
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(
+            case_status="closed",
+            case_closed_at=timezone.now() - timedelta(days=9),
+        )
+        row = self._track("food")["items"][0]
+        self.assertEqual(row["state"], "ended")
+        self.assertIn("Service ended", row["detail"])
+        self.assertIn("Medically Tailored Meals", row["detail"])
+
+    def test_the_ENDED_row_names_the_CLOSE_DATE(self):
+        from datetime import timedelta
+
+        from .models import Case
+
+        closed_on = (timezone.now() - timedelta(days=30)).date()
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(
+            case_status="closed", case_closed_at=timezone.now() - timedelta(days=30),
+        )
+        self.assertIn(
+            closed_on.isoformat(), self._track("food")["items"][0]["detail"],
+        )
+
+    def test_the_MOST_RECENTLY_closed_case_is_the_one_reported(self):
+        """A member with several closed cases ended the LAST one, not their first."""
+        from datetime import timedelta
+
+        from .models import Case, CaseType
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        old = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="closed",
+            service_type="Medically Tailored Meals",
+            program_name="MTM - Brooklyn", case_created_at=timezone.now(),
+        )
+        Case.objects.filter(pk=old.pk).update(
+            case_closed_at=timezone.now() - timedelta(days=200),
+        )
+        recent = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="closed",
+            service_type="Produce Prescription/Voucher",
+            program_name="Boxes - Brooklyn", case_created_at=timezone.now(),
+        )
+        Case.objects.filter(pk=recent.pk).update(
+            case_closed_at=timezone.now() - timedelta(days=3),
+        )
+        self.assertIn(
+            "Produce Prescription/Voucher",
+            self._track("food")["items"][0]["detail"],
+        )
+
+    def test_a_LIVE_case_outranks_a_closed_one(self):
+        from datetime import timedelta
+
+        from .models import Case, CaseType
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        closed = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="closed",
+            service_type="Medically Tailored Meals",
+            program_name="MTM - Brooklyn", case_created_at=timezone.now(),
+        )
+        Case.objects.filter(pk=closed.pk).update(
+            case_closed_at=timezone.now() - timedelta(days=5),
+        )
+        self._case("Produce Prescription/Voucher")      # live
+        row = self._track("food")["items"][0]
+        self.assertEqual(row["state"], "done")
+
+    def test_a_closed_case_keeps_the_track_VISIBLE_with_no_food_eligibility(self):
+        """⚠ The member who surfaced this: screened for Food, ECM only on the
+        assessment, an APPROVED meals case closed in September -- and the whole track
+        vanished, so the profile gave no sign a food programme had ever existed."""
+        from datetime import timedelta
+
+        from .models import Case
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM])                 # NO food service named
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(
+            case_status="closed", case_closed_at=timezone.now() - timedelta(days=9),
+        )
+        track = self._track("food")
+        self.assertIsNotNone(track)
+        self.assertEqual(track["items"][0]["state"], "ended")
+
+    def test_with_NO_food_eligibility_and_NO_case_the_track_stays_absent(self):
+        """The 116 approved-case members this guard was written for: demanding a food
+        case a member was never assessed for would invent a requirement."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM])
+        self.assertIsNone(self._track("food"))
+
     def test_NO_food_case_is_still_outstanding(self):
         self._screen(["Clinically Appropriate Meals (Food)"])
         self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])

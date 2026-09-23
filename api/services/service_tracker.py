@@ -389,6 +389,33 @@ def rule_1_housing(ctx, client):
     }
 
 
+def _last_ended_food_case(ctx):
+    """The most recently CLOSED food case, when none is live.
+
+    Read from ``all_cases`` rather than ``live_cases``: the point is to show that a
+    programme existed and has finished, which no live-only view can say. Ordered by
+    close date so a member with several closed cases reports the last one -- that is
+    the programme that "ended", not their first ever.
+    """
+    candidates = [
+        case for case in ctx["all_cases"]
+        if (case.service_type or "") in (
+            "Medically Tailored Meals", "Produce Prescription/Voucher",
+        )
+        and (case.case_status or "") not in LIVE_STATUSES
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda c: (
+            c.case_closed_at or c.case_created_at or timezone.now().replace(
+                year=1970,
+            ),
+        ),
+    )
+
+
 def rule_2_and_3_food(ctx):
     """Screened for Food + ECM -> a FOOD CASE. Meals or boxes; either satisfies it.
 
@@ -417,15 +444,23 @@ def rule_2_and_3_food(ctx):
         return None
 
     eligible = set(ctx["eligible"])
-    if not (eligible & (set(MEALS) | set(FOOD_PRESCRIPTION))):
-        # No food service named at all. The track is absent rather than showing a
-        # to-do: 116 such members hold an APPROVED food case, so demanding one would
-        # be inventing a requirement the programme does not have.
-        return None
-
     meals = _find_case(ctx["live_cases"], "Medically Tailored Meals")
     boxes = _find_case(ctx["live_cases"], "Produce Prescription/Voucher")
     case = meals or boxes
+    ended = _last_ended_food_case(ctx) if case is None else None
+
+    if not (eligible & (set(MEALS) | set(FOOD_PRESCRIPTION))):
+        # No food service named at all. Normally the track is absent rather than
+        # showing a to-do: 116 such members hold an APPROVED food case, so demanding
+        # one would be inventing a requirement the programme does not have.
+        #
+        # ⚠ BUT NOT WHEN THERE IS A FOOD CASE TO SHOW. A member who was served and
+        # whose programme has since closed had the track disappear entirely, so the
+        # profile gave no sign a food programme had ever existed. 6 members on the
+        # clone, and the one that surfaced it was screened for Food with an APPROVED
+        # meals case closed in September.
+        if case is None and ended is None:
+            return None
 
     # Which one they actually have, because "a food case" is the rule but an agent
     # still wants to know whether it is meals or boxes.
@@ -435,12 +470,26 @@ def rule_2_and_3_food(ctx):
         detail = "Medically Tailored Meals"
     elif boxes:
         detail = "Produce Prescription / Voucher"
+    elif ended is not None:
+        # ⚠ ENDED, NOT OUTSTANDING. Before this, 1,461 members whose food programme
+        # had closed showed "Food service case — to-do", which reads as "nobody ever
+        # opened one". They did; it ran and finished. Saying "open this case" on all
+        # of them would be both wrong and the loudest thing on the tracker.
+        closed_on = getattr(ended, "case_closed_at", None)
+        detail = (
+            f"Service ended — {ended.service_type}"
+            + (f", closed {closed_on.date().isoformat()}" if closed_on else "")
+        )
     else:
         detail = "Meals or voucher — either satisfies this"
 
+    # "ended" is its own state so the UI can render it as history rather than as
+    # either a success or a task, and the header badge counts only todo + blocked.
+    row_state = "ended" if (case is None and ended is not None) else None
     items = [{
         **_item(
-            "Food service case", case is not None, case=case, detail=detail,
+            "Food service case", case is not None,
+            case=case or ended, detail=detail, state=row_state,
             home_borough=ctx["home_borough"],
         ),
         "rule": "Rules 2 & 3",
