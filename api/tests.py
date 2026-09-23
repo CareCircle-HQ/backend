@@ -38638,3 +38638,148 @@ class InternalServiceRulesTest(TestCase):
         self._apply(client)
         enr.refresh_from_db()
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+
+class InternalServiceRulesTriggerTest(TestCase):
+    """WHERE the hold rules run.
+
+    ⚠ They were hooked only to the CLIENT paths at first, which is the wrong input:
+    rules 2 and 3 judge the GOVERNING CASE, and the governing case is exactly what a
+    CASE write changes -- the eligibility assessment barely moves. So an agent could
+    open a meals case for a boxes-only member and nothing would hold it until that
+    client happened to be imported again, and a case opened and closed between two
+    client imports was never judged at all.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+    BOXES = "Food Prescriptions (Voucher / Boxes) (Food)"
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, HoldReason
+
+        for code, label in (
+            ("not_enhanced_member", "Not an Enhanced Member"),
+            ("wrong_case_type", "Wrong Case Type Opened"),
+            ("uncategorized", "Uncategorized"),
+        ):
+            HoldReason.objects.create(code=code, label=label)
+        self.agent = Agent.objects.create(
+            name="Trig Agent", agent_code="897", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(self.agent.id)
+        acc["agent_code"] = self.agent.agent_code
+        acc["agent_name"] = self.agent.name
+        acc["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _member_awaiting_a_case(self):
+        """A member who passes every hard gate, is boxes-only eligible, and has NO
+        case yet -- so the case write is the thing that creates the violation."""
+        from .models import (
+            Assessment, Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Insurance, InsurancePlanType, MemberDietaryProfile,
+            RecordStatus, SocialCareCoverage, SocialCareCoverageStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Trg", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Insurance.objects.create(
+            client=client, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE, plan_name="NY Medicaid",
+        )
+        SocialCareCoverage.objects.create(
+            client=client, coverage_id=uuid.uuid4(),
+            status=SocialCareCoverageStatus.ENROLLED, plan_name="Social Care",
+        )
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+            eligible_services=[self.ECM, self.BOXES],
+            screen_created_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Trg HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Trg Member",
+        )
+        return client, enr
+
+    def _wrong_case(self, client):
+        """A MEALS case for a boxes-only member -- a rule 3 violation."""
+        from .models import Case, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+            service_type="Medically Tailored Meals",
+            program_name="Medically Tailored Meals (MTM) - Other - Brooklyn",
+            case_created_at=timezone.now(),
+        )
+
+    def test_a_CASE_save_through_the_viewset_holds_the_programme(self):
+        """The gap this closes. Previously nothing held until a CLIENT save."""
+        from .models import EnrollmentStage
+        from .views import CaseViewSet
+
+        client, enr = self._member_awaiting_a_case()
+        case = self._wrong_case(client)
+
+        # Exercise the hook the viewset calls, with a request carrying an agent.
+        view = CaseViewSet()
+        view.request = type("R", (), {"user": self.agent})()
+        view._apply_internal_service_rules(case)
+
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "wrong_case_type")
+
+    def test_a_case_with_NO_client_is_a_no_op(self):
+        from .views import CaseViewSet
+
+        view = CaseViewSet()
+        view.request = type("R", (), {"user": self.agent})()
+        view._apply_internal_service_rules(
+            type("C", (), {"client": None, "pk": None})(),
+        )  # must not raise
+
+    def test_a_rule_failure_never_breaks_the_case_write(self):
+        """Wrapped in try/except for exactly this: a hold is worth having, but not
+        at the cost of losing the case the agent just saved."""
+        from unittest.mock import patch
+
+        from .views import CaseViewSet
+
+        client, _enr = self._member_awaiting_a_case()
+        case = self._wrong_case(client)
+        view = CaseViewSet()
+        view.request = type("R", (), {"user": self.agent})()
+        with patch(
+            "api.services.internal_service_rules.apply_internal_service_rules",
+            side_effect=RuntimeError("boom"),
+        ):
+            view._apply_internal_service_rules(case)   # must not raise
+
+    def test_the_CSV_cases_import_runs_them_too(self):
+        """The cases importer changes the governing case, so it has to judge it --
+        the clients importer alone would leave a cases-only run unjudged."""
+        from .models import EnrollmentStage
+        from .services.csv_import import CsvImporter
+
+        client, enr = self._member_awaiting_a_case()
+        self._wrong_case(client)
+
+        importer = CsvImporter.__new__(CsvImporter)
+        importer.reconcile_client_ids = {client.pk}
+        importer.reconcile_touched_cases()
+
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "wrong_case_type")

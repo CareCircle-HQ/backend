@@ -149,9 +149,38 @@ although no assessment they have ever had named a food service.
 
 ### The asymmetric rule — NOW ENFORCED ✅
 
-`api/services/internal_service_rules.py`, called from
-`reconcile_client_eligibility`, so it applies on **both** the extension save and the
-CSV import. **It only ever HOLDS** — no auto-resume yet, by decision.
+`api/services/internal_service_rules.py`. **It only ever HOLDS** — no auto-resume
+yet, by decision.
+
+Six entry points, covering both the client and the case side:
+
+| Path | Where |
+|---|---|
+| ext CLIENT save | `views.py` — `ClientViewSet` create / update / bulk upsert |
+| ext CASE save | `views.py` — `CaseViewSet.perform_create` / `perform_update` |
+| ext CASE bulk | `views.py` — once per client, on the complete case picture |
+| CSV clients import | via `reconcile_client_eligibility` |
+| CSV cases import | `csv_import.reconcile_touched_cases` |
+| member / household edits | via `reconcile_client_eligibility` |
+
+⚠️ **The case paths matter more than the client ones.** Rules 2 and 3 judge the
+GOVERNING CASE, and a case write is what changes it — the assessment barely moves.
+Hooked only to the client paths (as they were first built), an agent could open a
+meals case for a boxes-only member and nothing would hold it until that client
+happened to be imported again; a case opened and closed between two client imports
+was never judged at all.
+
+On the bulk and CSV paths it runs **once per client, after** the authorization
+reconcile, so it reads the settled governing case. Per row it would judge a partial
+picture — a closed case written before its open successor looks like the governing
+one.
+
+Preview it with:
+
+```
+python manage.py apply_internal_service_rules            # dry run
+python manage.py apply_internal_service_rules --apply
+```
 
 Judged against the **GOVERNING case only**, and against the **latest** assessment
 only.
