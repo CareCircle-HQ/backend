@@ -38057,6 +38057,63 @@ class HoldReasonTest(TestCase):
         call_command("backfill_hold_reasons", stdout=out, stderr=out)
         self.assertIn("catalogue is missing", out.getvalue())
 
+    def test_the_AGENT_hold_endpoint_stores_the_chosen_category(self):
+        """The generic per-program On Hold on the Program tab -- distinct from the
+        Close flow, where the category is implied by the action."""
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, EnrollmentStage
+
+        enr = self._enrollment()
+        agent = Agent.objects.create(
+            name="Hold Agent", agent_code="894", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        resp = api.post(
+            f"/api/portal/members/{enr.client.client_id}/hold/",
+            {"reason": "member is travelling", "hold_reason_code": "member_requested"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "member_requested")
+
+    def test_a_hold_with_NO_code_supplied_still_succeeds(self):
+        """⚠ Deliberately not a 400. A hold somebody needs to place now must not be
+        blocked by a missing dropdown; Uncategorized is findable, unlike a NULL."""
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, EnrollmentStage
+
+        enr = self._enrollment()
+        agent = Agent.objects.create(
+            name="Hold Agent2", agent_code="895", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        resp = api.post(
+            f"/api/portal/members/{enr.client.client_id}/hold/",
+            {"reason": "no category given"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "uncategorized")
+
     def test_the_backfill_is_idempotent(self):
         from io import StringIO
 
