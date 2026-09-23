@@ -62,6 +62,7 @@ from ..models import (
     MemberStatus,
     PAUSABLE_MEMBER_STATUSES,
     MEMBER_PAUSED_STATUSES,
+    MEMBER_PAUSE_TIMESTAMP_STATUSES,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     MenuType,
     Note,
@@ -7098,8 +7099,48 @@ class MemberNutritionistReviewView(PortalAPIView):
             return Response({"error": "No enrollment for this member."}, status=http.HTTP_404_NOT_FOUND)
         from ..services.nutrition_pdf import nutrition_review_context
         ctx = nutrition_review_context(enr)
+
+        # WHY a paused member was paused, for the drawer.
+        #
+        # ⚠ ADDED HERE, NOT IN nutrition_review_context -- that context is shared
+        # with render_member_nutrition_pdf (nutrition_pdf.py:217), so a field added
+        # there would end up on the signed clinical document. This is informational
+        # for the Nutritionist deciding whether to resume; it is not part of the
+        # nutrition review, and the PDF never reads it.
+        pause_info = {}
+        for profile in enr.member_profiles.select_related("pause_reason").all():
+            if profile.status not in MEMBER_PAUSE_TIMESTAMP_STATUSES:
+                continue
+            note = ""
+            if profile.client_id:
+                # The free text whoever paused them wrote -- the detail the category
+                # cannot carry. Either prefix: the Nutritionist writes a different
+                # one, and missing it would blank the reason for exactly the members
+                # this drawer is about.
+                for body in (
+                    Note.objects.filter(client_id=profile.client_id)
+                    .order_by("created_at").values_list("body", flat=True)
+                ):
+                    if body.startswith((
+                        "Member paused. Reason:",
+                        "Member paused by Nutritionist. Reason:",
+                    )):
+                        note = body.split("Reason:", 1)[1].strip()
+            pause_info[str(profile.client_id or "")] = {
+                "status": profile.status,
+                "status_label": MemberStatus(profile.status).label,
+                "reason_label": (
+                    profile.pause_reason.label if profile.pause_reason_id else ""
+                ),
+                "note": note,
+                "paused_at": (
+                    profile.paused_at.isoformat() if profile.paused_at else None
+                ),
+            }
+
         return Response({
             **ctx,
+            "pause_info": pause_info,
             "already_approved": bool(enr.nutritionist_approved_at),
             "has_pdf": bool(enr.nutritionist_approval_pdf_key),
             # Auto-fill for the signature form from the acting agent.

@@ -39118,3 +39118,128 @@ class HoldPauseDatesTest(TestCase):
         row = self.api.get("/api/portal/members/paused/").data["results"][0]
         self.assertIsNotNone(row["paused_at"])
         self.assertIn("resumed_at", row)
+
+
+class NutritionistPauseInfoTest(TestCase):
+    """The review drawer shows WHY a paused member was paused.
+
+    ⚠ Informational only. It must NOT reach the signed nutrition PDF -- see the
+    last test.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        self.reason = PauseReason.objects.create(
+            code="nutritionist_paused", label="Nutritionist Paused", is_system=True,
+        )
+        agent = Agent.objects.create(
+            name="Pi Agent", agent_code="899", group="Nutritionist",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _paused_member(self, note_body=None, status=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus, Note, NoteSource,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pi", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Pi HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Pi Member",
+            status=status or MemberStatus.NUTRITIONIST_PAUSED,
+            pause_reason=(
+                self.reason
+                if (status or MemberStatus.NUTRITIONIST_PAUSED)
+                == MemberStatus.NUTRITIONIST_PAUSED else None
+            ),
+        )
+        if note_body:
+            Note.objects.create(
+                client=client, source=NoteSource.AGENT, body=note_body,
+            )
+        return client, enr
+
+    def _review(self, client):
+        resp = self.api.get(
+            f"/api/portal/members/{client.client_id}/nutritionist-review/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_it_returns_the_reason_and_the_note(self):
+        client, _enr = self._paused_member(
+            "Member paused by Nutritionist. Reason: kidney disease, need labs",
+        )
+        info = self._review(client)["pause_info"][str(client.client_id)]
+        self.assertEqual(info["reason_label"], "Nutritionist Paused")
+        self.assertIn("kidney disease", info["note"])
+        self.assertEqual(info["status_label"], "Nutritionist Paused")
+
+    def test_the_AGENT_note_prefix_is_read_too(self):
+        """A member paused by an agent and later reviewed by the Nutritionist. The
+        other prefix would blank the reason for exactly those."""
+        client, _enr = self._paused_member(
+            "Member paused. Reason: member asked to stop for a month",
+        )
+        info = self._review(client)["pause_info"][str(client.client_id)]
+        self.assertIn("asked to stop", info["note"])
+
+    def test_the_MOST_RECENT_note_wins(self):
+        from .models import Note, NoteSource
+
+        client, _enr = self._paused_member(
+            "Member paused. Reason: the first one",
+        )
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused by Nutritionist. Reason: the second one",
+        )
+        info = self._review(client)["pause_info"][str(client.client_id)]
+        self.assertEqual(info["note"], "the second one")
+
+    def test_an_ACTIVE_member_gets_no_entry(self):
+        from .models import MemberStatus
+
+        client, _enr = self._paused_member(status=MemberStatus.ACTIVE)
+        self.assertEqual(self._review(client)["pause_info"], {})
+
+    def test_a_pause_with_NO_note_still_reports_the_category(self):
+        client, _enr = self._paused_member()
+        info = self._review(client)["pause_info"][str(client.client_id)]
+        self.assertEqual(info["reason_label"], "Nutritionist Paused")
+        self.assertEqual(info["note"], "")
+
+    def test_it_is_NOT_in_the_shared_PDF_CONTEXT(self):
+        """⚠ THE POINT OF ADDING IT IN THE VIEW. nutrition_review_context is shared
+        with render_member_nutrition_pdf, so a field added there would print on the
+        signed clinical document. This is informational for the Nutritionist deciding
+        whether to resume -- not part of the nutrition review."""
+        from .services.nutrition_pdf import nutrition_review_context
+
+        _client, enr = self._paused_member(
+            "Member paused by Nutritionist. Reason: kidney disease",
+        )
+        ctx = nutrition_review_context(enr)
+        self.assertNotIn("pause_info", ctx)
+        # And no member row smuggles it in under another name.
+        for member in ctx.get("members", []):
+            for key in member:
+                self.assertNotIn("pause", key.lower(), f"{key} leaks into the PDF")
