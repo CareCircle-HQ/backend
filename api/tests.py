@@ -37135,3 +37135,71 @@ class PausedMembersTabTest(TestCase):
         self._member("Bob", MemberStatus.PAUSED, "member_cancelled")
         data = self._get("?search=Ada")
         self.assertEqual(data["count"], 1)
+
+    # ── the description column ──────────────────────────────────────────────
+    def test_the_agents_own_words_are_shown(self):
+        from .models import MemberStatus, Note, NoteSource
+
+        client = self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused. Reason: wants Halal meals, driver brought wrong",
+        )
+        self.assertIn(
+            "Halal", self._get()["results"][0]["pause_description"],
+        )
+
+    def test_the_NUTRITIONIST_prefix_is_read_too(self):
+        """A different prefix, and omitting it would blank the description for
+        exactly the members whose reason an agent most needs to read."""
+        from .models import MemberStatus, Note, NoteSource
+
+        client = self._member("Nut", MemberStatus.NUTRITIONIST_PAUSED)
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused by Nutritionist. Reason: awaiting renal review",
+        )
+        self.assertIn(
+            "renal review", self._get()["results"][0]["pause_description"],
+        )
+
+    def test_the_MOST_RECENT_note_wins(self):
+        from datetime import timedelta
+
+        from .models import MemberStatus, Note, NoteSource
+
+        client = self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        old = Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused. Reason: first time",
+        )
+        Note.objects.filter(pk=old.pk).update(
+            created_at=timezone.now() - timedelta(days=30),
+        )
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused. Reason: second time",
+        )
+        self.assertEqual(
+            self._get()["results"][0]["pause_description"], "second time",
+        )
+
+    def test_a_SYSTEM_pause_falls_back_to_the_stored_reasons(self):
+        """An out-of-range member has no agent note, but "home ZIP 33314 is outside
+        the coverage area" is exactly what an agent needs to read."""
+        from .models import MemberStatus
+
+        client = self._member("Rng", MemberStatus.OUT_OF_RANGE, "out_of_range")
+        client.ineligible_reasons = ["home ZIP 33314 is outside the coverage area"]
+        client.save(update_fields=["ineligible_reasons"])
+        self.assertIn("33314", self._get()["results"][0]["pause_description"])
+
+    def test_an_unpause_note_is_NOT_treated_as_a_description(self):
+        from .models import MemberStatus, Note, NoteSource
+
+        client = self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member unpaused. Reason: back from holiday",
+        )
+        self.assertEqual(self._get()["results"][0]["pause_description"], "")

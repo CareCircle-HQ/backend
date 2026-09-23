@@ -3772,6 +3772,45 @@ class PausedMembersListView(UnlinkedMembersListView):
             qs = qs.filter(cond)
         return qs.order_by("last_name", "first_name").distinct()
 
+    # The prefixes a pause description is written under. The Nutritionist writes a
+    # different one, and omitting it would show a blank description for exactly the
+    # members whose reason an agent most needs to read.
+    PAUSE_NOTE_PREFIXES = (
+        "Member paused. Reason:",
+        "Member paused by Nutritionist. Reason:",
+    )
+
+    def _pause_descriptions(self, clients):
+        """client_id -> the most recent pause description, in ONE query.
+
+        Batched rather than fetched per row: 1,374 pause notes against a page of 25
+        members is a query per row otherwise, on a page an agent opens to scan.
+
+        ⚠ NOT filtered to notes written AFTER the current pause. A member paused,
+        resumed and paused again shows the older description -- there is no link
+        between a note and a pause, only a timestamp. Better a slightly stale
+        sentence than a blank column, but it is why this is labelled "last note"
+        rather than "the reason".
+        """
+        from api.models import Note
+
+        ids = [c.client_id for c in clients]
+        if not ids:
+            return {}
+        found = {}
+        # Ordered oldest-first so the LAST write per client wins.
+        for client_id, body in (
+            Note.objects
+            .filter(client_id__in=ids)
+            .order_by("created_at")
+            .values_list("client_id", "body")
+        ):
+            for prefix in self.PAUSE_NOTE_PREFIXES:
+                if body.startswith(prefix):
+                    found[client_id] = body.split("Reason:", 1)[1].strip()
+                    break
+        return found
+
     def _paused_profile(self, client):
         """The paused profile to report on.
 
@@ -3786,6 +3825,7 @@ class PausedMembersListView(UnlinkedMembersListView):
 
     def get(self, request):
         page = self.paginate_queryset(self.get_queryset())
+        descriptions = self._pause_descriptions(page or [])
         rows = []
         for c in page or []:
             profile = self._paused_profile(c)
@@ -3815,6 +3855,18 @@ class PausedMembersListView(UnlinkedMembersListView):
                 # Service must dismiss the CaseMismatchFlag -- so it is worth
                 # showing rather than leaving them to find out by clicking.
                 "pause_locked": bool(profile.pause_locked) if profile else False,
+                # WHAT THE AGENT ACTUALLY WROTE. The category is countable; this is
+                # the detail no catalogue carries -- "member wants Halal meals and
+                # the driver brought the wrong ones" is not a category.
+                #
+                # Falls back to the stored ineligibility reasons, which ARE the
+                # description for a system pause: an out-of-range member has no agent
+                # note, but "home ZIP 33314 is outside the coverage area" is exactly
+                # what an agent needs to read.
+                "pause_description": (
+                    descriptions.get(c.client_id)
+                    or "; ".join(getattr(c, "ineligible_reasons", None) or [])
+                ),
             })
         return self.get_paginated_response(rows)
 
