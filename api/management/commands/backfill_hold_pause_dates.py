@@ -15,23 +15,26 @@ what was already recorded:
       hold_resumed_at  the most recent transition AWAY from On Hold, for an
                        enrollment no longer held
 
-  PAUSES -- from ``status_changed_at``, which the model has always stamped on a
-  status change.
+  PAUSES -- from TimelineEvent, which records every member pause and resume with
+  its timestamp. 9,277 relevant rows:
 
-      paused_at        status_changed_at, when the member is CURRENTLY paused
-      resumed_at       left NULL -- see below
+      member_paused        4,407        member_unpaused    1,552
+      out_of_orbit         2,149        service_resumed      614
+      out_of_range           518
+      nutritionist_paused     37
 
-⚠ resumed_at CANNOT BE RECOVERED FOR PAST PAUSES, and is deliberately left NULL
-rather than guessed. ``status_changed_at`` holds ONE timestamp: for a member who was
-paused and is now active it is the resume, but for a member who has never been paused
-it is simply their last status change, and the two are indistinguishable. Writing it
-as a resume date would invent a pause that never happened for ~21,000 active members.
+      paused_at    the most recent pause event at or before the current status
+      resumed_at   the most recent resume event, when the member is not paused now
 
-So a "was resumed between" filter returns nothing for historical pauses. That is
-honest: the data to answer it was never kept. Forward-dated pauses answer it exactly.
+⚠ AN EARLIER VERSION OF THIS COMMAND CLAIMED resumed_at WAS UNRECOVERABLE. It read
+``status_changed_at`` -- one timestamp that cannot tell a resume from any other status
+change -- and recovered 1,000 dates from "Member unpaused" NOTES, leaving the rest
+NULL on the grounds that "the data was never kept".
 
-There IS a fallback for members whose resume left a note -- "Member unpaused", 1,027
-of them -- and those are recovered.
+The data was kept. TimelineEvent has held it all along, in the same table this
+codebase already writes pause and resume events to. The lesson is narrow and worth
+keeping: "the data does not exist" is a claim about a schema, and it needs a query,
+not an inference from the one field that happened to be in view.
 
 Idempotent: re-running skips anything already stamped unless --overwrite.
 """
@@ -53,7 +56,7 @@ class Command(BaseCommand):
 
         from api.models import (
             EnrollmentStage, EnrollmentVerification, MEMBER_PAUSE_TIMESTAMP_STATUSES,
-            MemberDietaryProfile, Note, StageEvent,
+            MemberDietaryProfile, StageEvent, TimelineEvent,
         )
 
         apply_it, overwrite = options["apply"], options["overwrite"]
@@ -103,38 +106,69 @@ class Command(BaseCommand):
                 enr.hold_resumed_at = hold_resumed_at
                 enrollment_writes.append(enr)
 
-        # ── pauses, from status_changed_at ──────────────────────────────────
-        # Resume notes, read once: the only recoverable resume signal.
-        resume_notes = {}
-        for client_id, body, created in Note.objects.filter(
-            body__startswith="Member unpaused",
-        ).order_by("created_at").values_list("client_id", "body", "created_at"):
-            resume_notes[client_id] = created
+        # ── pauses, from the TimelineEvent history ─────────────────────────
+        PAUSE_EVENTS = (
+            "member_paused", "out_of_orbit", "out_of_range",
+            "nutritionist_paused",
+        )
+        RESUME_EVENTS = ("member_unpaused", "service_resumed")
+
+        # Read in ONE pass, newest last so the final write per client wins.
+        latest_pause, latest_resume = {}, {}
+        for client_id, event_type, when in (
+            TimelineEvent.objects
+            .filter(event_type__in=PAUSE_EVENTS + RESUME_EVENTS)
+            .order_by("occurred_at")
+            .values_list("client_id", "event_type", "occurred_at")
+        ):
+            if event_type in PAUSE_EVENTS:
+                latest_pause[client_id] = when
+            else:
+                latest_resume[client_id] = when
 
         profile_writes = []
         for profile in MemberDietaryProfile.objects.all().iterator(chunk_size=1000):
             if (profile.paused_at or profile.resumed_at) and not overwrite:
                 counts["profile: already stamped"] += 1
                 continue
-            paused = profile.status in MEMBER_PAUSE_TIMESTAMP_STATUSES
-            if paused:
-                if profile.status_changed_at:
-                    profile.paused_at = profile.status_changed_at
-                    profile.resumed_at = None
-                    profile_writes.append(profile)
-                    counts["profile: paused_at recovered"] += 1
+            paused_now = profile.status in MEMBER_PAUSE_TIMESTAMP_STATUSES
+            pause_at = latest_pause.get(profile.client_id)
+            resume_at = latest_resume.get(profile.client_id)
+
+            if paused_now:
+                # Currently paused: the pause event is the one that matters, and
+                # any earlier resume ended a PREVIOUS cycle -- carrying it over
+                # would make a paused member read as resumed.
+                if pause_at is None:
+                    # Fall back to the status change: the member is demonstrably
+                    # paused, so this timestamp IS their pause even without an event.
+                    pause_at = profile.status_changed_at
+                    if pause_at:
+                        counts["profile: paused_at from status_changed_at"] += 1
+                    else:
+                        counts["profile: paused, nothing to read"] += 1
+                        continue
                 else:
-                    counts["profile: paused, no status_changed_at"] += 1
-                continue
-            # ⚠ NOT paused now. status_changed_at cannot tell a resume from any
-            # other status change, so only a resume NOTE is trusted.
-            when = resume_notes.get(profile.client_id)
-            if when is not None:
-                profile.resumed_at = when
+                    counts["profile: paused_at from the timeline"] += 1
+                profile.paused_at = pause_at
+                profile.resumed_at = None
                 profile_writes.append(profile)
-                counts["profile: resumed_at from a note"] += 1
+                continue
+
+            # Not paused now. A resume event is exact; without one there is nothing
+            # to say, and status_changed_at must NOT be used -- for a member who was
+            # never paused it is simply their last status change.
+            if resume_at is None:
+                counts["profile: never paused"] += 1
+                continue
+            profile.resumed_at = resume_at
+            # And the pause it ended, so the pair reads as one cycle.
+            if pause_at is not None and pause_at <= resume_at:
+                profile.paused_at = pause_at
+                counts["profile: full pause/resume cycle recovered"] += 1
             else:
-                counts["profile: not paused, no resume note"] += 1
+                counts["profile: resumed_at only"] += 1
+            profile_writes.append(profile)
 
         self.stdout.write("ENROLLMENTS (holds):")
         for k, v in sorted(counts.items()):

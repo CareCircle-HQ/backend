@@ -39011,6 +39011,108 @@ class HoldPauseDatesTest(TestCase):
         resp = self.api.get(f"/api/portal/members/on-hold/?held_from={today}")
         self.assertEqual(resp.data["count"], 0)
 
+    def test_the_backfill_recovers_BOTH_dates_from_the_timeline(self):
+        """⚠ An earlier version of this command claimed resumed_at was
+        unrecoverable -- it read status_changed_at, which cannot tell a resume from
+        any other status change, and fell back to notes for 1,000 of them.
+
+        TimelineEvent had it all along: 4,407 member_paused and 1,552
+        member_unpaused rows, in the same table this codebase already writes those
+        events to. Reading it recovered 1,843 resume dates instead of 1,000, and
+        1,367 FULL pause/resume cycles that were previously impossible."""
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus, TimelineEvent
+
+        profile = self._profile()          # ACTIVE, i.e. resumed
+        paused_when = timezone.now() - timedelta(days=20)
+        resumed_when = timezone.now() - timedelta(days=5)
+        TimelineEvent.objects.create(
+            client=profile.client, event_type="member_paused",
+            occurred_at=paused_when, title="Member Paused",
+        )
+        TimelineEvent.objects.create(
+            client=profile.client, event_type="member_unpaused",
+            occurred_at=resumed_when, title="Member Unpaused",
+        )
+        out = StringIO()
+        call_command("backfill_hold_pause_dates", "--apply", stdout=out, stderr=out)
+        profile.refresh_from_db()
+        self.assertEqual(profile.paused_at, paused_when)
+        self.assertEqual(profile.resumed_at, resumed_when)
+
+    def test_the_backfill_does_NOT_carry_a_stale_resume_onto_a_paused_member(self):
+        """An earlier resume ended a PREVIOUS cycle. Carrying it over would make a
+        currently-paused member read as resumed."""
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus, TimelineEvent
+
+        profile = self._profile(status=MemberStatus.PAUSED)
+        TimelineEvent.objects.create(
+            client=profile.client, event_type="member_unpaused",
+            occurred_at=timezone.now() - timedelta(days=30),
+            title="Member Unpaused",
+        )
+        TimelineEvent.objects.create(
+            client=profile.client, event_type="member_paused",
+            occurred_at=timezone.now() - timedelta(days=2), title="Member Paused",
+        )
+        out = StringIO()
+        call_command("backfill_hold_pause_dates", "--apply", stdout=out, stderr=out)
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.paused_at)
+        self.assertIsNone(profile.resumed_at)
+
+    def test_the_backfill_leaves_a_NEVER_PAUSED_member_alone(self):
+        """⚠ status_changed_at must NOT be used as a resume date: for a member who
+        was never paused it is simply their last status change, and writing it would
+        invent a pause for ~21,000 active members."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.ACTIVE)
+        profile.status = MemberStatus.PENDING
+        profile.save()                      # stamps status_changed_at, no pause
+        out = StringIO()
+        call_command("backfill_hold_pause_dates", "--apply", stdout=out, stderr=out)
+        profile.refresh_from_db()
+        self.assertIsNone(profile.paused_at)
+        self.assertIsNone(profile.resumed_at)
+
+    def test_the_backfill_recovers_the_hold_dates_from_StageEvent(self):
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import EnrollmentStage, EnrollmentVerification, StageEvent
+
+        profile = self._profile()
+        enr = profile.enrollment
+        held_when = timezone.now() - timedelta(days=9)
+        event = StageEvent.objects.create(
+            entity_type="enrollment", enrollment=enr, client=enr.client,
+            from_stage=EnrollmentStage.SERVICE_ACTIVE,
+            to_stage=EnrollmentStage.ON_HOLD,
+        )
+        # ⚠ entered_at is auto_now_add, so passing it to create() is SILENTLY
+        # ignored -- the row lands with "now" and the assertion fails against a date
+        # that was never stored. Same trap as Case.case_created_at.
+        StageEvent.objects.filter(pk=event.pk).update(entered_at=held_when)
+        EnrollmentVerification.objects.filter(pk=enr.pk).update(
+            stage=EnrollmentStage.ON_HOLD,
+        )
+        out = StringIO()
+        call_command("backfill_hold_pause_dates", "--apply", stdout=out, stderr=out)
+        enr.refresh_from_db()
+        self.assertEqual(enr.held_at, held_when)
+
     def test_the_rows_carry_the_dates(self):
         self._paused_on(timezone.now())
         row = self.api.get("/api/portal/members/paused/").data["results"][0]
