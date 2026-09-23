@@ -38559,6 +38559,67 @@ class InternalServiceRulesTest(TestCase):
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
         self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
 
+    def test_the_command_DRY_RUNS_by_default(self):
+        """⚠ The command exists because these rules otherwise have no dry run: they
+        fire on import, so without it the first sight of the blast radius is after
+        154 enrollments are already held."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        out = StringIO()
+        call_command("apply_internal_service_rules", stdout=out, stderr=out)
+        self.assertIn("Dry run", out.getvalue())
+        self.assertIn("Not an Enhanced Member", out.getvalue())
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_the_command_APPLIES_and_reports_the_scope_split(self):
+        """95% of what these rules hold is individual-scope, and the report has to
+        say so -- a hold lives on the ENROLLMENT, so a household-scope one stops
+        service for every dependent too."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import Case, EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        Case.objects.filter(client=client).update(household_type="individual")
+        out = StringIO()
+        call_command("apply_internal_service_rules", "--apply", stdout=out, stderr=out)
+        self.assertIn("individual", out.getvalue())
+        self.assertIn("held 1", out.getvalue())
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_the_command_NAMES_households_with_dependents_at_risk(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import Case, Client, HouseholdMember
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        Case.objects.filter(client=client).update(household_type="household")
+        dependent = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endant",
+        )
+        HouseholdMember.objects.create(
+            household=enr.household, client=dependent, is_primary=False,
+        )
+        out = StringIO()
+        call_command("apply_internal_service_rules", stdout=out, stderr=out)
+        self.assertIn("dependent", out.getvalue())
+        self.assertIn("Isr Member", out.getvalue())
+
     def test_there_is_NO_auto_resume(self):
         """By decision. Releasing members automatically is a separate, riskier
         piece: a held programme waits for an agent."""
