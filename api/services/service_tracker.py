@@ -116,6 +116,21 @@ def latest_eligible_services(rows):
     return services
 
 
+def _latest_record(rows):
+    """The most recent record, whether or not it lists any service.
+
+    Separate from :func:`_latest_with_services` because "the member was screened" and
+    "the screening named something we serve" are different facts, and 64.9% of
+    screening records carry an empty eligible_services.
+    """
+    if not rows:
+        return None
+    dated = sorted(
+        rows, key=lambda r: (r.screen_created_at is None, r.screen_created_at),
+    )
+    return dated[-1]
+
+
 def _latest_with_services(rows):
     """The most recent record that actually lists services, or None.
 
@@ -136,6 +151,9 @@ def gather(client):
     """Everything the rules need, read once."""
     screening = _latest_with_services(list(client.screenings.all()))
     assessment = _latest_with_services(list(client.assessments.all()))
+    # The most recent record of ANY kind, empty or not -- "did this happen".
+    any_screening = _latest_record(list(client.screenings.all()))
+    any_assessment = _latest_record(list(client.assessments.all()))
     screened = list((screening.eligible_services if screening else []) or [])
     # The UNION across every assessment tied on the latest DATE -- see
     # latest_eligible_services. Reading one arbitrarily-chosen row made the food rule
@@ -150,6 +168,10 @@ def gather(client):
     return {
         "screening": screening,
         "assessment": assessment,
+        # The most recent record of ANY kind, empty or not: "did this happen", as
+        # opposed to "did it name anything we serve".
+        "any_screening": any_screening,
+        "any_assessment": any_assessment,
         "screened": screened,
         "eligible": eligible,
         "screened_domains": domains_of(screened),
@@ -160,6 +182,9 @@ def gather(client):
         "ecm": ECM in eligible,
         # Where the member LIVES, for the borough check on every row.
         "home_borough": member_home_borough(client),
+        # The member, so detect_alerts can call evaluate_governing_case rather than
+        # restating its conditions -- see _internal_service_rule_alerts.
+        "client": client,
     }
 
 
@@ -551,10 +576,14 @@ def rule_2_and_3_food(ctx):
 
 def tracker_for(client):
     """The whole tracker: the gateway phase, then a track per applicable rule."""
+    from api.models import CaseStatus, CaseType
+
     ctx = gather(client)
 
     screening = ctx["screening"]
     assessment = ctx["assessment"]
+    any_screening = ctx["any_screening"]
+    any_assessment = ctx["any_assessment"]
     tracks = [
         t for t in (
             rule_0_care_management(ctx),
@@ -565,8 +594,21 @@ def tracker_for(client):
     return {
         "phase1": {
             "screening": {
-                "done": screening is not None,
-                "at": screening.screen_created_at if screening else None,
+                # ⚠ "DID IT HAPPEN" AND "DID IT NAME ANYTHING" ARE TWO FACTS, and
+                # `done` used to be both. 64.9% of screening records carry an EMPTY
+                # eligible_services, so 12,518 members -- 19% of everyone screened --
+                # showed an unticked "Screening Intake" gate reading "No food or
+                # housing need screened", which an agent reads as NOT DONE. TERA
+                # HOOD was screened the same morning and the panel denied it.
+                #
+                # `done` is now "a screening record exists". `has_result` is "it
+                # named at least one service". The domains still come from the
+                # latest record WITH services, so which tracks appear is unchanged.
+                "done": any_screening is not None,
+                "has_result": screening is not None,
+                "at": (
+                    any_screening.screen_created_at if any_screening else None
+                ),
                 # The domains we act on, in the order an agent reads them. Only
                 # Food and Housing: we screen for four and take two, and listing
                 # the other two as though we might act on them would mislead.
@@ -578,14 +620,24 @@ def tracker_for(client):
                 ),
             },
             "assessment": {
-                "done": assessment is not None,
-                "at": assessment.screen_created_at if assessment else None,
+                "done": any_assessment is not None,
+                # ⚠ THE UI MUST NOT COLOUR "Core Eligibility" RED OFF `done`.
+                # 18.2% of assessments name no services, and an assessment that
+                # determined nothing has not ruled the member out -- it has not
+                # determined anything. Red belongs on has_result && not ecm.
+                "has_result": assessment is not None,
+                "at": (
+                    any_assessment.screen_created_at if any_assessment else None
+                ),
                 "services": ctx["eligible"],
             },
             "determination": {
                 "done": ctx["ecm"],
-                "label": "Qualified: ECM Level 2" if ctx["ecm"]
-                         else "Not qualified for ECM Level 2",
+                "label": (
+                    "Qualified: ECM Level 2" if ctx["ecm"]
+                    else "Not qualified for ECM Level 2" if assessment is not None
+                    else "No determination yet"
+                ),
             },
         },
         # So the UI can name the borough it is comparing against, rather than
@@ -593,6 +645,35 @@ def tracker_for(client):
         "home_borough": ctx["home_borough"],
         "alerts": detect_alerts(ctx),
         "tracks": tracks,
+        # WHETHER THERE IS A PROGRAMME TO RETIRE, for the empty state.
+        #
+        # "No track applies YET" is right for a member still coming through the
+        # funnel and wrong for one who does not qualify at all -- and wrong in
+        # opposite directions depending on whether they are being served. A member
+        # with an open case and a live enrollment needs the case CLOSED and the
+        # member retired; a member with neither needs nothing done.
+        "service_status": _service_status(ctx),
+        # IS A CASE ALREADY OPEN? The gates need it to tell "not reached yet" from
+        # "out of order".
+        #
+        # A missing screening or assessment is the NORMAL state of a member coming
+        # through the funnel -- 33,034 screened members have neither an assessment
+        # nor a case. It only becomes a problem once an internal-service case is
+        # OPEN, because then a step was skipped: 227 members hold a live case with no
+        # screening and 5,744 with no assessment.
+        #
+        # Without this the red border fired on every early-funnel member, which
+        # would have made it worth nothing.
+        "has_live_case": any(
+            c.case_type == CaseType.INTERNAL_SERVICE
+            and (c.case_status or "") not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+            for c in ctx["all_cases"]
+        ),
+        # Whether the member qualifies at all. The panel needs it for the empty
+        # state: "no track applies YET" is only true while they are still coming
+        # through the funnel, and it is the opposite of true for a member the
+        # assessment has ruled out.
+        "ecm": ctx["ecm"],
     }
 
 
@@ -706,6 +787,51 @@ def _scheduled_reauth_rows(ctx, service_type):
 # half is missing. Repeating it as an alert would double-count the commonest state in
 # the tracker and teach an agent to ignore the banner.
 
+# Stages where a programme still EXISTS and therefore has to be retired. ON_HOLD is
+# in it: a hold stops deliveries but leaves the case open and the enrollment live, so
+# somebody still has to close it. That is the member this empty state was most wrong
+# for -- JAIAIRE ADAMSBIRD, held as Not an Enhanced Member, case open, panel saying
+# "a track appears once the member qualifies".
+_LIVE_ENROLLMENT_STAGES = frozenset({
+    "pending_verification", "validated", "verified", "kitchen_assignment",
+    "service_active", "on_hold", "scheduled_extension",
+})
+
+
+def _service_status(ctx):
+    """Is there a live programme, and what is it doing?"""
+    client = ctx.get("client")
+    if client is None:
+        return {"in_service": False, "stage": "", "stage_label": "", "has_open_case": False}
+    from api.models import CaseStatus, CaseType, EnrollmentStage
+
+    live = [
+        e for e in client.enrollments.all()
+        if (e.stage or "") in _LIVE_ENROLLMENT_STAGES
+    ]
+    # The one furthest along, since a member can carry a dead-ish extension beside a
+    # serving enrollment and the serving one is what has to be retired.
+    order = {
+        EnrollmentStage.SERVICE_ACTIVE: 6, EnrollmentStage.ON_HOLD: 5,
+        EnrollmentStage.KITCHEN_ASSIGNMENT: 4, EnrollmentStage.VERIFIED: 3,
+        EnrollmentStage.VALIDATED: 2, EnrollmentStage.PENDING_VERIFICATION: 1,
+    }
+    enrollment = max(live, key=lambda e: order.get(e.stage, 0)) if live else None
+    has_open_case = any(
+        c.case_type == CaseType.INTERNAL_SERVICE
+        and (c.case_status or "") not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+        for c in ctx["all_cases"]
+    )
+    return {
+        "in_service": enrollment is not None,
+        "stage": enrollment.stage if enrollment else "",
+        "stage_label": (
+            EnrollmentStage(enrollment.stage).label if enrollment else ""
+        ),
+        "has_open_case": has_open_case,
+    }
+
+
 def _alert(code, title, detail, *, severity="error", program=""):
     return {
         "code": code,
@@ -714,6 +840,75 @@ def _alert(code, title, detail, *, severity="error", program=""):
         "detail": detail,
         "program_name": program,
     }
+
+
+# What the internal-service rules decide, restated for the panel.
+#
+# ⚠ DRIVEN BY evaluate_governing_case ITSELF, not by a second copy of its
+# conditions. If the panel restated them it could drift from the rule, and the
+# failure mode is the worst one available here: the tracker saying a member is fine
+# while their deliveries are stopped. That is exactly the state 96 held households
+# were in.
+_RULE_ALERTS = {
+    "not_enhanced_member": (
+        "Not qualified for Enhanced Care Management (Level 2)",
+        "The latest eligibility assessment does not include ECM Level 2, so the "
+        "member is not entitled to internal services.",
+    ),
+    "wrong_case_type": (
+        "The open case is not the service the assessment permits",
+        "The latest eligibility assessment names a produce prescription and not "
+        "medically tailored meals, so a meals case cannot be served.",
+    ),
+}
+
+
+def _internal_service_rule_alerts(ctx):
+    """Rules 2 and 3, as panel alerts."""
+    client = ctx.get("client")
+    if client is None:
+        return []
+    # Imported here, not at module scope: internal_service_rules imports
+    # latest_eligible_services from THIS module.
+    from api.services.internal_service_rules import evaluate_governing_case
+
+    try:
+        verdict = evaluate_governing_case(client)
+    except Exception:  # noqa: BLE001 - the panel must render even if a rule fails
+        logger.exception("internal-service rule alert failed for %s", client.pk)
+        return []
+    if verdict is None:
+        return []
+    code, _reason = verdict
+    titles = _RULE_ALERTS.get(code)
+    if titles is None:
+        return []
+    title, detail = titles
+
+    # WHAT ACTUALLY HAPPENED to this member, because the rule's verdict alone no
+    # longer says: a member in service is HELD, one earlier in the funnel gets a
+    # TICKET, and a terminal enrollment gets neither. Saying "the programme is On
+    # Hold" to someone whose programme is not held would be its own wrong answer.
+    from api.models import EnrollmentStage
+    from api.services.internal_service_rules import TICKETABLE_STAGES
+
+    # ⚠ ASK "IS IT HELD?" FIRST, before looking at anything else. Reading only the
+    # non-held enrollments made a member with one ON_HOLD and one CLOSED enrollment
+    # look terminal, so the alert dropped the outcome sentence entirely while their
+    # deliveries were stopped. Which enrollments exist BESIDES the hold says nothing
+    # about whether the hold is there.
+    stages = {e.stage for e in client.enrollments.all()}
+    if EnrollmentStage.ON_HOLD in stages:
+        outcome = " The programme is On Hold."
+    elif EnrollmentStage.SERVICE_ACTIVE in stages:
+        # Found by the rule but not yet applied -- the next case write holds it.
+        outcome = " The programme will be held on the next case save."
+    elif stages & TICKETABLE_STAGES:
+        outcome = " A ticket has been raised; the programme is not held."
+    else:
+        # Closed, cancelled, disregarded or superseded: neither held nor ticketed.
+        outcome = " No programme is in service, so nothing was held."
+    return [_alert(code, title, detail + outcome, severity="error")]
 
 
 def detect_alerts(ctx):
@@ -727,6 +922,24 @@ def detect_alerts(ctx):
     # can be opened at all, and every track is absent. Without this the tracker
     # would simply show nothing, which reads as "nothing to do here".
     if not ctx["ecm"]:
+        # ⚠ RULE 2 FIRST, and NOT gated on the screened domains. A member held as
+        # "Not an Enhanced Member" who was never screened for Housing or Food got
+        # neither an alert nor a single track -- an entirely EMPTY panel beside a
+        # stopped programme. 50 held households read that way.
+        rule_alerts = _internal_service_rule_alerts(ctx)
+        alerts.extend(rule_alerts)
+        # ⚠ AND NOT BOTH. When the rule alert fires, "Screened for Food, but not
+        # qualified for ECM Level 2" says the same thing one line lower and in
+        # weaker terms -- it offers "the assessment is missing or incomplete" as a
+        # possibility when the rule has already determined the member does not
+        # qualify and their programme is held. Two alerts for one fact is how a
+        # panel teaches an agent to skim it.
+        #
+        # The domain warnings still fire on their own, for a member with NO governing
+        # case: there the rule has no verdict and "you screened them for food and
+        # they did not qualify" is the only thing to say.
+        if rule_alerts:
+            return alerts
         for domain in ("Housing", "Food"):
             if domain in domains:
                 alerts.append(_alert(
@@ -767,6 +980,12 @@ def detect_alerts(ctx):
                 program=boxes_case.program_name or "",
                 severity="warning",
             ))
+
+    # RULE 3 -- boxes-only eligibility holding a MEALS case. This one DOES hold, and
+    # until now the panel said nothing about it: a member whose deliveries were
+    # stopped showed "[done] Food service case" and no alert at all. 96 held
+    # households.
+    alerts.extend(_internal_service_rule_alerts(ctx))
 
     # ⚠ THE OPPOSITE ALERT WAS REMOVED, and deliberately so.
     #

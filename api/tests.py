@@ -35883,6 +35883,307 @@ class ServiceTrackerTest(TestCase):
         self._assess([self.ECM])
         self.assertIsNone(self._track("food"))
 
+    # ── the rules are visible on the panel ──────────────────────────────────
+    def _alert_codes(self):
+        from .services.service_tracker import tracker_for
+
+        return [a["code"] for a in tracker_for(self.member)["alerts"]]
+
+    def _enroll(self, stage):
+        """This class builds only a Client, so the rule-outcome tests that need a
+        stage make their own enrollment."""
+        from .models import (
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        household, _ = Household.objects.get_or_create(name="Track HH")
+        HouseholdMember.objects.get_or_create(
+            household=household, client=self.member, defaults={"is_primary": True},
+        )
+        enrollment = EnrollmentVerification.objects.create(
+            client=self.member, household=household, stage=stage,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=self.member, member_name="Track Member",
+        )
+        return enrollment
+
+    # ── the empty state tells the truth ─────────────────────────────────────
+    def _status(self):
+        from .services.service_tracker import tracker_for
+
+        return tracker_for(self.member)["service_status"]
+
+    def test_a_NON_QUALIFYING_member_IN_SERVICE_reports_a_programme_to_retire(self):
+        """⚠ JAIAIRE ADAMSBIRD: held as Not an Enhanced Member, meals case still
+        OPEN, and the panel said "a track appears once the member qualifies for ECM
+        Level 2". He never will. Somebody has to close the case and retire him, and
+        the page was describing a wait instead."""
+        from .models import EnrollmentStage
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess(["Navigation Services (Level 1)"])       # no ECM
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.ON_HOLD)
+        data = tracker_for(self.member)
+        self.assertFalse(data["ecm"])
+        self.assertEqual(data["tracks"], [])
+        self.assertTrue(data["service_status"]["in_service"])
+        self.assertEqual(data["service_status"]["stage_label"], "On Hold")
+        self.assertTrue(data["service_status"]["has_open_case"])
+
+    def test_ON_HOLD_counts_as_in_service_because_the_case_is_still_open(self):
+        """A hold stops deliveries but leaves the case open and the enrollment live,
+        so there is still something to retire. That is the member this empty state
+        was most wrong for."""
+        from .models import EnrollmentStage
+
+        self._assess(["Navigation Services (Level 1)"])
+        self._enroll(EnrollmentStage.ON_HOLD)
+        self.assertTrue(self._status()["in_service"])
+
+    def test_a_member_with_NO_enrollment_is_NOT_in_service(self):
+        self._assess(["Navigation Services (Level 1)"])
+        status = self._status()
+        self.assertFalse(status["in_service"])
+        self.assertEqual(status["stage_label"], "")
+
+    def test_a_TERMINAL_enrollment_is_NOT_in_service(self):
+        from .models import EnrollmentStage
+
+        self._assess(["Navigation Services (Level 1)"])
+        for stage in (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+                      EnrollmentStage.DISREGARDED):
+            with self.subTest(stage=stage):
+                self.member.enrollments.all().delete()
+                self._enroll(stage)
+                self.assertFalse(self._status()["in_service"])
+
+    def test_the_FURTHEST_ALONG_enrollment_is_the_one_reported(self):
+        """A member can carry a pre-verification row beside a serving one, and it is
+        the SERVING one that has to be retired."""
+        from .models import EnrollmentStage
+
+        self._assess(["Navigation Services (Level 1)"])
+        self._enroll(EnrollmentStage.PENDING_VERIFICATION)
+        self._enroll(EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(self._status()["stage_label"], "Service Active")
+
+    def test_has_open_case_is_FALSE_once_the_case_closes(self):
+        from .models import Case, EnrollmentStage
+
+        self._assess(["Navigation Services (Level 1)"])
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.ON_HOLD)
+        Case.objects.filter(client=self.member).update(case_status="closed")
+        status = self._status()
+        self.assertTrue(status["in_service"])
+        self.assertFalse(status["has_open_case"])
+
+    # ── "did it happen" vs "did it name anything" ───────────────────────────
+    def test_an_EMPTY_screening_still_counts_as_SCREENED(self):
+        """⚠ 64.9% of screening records carry an empty eligible_services, and `done`
+        used to mean "a screening WITH services exists" -- so 12,518 members, 19% of
+        everyone screened, showed an unticked "Screening Intake" gate. TERA HOOD was
+        screened that same morning and the panel denied it."""
+        from .models import Screening
+        from .services.service_tracker import tracker_for
+
+        Screening.objects.create(
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=[],
+            screen_created_at=timezone.now(),
+        )
+        phase1 = tracker_for(self.member)["phase1"]
+        self.assertTrue(phase1["screening"]["done"])
+        self.assertFalse(phase1["screening"]["has_result"])
+        self.assertIsNotNone(phase1["screening"]["at"])
+
+    def test_NO_screening_at_all_is_still_NOT_done(self):
+        from .services.service_tracker import tracker_for
+
+        phase1 = tracker_for(self.member)["phase1"]
+        self.assertFalse(phase1["screening"]["done"])
+        self.assertFalse(phase1["screening"]["has_result"])
+
+    def test_an_EMPTY_assessment_does_NOT_read_as_a_REFUSAL(self):
+        """⚠ 18.2% of assessments name no services. An assessment that determined
+        nothing has not ruled the member out, so the Core Eligibility gate must not
+        go red -- which it would if the UI keyed off `done`."""
+        from .models import Assessment
+        from .services.service_tracker import tracker_for
+
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=self.member,
+            eligible_services=[], screen_created_at=timezone.now(),
+        )
+        phase1 = tracker_for(self.member)["phase1"]
+        self.assertTrue(phase1["assessment"]["done"])
+        self.assertFalse(phase1["assessment"]["has_result"])
+        self.assertEqual(phase1["determination"]["label"], "No determination yet")
+
+    def test_a_REAL_refusal_still_says_NOT_QUALIFIED(self):
+        from .services.service_tracker import tracker_for
+
+        self._assess(["Navigation Services (Level 1)"])
+        phase1 = tracker_for(self.member)["phase1"]
+        self.assertTrue(phase1["assessment"]["has_result"])
+        self.assertEqual(
+            phase1["determination"]["label"], "Not qualified for ECM Level 2",
+        )
+
+    def test_the_DOMAINS_still_come_from_the_record_WITH_services(self):
+        """The fix must not change which tracks appear -- only what the gate says."""
+        from .models import Screening
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        Screening.objects.create(            # a LATER, empty screening
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=[],
+            screen_created_at=timezone.now(),
+        )
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        data = tracker_for(self.member)
+        self.assertEqual(data["phase1"]["screening"]["domains"], ["Food"])
+        self.assertIn("food", [t["code"] for t in data["tracks"]])
+
+    # ── "not reached yet" vs "out of order" ─────────────────────────────────
+    def test_has_live_case_is_FALSE_without_a_case(self):
+        """⚠ The gates go red only when a step is missing AND a case is open. Without
+        this flag the red border fired on the whole early funnel -- 33,034 screened
+        members have neither an assessment nor a case -- which would have made it
+        worth nothing."""
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self.assertFalse(tracker_for(self.member)["has_live_case"])
+
+    def test_has_live_case_is_TRUE_with_an_open_internal_service_case(self):
+        from .services.service_tracker import tracker_for
+
+        self._case("Medically Tailored Meals")
+        self.assertTrue(tracker_for(self.member)["has_live_case"])
+
+    def test_a_CLOSED_case_does_not_count(self):
+        """A finished programme is not a skipped step."""
+        from .models import Case
+        from .services.service_tracker import tracker_for
+
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(case_status="closed")
+        self.assertFalse(tracker_for(self.member)["has_live_case"])
+
+    def test_a_CANCELLED_case_does_not_count(self):
+        from .models import Case
+        from .services.service_tracker import tracker_for
+
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(case_status="cancelled")
+        self.assertFalse(tracker_for(self.member)["has_live_case"])
+
+    def test_RULE_3_raises_an_alert(self):
+        """⚠ It HOLDS 96 households and the panel said nothing: the Food Program row
+        read "[done] Food service case" with no alert, while their deliveries were
+        stopped. The tracker claiming a member is fine when they are held is the worst
+        failure available here."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._case("Medically Tailored Meals")
+        self.assertIn("wrong_case_type", self._alert_codes())
+
+    def test_the_RULE_2_alert_REPLACES_the_screened_domain_warning(self):
+        """⚠ Two alerts for one fact. "Screened for Food, but not qualified for ECM
+        Level 2" said the same thing one line below the rule alert and in weaker
+        terms -- offering "the assessment is missing or incomplete" as a possibility
+        when the rule had already determined the member does not qualify and their
+        programme is held."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess(["Navigation Services (Level 1)"])       # no ECM
+        self._case("Medically Tailored Meals")
+        codes = self._alert_codes()
+        self.assertIn("not_enhanced_member", codes)
+        self.assertNotIn("no_ecm_food", codes)
+
+    def test_the_domain_warning_SURVIVES_when_there_is_no_governing_case(self):
+        """With no case the rule has no verdict, so "you screened them for food and
+        they did not qualify" is the only thing there is to say."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess(["Navigation Services (Level 1)"])
+        codes = self._alert_codes()                            # no case created
+        self.assertIn("no_ecm_food", codes)
+        self.assertNotIn("not_enhanced_member", codes)
+
+    def test_RULE_2_raises_an_alert_even_with_NO_screened_domain(self):
+        """⚠ The no_ecm_* alerts fire only when the member was SCREENED for Food or
+        Housing. A member held as "Not an Enhanced Member" who was not got neither an
+        alert nor a single track -- an entirely empty panel beside a stopped
+        programme."""
+        self._screen([])                      # nothing screened
+        self._assess(["Clinically Appropriate Meals (Food)"])   # no ECM
+        self._case("Medically Tailored Meals")
+        self.assertIn("not_enhanced_member", self._alert_codes())
+
+    def test_the_alert_says_the_programme_is_ON_HOLD(self):
+        from .models import EnrollmentStage
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.ON_HOLD)
+        alert = next(
+            a for a in tracker_for(self.member)["alerts"]
+            if a["code"] == "wrong_case_type"
+        )
+        self.assertIn("On Hold", alert["detail"])
+
+    def test_a_HELD_member_with_a_CLOSED_enrollment_still_reads_as_held(self):
+        """⚠ Reading only the NON-held enrollments made this member look terminal, so
+        the alert dropped the outcome entirely while their deliveries were stopped."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.ON_HOLD)
+        self._enroll(EnrollmentStage.CLOSED)
+        alert = next(
+            a for a in tracker_for(self.member)["alerts"]
+            if a["code"] == "wrong_case_type"
+        )
+        self.assertIn("On Hold", alert["detail"])
+
+    def test_a_PRE_SERVICE_member_is_told_a_TICKET_was_raised(self):
+        """Saying "the programme is On Hold" to someone whose programme is not held
+        would be its own wrong answer."""
+        from .models import EnrollmentStage
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.KITCHEN_ASSIGNMENT)
+        alert = next(
+            a for a in tracker_for(self.member)["alerts"]
+            if a["code"] == "wrong_case_type"
+        )
+        self.assertIn("ticket", alert["detail"].lower())
+        self.assertNotIn("On Hold", alert["detail"])
+
+    def test_a_member_who_PASSES_gets_no_rule_alert(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        self._case("Medically Tailored Meals")
+        codes = self._alert_codes()
+        self.assertNotIn("wrong_case_type", codes)
+        self.assertNotIn("not_enhanced_member", codes)
+
     def test_NO_food_case_is_still_outstanding(self):
         self._screen(["Clinically Appropriate Meals (Food)"])
         self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
@@ -36752,7 +37053,7 @@ class ServiceTrackerAlertsTest(TestCase):
         self.assertNotIn("no_ecm_housing", codes)
 
     # ── 4: the wrong kind of food case -- REMOVED ─────────────────────────
-    def test_a_food_case_on_EITHER_service_raises_NOTHING(self):
+    def test_boxes_eligible_with_a_MEALS_case_now_raises_RULE_3(self):
         """⚠ THE ALERTS WERE REMOVED, and this asserts their absence.
 
         They fired when a member held a meals case with voucher eligibility, or the
@@ -36769,16 +37070,24 @@ class ServiceTrackerAlertsTest(TestCase):
         I built them from the eligibility strings without asking whether the payer
         agreed. That was one query away.
         """
-        # ⚠ ONLY the boxes-eligible + MEALS case direction is silent here. The
-        # reverse -- meals-only eligibility holding a BOXES case -- became a WARNING
-        # (rule 4), and is asserted in its own test below. The programme is still not
-        # HELD for it, which is the part that matters.
+        # ⚠ THIS TEST NOW ASSERTS THE OPPOSITE, and the requirement is what changed.
+        #
+        # It was written when BOTH directions were removed as noise, which was right
+        # at the time. Then boxes-eligible + a MEALS case became RULE 3 and started
+        # HOLDING the programme -- 96 households -- and a hold the panel does not
+        # mention is worse than the noise this test was protecting against: the
+        # tracker showed "[done] Food service case" beside stopped deliveries.
+        #
+        # The other direction (meals-only + a BOXES case) is still not held: it is
+        # rule 4, a warning, asserted in the test below. That asymmetry is the whole
+        # finding -- stepping DOWN to boxes is normal and payer-approved, stepping UP
+        # to meals without eligibility is not.
         self.member.cases.all().delete()
         self.member.assessments.all().delete()
         self._screen([self.MTM])
         self._assess([self.ECM, self.VOUCHER])
         self._case("Medically Tailored Meals")
-        self.assertEqual(self._codes(), [])
+        self.assertEqual(self._codes(), ["wrong_case_type"])
 
     def test_rule4_meals_only_with_a_BOXES_case_WARNS_but_does_not_hold(self):
         """⚠ A warning, never a hold: 218 of 219 such cases are APPROVED by the
@@ -40003,3 +40312,133 @@ class ResumeAuthorizationWindowTest(TestCase):
         plan = self._plan(enr)
         self.assertTrue(plan["allowed"])
         self.assertFalse(plan["checks"]["authorization_not_started"])
+
+
+class NotEnhancedMemberWarningTest(TestCase):
+    """The Profile-tab warning for a member whose latest assessment does not name
+    ECM Level 2.
+
+    Its own class rather than extra methods on ClientEligibilityWarningsViewTest:
+    every test here needs a client that passes the OTHER four gates, so only this
+    warning can fire, and that fixture does not belong to the existing class.
+    """
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Ext", agent_code=str(uuid.uuid4())[:8], group="CS",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _codes(self, client_id):
+        resp = self._api().get(f"/api/clients/{client_id}/eligibility-warnings/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {w["code"] for w in resp.data["warnings"]}
+
+    def _member(self, assessments):
+        """A client that passes every OTHER gate. ``assessments`` is (days_ago,
+        services) pairs."""
+        from datetime import timedelta
+
+        from .models import (
+            Address, AddressType, Assessment, Client, Insurance, ServiceZipCode,
+            SocialCareCoverage, SocialCareCoverageStatus,
+        )
+
+        ServiceZipCode.objects.get_or_create(
+            zip="10001", defaults={"is_active": True},
+        )
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ecm", last_name="Member",
+        )
+        Insurance.objects.create(
+            client=client, plan_name="Fidelis Medicaid", external_member_id="1",
+        )
+        Address.objects.create(client=client, type=AddressType.CURRENT, zip="10001")
+        SocialCareCoverage.objects.create(
+            client=client, coverage_id=uuid.uuid4(),
+            status=SocialCareCoverageStatus.ENROLLED, plan_name="Social Care",
+        )
+        # ⚠ ONE base timestamp for the whole fixture. timezone.now() per row puts
+        # "same day" records MICROSECONDS apart, so the tie test below would not
+        # actually tie -- which is exactly how the rule's tie test first passed for
+        # the wrong reason.
+        base = timezone.now().replace(hour=4, minute=0, second=0, microsecond=0)
+        for days_ago, services in assessments:
+            Assessment.objects.create(
+                assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+                eligible_services=services,
+                screen_created_at=base - timedelta(days=days_ago),
+            )
+        return client
+
+    def test_a_latest_assessment_without_ECM_warns(self):
+        client = self._member([(0, ["Navigation Services (Level 1)"])])
+        self.assertIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_the_wording_is_the_one_the_rule_uses(self):
+        """The same sentence the hold writes, so an agent reads one explanation
+        whether they are in the extension, the CRM or the hold history."""
+        client = self._member([(0, ["Navigation Services (Level 1)"])])
+        resp = self._api().get(f"/api/clients/{client.pk}/eligibility-warnings/")
+        warning = next(
+            w for w in resp.data["warnings"] if w["code"] == "not_enhanced_member"
+        )
+        self.assertEqual(warning["title"], "Not an Enhanced Member")
+        self.assertIn("does not include ECM Level 2", warning["detail"])
+        self.assertIn("not entitled to internal services", warning["detail"])
+
+    def test_an_assessment_WITH_ECM_does_not_warn(self):
+        client = self._member([(0, ["Enhanced Care Management (Level 2)"])])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_NO_assessment_does_not_warn(self):
+        """⚠ "No assessment" is not "not entitled". 6,002 of 17,028 members with a
+        live case have none; warning all of them would be the loudest thing on the
+        Profile tab and wrong every time."""
+        client = self._member([])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_an_EMPTY_assessment_does_not_warn(self):
+        """18.2% of assessment records name no services. One that determined nothing
+        has not ruled the member out."""
+        client = self._member([(0, [])])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_TIED_assessments_are_UNIONED_before_deciding(self):
+        """⚠ The same trap as the hold rule: screen_created_at is date-only for 77%
+        of assessments, so two records from one day cannot be ordered. Reading one
+        arbitrarily held 8 members as "Not an Enhanced Member" while a same-day
+        record said they have ECM."""
+        client = self._member([
+            (0, ["Navigation Services (Level 1)"]),
+            (0, ["Enhanced Care Management (Level 2)"]),
+        ])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_an_OLDER_assessment_with_ECM_does_not_rescue_the_member(self):
+        """Rule 1: only the latest DATE counts."""
+        client = self._member([
+            (120, ["Enhanced Care Management (Level 2)"]),
+            (0, ["Navigation Services (Level 1)"]),
+        ])
+        self.assertIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_a_NEWER_assessment_with_ECM_clears_it(self):
+        """The mirror, and the case that actually happened: JAIAIRE ADAMSBIRD warned
+        on an April assessment naming Navigation Level 1 until the extension imported
+        his July one, which names ECM. The warning went away on its own."""
+        client = self._member([
+            (120, ["Navigation Services (Level 1)"]),
+            (0, ["Enhanced Care Management (Level 2)"]),
+        ])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))

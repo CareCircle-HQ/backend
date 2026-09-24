@@ -406,6 +406,33 @@ class ClientEligibilityWarningsView(APIView):
                 "title": "No Social Care Coverage", "detail": scc,
             })
 
+        # NOT AN ENHANCED MEMBER -- the latest eligibility assessment does not name
+        # ECM Level 2, so no internal service can be opened at all.
+        #
+        # ⚠ READ FROM latest_eligible_services, THE SAME HELPER THE HOLD RULE USES.
+        # Rule 2 holds a programme on exactly this condition, and a warning derived
+        # separately could tell an agent they are fine while the rule holds them --
+        # or the reverse. That helper also UNIONS assessments tied on the latest
+        # date, which matters here: reading one arbitrarily-chosen row held 8 members
+        # as "Not an Enhanced Member" while a same-day record said they have ECM.
+        #
+        # Nothing is said when there is NO assessment yet. "No assessment" is not
+        # "not entitled" -- 6,002 of 17,028 members with a live case have none, and
+        # warning all of them would be the loudest thing on the Profile tab and
+        # wrong every time.
+        from .services.service_tracker import ECM, latest_eligible_services
+
+        eligible = latest_eligible_services(list(client.assessments.all()))
+        if eligible and ECM not in eligible:
+            warnings.append({
+                "code": "not_enhanced_member",
+                "title": "Not an Enhanced Member",
+                "detail": (
+                    "The latest eligibility assessment does not include ECM "
+                    "Level 2, so the member is not entitled to internal services."
+                ),
+            })
+
         return Response({"warnings": warnings})
 
 
