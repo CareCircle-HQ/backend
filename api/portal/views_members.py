@@ -3798,6 +3798,33 @@ class PausedMembersListView(UnlinkedMembersListView):
             "member_profiles__pause_reason",
         ).distinct()
 
+        # NOT the eligibility-off-ramped, by default. 1,412 of 2,156 rows -- 65%.
+        #
+        # ⚠ I ARGUED AGAINST THIS AND WAS WRONG. The two biggest hidden reasons are
+        # Out of Range (692) and Insurance expired or invalid (676), and I read
+        # "kept sticky until the underlying data recovers" as "an agent can work
+        # this here". It does not mean that. The model says what it means:
+        #
+        #     "Hard off-ramp: a CareCircle-UNFIXABLE eligibility failure
+        #      (expired/missing medical insurance, wrong Medicaid type, or an
+        #      out-of-range primary/delivery address). The member's Unite Us case
+        #      must be closed by an agent."     -- models.ClientStage.INELIGIBLE
+        #
+        # This page exists to decide whether a problem CAN be fixed. An already
+        # ineligible member cannot be, so 65% of the tab was rows an agent could
+        # only skip. What is left -- 744 -- are eligible members who were paused for
+        # something someone might actually resolve.
+        #
+        # Both stages, as on the On Hold and No Care Management tabs: NOT_ELIGIBLE
+        # is the terminal off-ramp (25 rows here) and INELIGIBLE the import-time
+        # gate (1,387).
+        #
+        # ?eligible=all restores the full list rather than hiding rows silently.
+        if (params.get("eligible") or "").lower() != "all":
+            qs = qs.exclude(lifecycle_stage__in=(
+                ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE,
+            ))
+
         # ?reason=<code>, or ?reason=none for the ones nobody has classified --
         # which is the filter that actually gets used, because it IS the backlog.
         reason = (params.get("reason") or "").strip()
