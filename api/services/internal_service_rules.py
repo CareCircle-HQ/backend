@@ -74,6 +74,13 @@ BOXES_RESULTS = {
     "Food Prescriptions (Voucher / Boxes)",
 }
 
+# The stages where a wrong case is worth telling somebody about: the member is
+# still moving through the funnel and the case CAN be corrected. Service Active is
+# absent because that is a HOLD, not a ticket.
+TICKETABLE_STAGES = frozenset({
+    "pending_verification", "validated", "verified", "kitchen_assignment",
+})
+
 MEALS_CASE_SERVICE = "Medically Tailored Meals"
 BOXES_CASE_SERVICE = "Produce Prescription/Voucher"
 
@@ -138,6 +145,44 @@ def evaluate_governing_case(client):
     return None
 
 
+# The hold reason code -> the ticket type raised when the member is NOT yet in
+# service. Same codes, deliberately: a member HELD for wrong_case_type and a member
+# TICKETED for wrong_case_type have the same problem, caught at different points.
+_TICKET_TYPE_FOR = {
+    "wrong_case_type": "wrong_case_type",
+    "not_enhanced_member": "not_enhanced_member",
+}
+
+
+def _open_wrong_case_ticket(client, code, reason_text, stage):
+    """Raise a ticket instead of holding, for a member not yet in service.
+
+    open_ticket is idempotent on (type, client, case, reason), so a re-import does
+    not pile up duplicates for the same member and problem -- which matters because
+    these rules run on every case write.
+
+    No ticket when we DO hold: a service-active hold stops deliveries and is visible
+    on its own.
+    """
+    from api.services.tickets import open_ticket
+
+    ticket_type = _TICKET_TYPE_FOR.get(code)
+    if ticket_type is None:
+        return None
+    try:
+        ticket, _created = open_ticket(
+            ticket_type,
+            reason=f"{reason_text} (member is at {stage}, not yet in service)",
+            client=client,
+            source="internal_service_rules",
+            actor="System",
+        )
+        return ticket
+    except Exception:  # noqa: BLE001 - a ticket must never break an import
+        logger.exception("could not raise a %s ticket for %s", ticket_type, client.pk)
+        return None
+
+
 def apply_internal_service_rules(client, *, actor=None, actor_label="", source=None):
     """Hold the governing programme when the rules say so. Returns the held
     enrollments.
@@ -160,11 +205,37 @@ def apply_internal_service_rules(client, *, actor=None, actor_label="", source=N
 
     held = []
     for enr in _governing_enrollments(client):
-        if EnrollmentStage(enr.stage) == EnrollmentStage.ON_HOLD:
+        stage = EnrollmentStage(enr.stage)
+        if stage == EnrollmentStage.ON_HOLD:
             continue                     # already held -- leave it, reason and all
-        if EnrollmentStage.ON_HOLD not in ENROLLMENT_TRANSITIONS.get(
-            EnrollmentStage(enr.stage), set()
-        ):
+
+        # ⚠ HOLD ONLY A MEMBER WHO IS ACTUALLY IN SERVICE. Everything earlier gets a
+        # TICKET instead.
+        #
+        # A hold stops deliveries -- that is the whole of what it does. Before
+        # Service Active nothing is being delivered, so the hold protects nothing
+        # and costs real time: resuming a household held at KITCHEN ASSIGNMENT
+        # returns it to kitchen assignment, NOT to service, so it has to be
+        # re-assigned and re-scheduled and can lose several delivery cycles.
+        #
+        # The codebase already made this call once, for the all-paused rule:
+        #   "A not-yet-verified enrollment isn't serving anyone, so pausing its
+        #    members must NOT drive it to On Hold -- otherwise a later resume would
+        #    advance it to Service Active and strand it Active without ever being
+        #    verified."   (views_members.py:520)
+        # These rules had no such guard, and held 7 of 137 members from `validated`,
+        # `verified` and `kitchen_assignment`.
+        if stage != EnrollmentStage.SERVICE_ACTIVE:
+            # ⚠ AND ONLY TICKET A LIVE, PRE-SERVICE ENROLLMENT. A member whose
+            # enrollment is CLOSED, CANCELLED, DISREGARDED or on a
+            # SCHEDULED_EXTENSION has nothing for anyone to correct -- the
+            # enrollment is finished or superseded. Ticketing them anyway would
+            # have raised ~65 tickets nobody can action, which is how a new ticket
+            # type becomes noise on the day it ships.
+            if stage in TICKETABLE_STAGES:
+                _open_wrong_case_ticket(client, code, reason_text, stage)
+            continue
+        if EnrollmentStage.ON_HOLD not in ENROLLMENT_TRANSITIONS.get(stage, set()):
             continue
         # Truncate BEFORE the hold, matching the other off-ramps: an ON_HOLD
         # enrollment is skipped by the delivery writer, so the order matters.

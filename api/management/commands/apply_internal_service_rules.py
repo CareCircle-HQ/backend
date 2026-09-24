@@ -103,6 +103,40 @@ class Command(BaseCommand):
             if already_held:
                 counts["  ... already On Hold, will be left alone"] += 1
 
+            # ⚠ WHAT WILL ACTUALLY HAPPEN, hold or ticket. The verdict alone is no
+            # longer the whole story: a hold is only placed on a member who is
+            # SERVICE ACTIVE, because resuming a household held at kitchen
+            # assignment returns it to kitchen assignment and can cost several
+            # delivery cycles. Everything earlier gets a ticket instead.
+            #
+            # Reporting the verdict as "would hold" would make this preview lie
+            # about its own --apply, which is the one thing the command exists to
+            # prevent.
+            stages = [
+                e.stage for e in client.enrollments.all()
+                if e.stage != EnrollmentStage.ON_HOLD
+            ]
+            if not stages:
+                # Every enrollment is ALREADY On Hold, so the rule skips this
+                # member entirely -- neither held again nor ticketed. Counting
+                # them as "will ticket" overstated the action by 134.
+                counts["ACTION: none (already held)"] += 1
+            elif EnrollmentStage.SERVICE_ACTIVE in stages:
+                counts["ACTION: hold (service active)"] += 1
+            else:
+                from api.services.internal_service_rules import TICKETABLE_STAGES
+
+                live = sorted(set(stages) & TICKETABLE_STAGES)
+                if live:
+                    counts[f"ACTION: ticket (at {', '.join(live)})"] += 1
+                else:
+                    # Closed / cancelled / disregarded / superseded: nothing to
+                    # correct, so neither held nor ticketed.
+                    counts[
+                        f"ACTION: none (terminal: "
+                        f"{', '.join(sorted(set(stages)))})"
+                    ] += 1
+
             affected.append({
                 "client": client,
                 "code": code,
@@ -120,7 +154,7 @@ class Command(BaseCommand):
             f"{counts['members with a live governing case']:,}"
         )
         self.stdout.write("")
-        self.stdout.write("WOULD HOLD:")
+        self.stdout.write("WHAT THE RULES FIND (hold OR ticket -- see ACTION below):")
         for key, n in sorted(counts.items()):
             if key.startswith("members with"):
                 continue

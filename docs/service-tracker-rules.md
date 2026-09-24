@@ -195,6 +195,48 @@ only.
 Rule 2 is checked **first**: there is no point judging which food case is right for a
 member not entitled to internal services at all.
 
+### ⚠️ A HOLD only when the member is IN SERVICE — otherwise a TICKET
+
+| Enrollment stage | Action |
+|---|---|
+| `service_active` | **HOLD** — stopping real deliveries is the whole point |
+| `kitchen_assignment` · `verified` · `validated` · `pending_verification` | **TICKET** |
+| `closed` · `cancelled` · `disregarded` · `scheduled_extension` | nothing |
+| already `on_hold` | nothing — the existing hold and its reason stand |
+
+A hold stops deliveries, and that is *all* it does. Before Service Active nothing is
+being delivered, so the hold protects nothing — and it costs real time: **resuming a
+household held at kitchen assignment returns it to kitchen assignment, not to
+service**, so it must be re-assigned and re-scheduled and can lose several delivery
+cycles.
+
+The codebase had already made this call once, for the all-paused rule:
+
+> *"A not-yet-verified enrollment isn't serving anyone, so pausing its members must
+> NOT drive it to On Hold — otherwise a later resume would advance it to Service
+> Active and strand it Active without ever being verified."* — `views_members.py:520`
+
+These rules had no such guard and held 7 of 137 members from `validated`, `verified`
+and `kitchen_assignment`.
+
+**Terminal stages get nothing at all.** A closed or superseded enrollment has nothing
+for anyone to correct; ticketing them would have raised ~65 tickets nobody can
+action.
+
+Two ticket types, mirroring the hold-reason codes so the vocabularies line up
+(migration `0303`):
+
+```
+wrong_case_type        Wrong Case Type Opened
+not_enhanced_member    Not an Enhanced Member
+```
+
+⚠️ Neither reuses `ineligible_for_service`. These members **are** eligible — the case
+is wrong. The remedy is to correct the case, not off-ramp the member.
+
+**No ticket when we DO hold.** A service-active hold stops deliveries and is visible
+on its own.
+
 The reasons written onto the hold:
 
 ```

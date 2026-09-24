@@ -38763,6 +38763,108 @@ class InternalServiceRulesTest(TestCase):
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
         self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
 
+    # ── hold only in service; ticket otherwise ──────────────────────────────
+    def test_SERVICE_ACTIVE_is_HELD_and_raises_NO_ticket(self):
+        """A service-active hold stops real deliveries and is visible on its own."""
+        from .models import EnrollmentStage, Ticket
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(Ticket.objects.filter(client=client).count(), 0)
+
+    def test_KITCHEN_ASSIGNMENT_is_TICKETED_not_held(self):
+        """⚠ The change. Resuming a household held at kitchen assignment returns it
+        to KITCHEN ASSIGNMENT, not to service -- so it must be re-assigned and
+        re-scheduled, and can lose SEVERAL delivery cycles. Before Service Active a
+        hold protects nothing and costs that."""
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        TicketType.objects.get_or_create(
+            code="not_enhanced_member", defaults={"label": "Not an Enhanced Member"},
+        )
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        self.assertEqual(self._apply(client), [])
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        ticket = Ticket.objects.filter(client=client).first()
+        self.assertIsNotNone(ticket)
+        self.assertEqual(ticket.type.code, "not_enhanced_member")
+        self.assertIn("not yet in service", ticket.reason)
+
+    def test_every_PRE_SERVICE_stage_is_ticketed(self):
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        for code in ("not_enhanced_member", "wrong_case_type"):
+            TicketType.objects.get_or_create(code=code, defaults={"label": code})
+        for stage in (EnrollmentStage.PENDING_VERIFICATION, EnrollmentStage.VERIFIED,
+                      EnrollmentStage.KITCHEN_ASSIGNMENT):
+            with self.subTest(stage=stage):
+                client, enr = self._member(
+                    eligible=[self.MTM], case_service="Medically Tailored Meals",
+                    stage=stage,
+                )
+                self.assertEqual(self._apply(client), [])
+                self.assertEqual(Ticket.objects.filter(client=client).count(), 1)
+
+    def test_a_TERMINAL_enrollment_gets_NEITHER(self):
+        """⚠ Closed / cancelled / disregarded / superseded: nothing for anyone to
+        correct. Ticketing them would have raised ~65 tickets nobody can action --
+        which is how a new ticket type becomes noise on the day it ships."""
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        TicketType.objects.get_or_create(
+            code="not_enhanced_member", defaults={"label": "Not an Enhanced Member"},
+        )
+        for stage in (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+                      EnrollmentStage.DISREGARDED):
+            with self.subTest(stage=stage):
+                client, _enr = self._member(
+                    eligible=[self.MTM], case_service="Medically Tailored Meals",
+                    stage=stage,
+                )
+                self.assertEqual(self._apply(client), [])
+                self.assertEqual(Ticket.objects.filter(client=client).count(), 0)
+
+    def test_the_ticket_is_IDEMPOTENT_across_re_imports(self):
+        """These rules run on every case write, so a duplicate per import would
+        bury the queue."""
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        TicketType.objects.get_or_create(
+            code="not_enhanced_member", defaults={"label": "Not an Enhanced Member"},
+        )
+        client, _enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+            stage=EnrollmentStage.VERIFIED,
+        )
+        self._apply(client)
+        self._apply(client)
+        self._apply(client)
+        self.assertEqual(Ticket.objects.filter(client=client).count(), 1)
+
+    def test_the_ticket_type_matches_the_RULE(self):
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        for code in ("not_enhanced_member", "wrong_case_type"):
+            TicketType.objects.get_or_create(code=code, defaults={"label": code})
+        client, _enr = self._member(
+            eligible=[self.ECM, self.BOXES],          # rule 3
+            case_service="Medically Tailored Meals",
+            stage=EnrollmentStage.VERIFIED,
+        )
+        self._apply(client)
+        self.assertEqual(
+            Ticket.objects.filter(client=client).first().type.code,
+            "wrong_case_type",
+        )
+
     def test_the_command_DRY_RUNS_by_default(self):
         """⚠ The command exists because these rules otherwise have no dry run: they
         fire on import, so without it the first sight of the blast radius is after
@@ -38869,6 +38971,16 @@ class InternalServiceRulesTriggerTest(TestCase):
             ("uncategorized", "Uncategorized"),
         ):
             HoldReason.objects.create(code=code, label=label)
+        # Migrations are disabled under the test runner, so the seeded ticket types
+        # do not exist -- a pre-service member is ticketed, and open_ticket needs
+        # the type to be there.
+        from .models import TicketType
+
+        for code, label in (
+            ("not_enhanced_member", "Not an Enhanced Member"),
+            ("wrong_case_type", "Wrong Case Type Opened"),
+        ):
+            TicketType.objects.get_or_create(code=code, defaults={"label": label})
         self.agent = Agent.objects.create(
             name="Trig Agent", agent_code="897", group="Management",
         )
@@ -38984,9 +39096,18 @@ class InternalServiceRulesTriggerTest(TestCase):
         importer.reconcile_client_ids = {client.pk}
         importer.reconcile_touched_cases()
 
+        # ⚠ A TICKET, not a hold. The authorization reconcile that runs first leaves
+        # this enrollment at VERIFIED, and a member who is not yet in service is
+        # ticketed rather than held -- resuming a pre-service hold costs delivery
+        # cycles and protects nothing. What this test pins is that the CSV cases
+        # import REACHES the rules at all, which is the gap it was written for.
+        from .models import Ticket, TicketType
+
         enr.refresh_from_db()
-        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
-        self.assertEqual(enr.hold_reason.code, "wrong_case_type")
+        self.assertNotEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        ticket = Ticket.objects.filter(client=client).first()
+        self.assertIsNotNone(ticket, "the cases import did not reach the rules")
+        self.assertEqual(ticket.type.code, "wrong_case_type")
 
 
 class HoldPauseDatesTest(TestCase):
