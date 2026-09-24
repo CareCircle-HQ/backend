@@ -36050,6 +36050,40 @@ class ServiceTrackerTest(TestCase):
         self.assertEqual(data["phase1"]["screening"]["domains"], ["Food"])
         self.assertIn("food", [t["code"] for t in data["tracks"]])
 
+    # ── "not reached yet" vs "out of order" ─────────────────────────────────
+    def test_has_live_case_is_FALSE_without_a_case(self):
+        """⚠ The gates go red only when a step is missing AND a case is open. Without
+        this flag the red border fired on the whole early funnel -- 33,034 screened
+        members have neither an assessment nor a case -- which would have made it
+        worth nothing."""
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self.assertFalse(tracker_for(self.member)["has_live_case"])
+
+    def test_has_live_case_is_TRUE_with_an_open_internal_service_case(self):
+        from .services.service_tracker import tracker_for
+
+        self._case("Medically Tailored Meals")
+        self.assertTrue(tracker_for(self.member)["has_live_case"])
+
+    def test_a_CLOSED_case_does_not_count(self):
+        """A finished programme is not a skipped step."""
+        from .models import Case
+        from .services.service_tracker import tracker_for
+
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(case_status="closed")
+        self.assertFalse(tracker_for(self.member)["has_live_case"])
+
+    def test_a_CANCELLED_case_does_not_count(self):
+        from .models import Case
+        from .services.service_tracker import tracker_for
+
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(case_status="cancelled")
+        self.assertFalse(tracker_for(self.member)["has_live_case"])
+
     def test_RULE_3_raises_an_alert(self):
         """⚠ It HOLDS 96 households and the panel said nothing: the Food Program row
         read "[done] Food service case" with no alert, while their deliveries were

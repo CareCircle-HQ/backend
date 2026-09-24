@@ -576,6 +576,8 @@ def rule_2_and_3_food(ctx):
 
 def tracker_for(client):
     """The whole tracker: the gateway phase, then a track per applicable rule."""
+    from api.models import CaseStatus, CaseType
+
     ctx = gather(client)
 
     screening = ctx["screening"]
@@ -651,6 +653,22 @@ def tracker_for(client):
         # with an open case and a live enrollment needs the case CLOSED and the
         # member retired; a member with neither needs nothing done.
         "service_status": _service_status(ctx),
+        # IS A CASE ALREADY OPEN? The gates need it to tell "not reached yet" from
+        # "out of order".
+        #
+        # A missing screening or assessment is the NORMAL state of a member coming
+        # through the funnel -- 33,034 screened members have neither an assessment
+        # nor a case. It only becomes a problem once an internal-service case is
+        # OPEN, because then a step was skipped: 227 members hold a live case with no
+        # screening and 5,744 with no assessment.
+        #
+        # Without this the red border fired on every early-funnel member, which
+        # would have made it worth nothing.
+        "has_live_case": any(
+            c.case_type == CaseType.INTERNAL_SERVICE
+            and (c.case_status or "") not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+            for c in ctx["all_cases"]
+        ),
         # Whether the member qualifies at all. The panel needs it for the empty
         # state: "no track applies YET" is only true while they are still coming
         # through the funnel, and it is the opposite of true for a member the
