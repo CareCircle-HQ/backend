@@ -37024,19 +37024,106 @@ class PauseReasonTest(TestCase):
         self.assertEqual(code, "out_of_range")
         self.assertIn("ZIP", how)
 
-    def test_a_MEDICAID_TYPE_failure_stays_uncategorised(self):
-        """⚠ 497 members. It is the largest ineligibility gate in the system and the
-        catalogue has no reason for it -- calling it "insurance" would be a guess that
-        reads as a fact."""
+    # ⚠ REPLACED. This used to assert that a Medicaid plan-type failure stayed
+    # Uncategorized, on my argument that calling it "insurance" would be a guess.
+    # It was the wrong call -- the member's Medicaid plan IS their insurance -- and
+    # it left 493 members in the largest bucket on the page. See
+    # test_MEDICAID_plan_type_is_an_INSURANCE_failure below.
+
+    def test_MEDICAID_plan_type_is_an_INSURANCE_failure(self):
+        """⚠ I originally left these Uncategorized, arguing that calling an unserved
+        plan type "insurance" would be a guess. It is not: the member's Medicaid plan
+        IS the insurance, and an unserved type makes it invalid for our purposes.
+        493 of the 577 Uncategorized pauses were this one string."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.client.ineligible_reasons = [
+            "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MLTC",
+        ]
+        profile.client.save(update_fields=["ineligible_reasons"])
+        code, how = self._classify(profile)
+        self.assertEqual(code, "insurance_invalid")
+        self.assertIn("Medicaid", how)
+
+    def test_the_coverage_area_wording_VARIANTS_all_map_to_out_of_range(self):
+        """⚠ "outside THE coverage area" was too tight -- the delivery-address
+        variant has no "the" and slipped into Uncategorized."""
+        from .models import MemberStatus
+
+        for stored in (
+            "home ZIP 33314 is outside the coverage area",
+            "delivery address outside coverage area",
+            "current ZIP 10301 is outside the coverage area",
+            "home state NJ is not served",
+        ):
+            with self.subTest(stored=stored):
+                profile = self._profile(
+                    status=MemberStatus.PAUSED, eligibility_paused=True,
+                )
+                profile.client.ineligible_reasons = [stored]
+                profile.client.save(update_fields=["ineligible_reasons"])
+                self.assertEqual(self._classify(profile)[0], "out_of_range")
+
+    def test_MEDICAID_is_checked_before_the_generic_insurance_match(self):
+        """The Medicaid string contains "FFS" and sits beside insurance wording, so
+        the order decides which reason 493 members get -- both land on
+        insurance_invalid, but only the Medicaid branch says so in `how`."""
         from .models import MemberStatus
 
         profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
         profile.client.ineligible_reasons = [
             "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MAP",
+            "all medical insurance plans are expired",
         ]
         profile.client.save(update_fields=["ineligible_reasons"])
-        code, _how = self._classify(profile)
-        self.assertEqual(code, "uncategorized")
+        self.assertIn("Medicaid", self._classify(profile)[1])
+
+    def test_reclassify_uncategorized_leaves_a_REAL_reason_alone(self):
+        """⚠ NOT --overwrite. Re-running a classifier over a category an agent chose
+        by hand is the whole risk of touching live data twice."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus, PauseReason
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.pause_reason = PauseReason.objects.get(code="member_cancelled")
+        profile.save(update_fields=["pause_reason"])
+        profile.client.ineligible_reasons = [
+            "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MLTC",
+        ]
+        profile.client.save(update_fields=["ineligible_reasons"])
+
+        out = StringIO()
+        call_command(
+            "backfill_pause_reasons", "--reclassify-uncategorized", "--apply",
+            stdout=out, stderr=out,
+        )
+        profile.refresh_from_db()
+        self.assertEqual(profile.pause_reason.code, "member_cancelled")
+
+    def test_reclassify_uncategorized_DOES_revisit_an_uncategorized_one(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus, PauseReason
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.pause_reason = PauseReason.objects.get(code="uncategorized")
+        profile.save(update_fields=["pause_reason"])
+        profile.client.ineligible_reasons = [
+            "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MLTC",
+        ]
+        profile.client.save(update_fields=["ineligible_reasons"])
+
+        out = StringIO()
+        call_command(
+            "backfill_pause_reasons", "--reclassify-uncategorized", "--apply",
+            stdout=out, stderr=out,
+        )
+        profile.refresh_from_db()
+        self.assertEqual(profile.pause_reason.code, "insurance_invalid")
 
     def test_pause_locked_means_a_CASE_TYPE_SWITCH(self):
         from .models import MemberStatus
