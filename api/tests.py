@@ -1,4 +1,5 @@
 import base64
+import io
 import uuid
 from datetime import date, datetime, timedelta, timezone as dt_timezone
 from types import SimpleNamespace
@@ -34008,3 +34009,5349 @@ class DataPageDomainFilterTest(TestCase):
         self.assertEqual(housing.data["domain"], "housing")
         self.assertFalse(housing.data["domain_available"])
         self.assertEqual(housing.data["count"], 0)
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorCompanyProfileTest(TestCase):
+    """The company's own address, phone and logo. ADMIN ONLY."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        self.vendor = Vendor.objects.create(
+            name="Acme Repairs", address="1 Old Road", contact_phone="(212) 555-0100",
+        )
+        self.admin = VendorUser.objects.create(
+            vendor=self.vendor, email="boss@acme.test", name="Ada Boss",
+            is_admin=True, password=make_password("pw-acme-1234"),
+        )
+        self.staff = VendorUser.objects.create(
+            vendor=self.vendor, email="tom@acme.test", name="Tom Staff",
+            is_admin=False, password=make_password("pw-tom-1234"),
+        )
+
+    def _api(self, email, password):
+        resp = APIClient().post(
+            "/v1/auth/login/", {"email": email, "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def _as_admin(self):
+        return self._api("boss@acme.test", "pw-acme-1234")
+
+    def _as_staff(self):
+        return self._api("tom@acme.test", "pw-tom-1234")
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+    # ── admin only ──────────────────────────────────────────────────────────
+    def test_a_STAFF_user_cannot_read_the_company_profile(self):
+        resp = self._as_staff().get("/v1/company/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_a_STAFF_user_cannot_change_the_address(self):
+        """They can read their assignments, but must not be able to change where
+        the company says it is."""
+        resp = self._as_staff().patch(
+            "/v1/company/", {"address": "somewhere else"}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.vendor.refresh_from_db()
+        self.assertEqual(self.vendor.address, "1 Old Road")
+
+    def test_a_STAFF_user_cannot_upload_a_logo(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        resp = self._as_staff().post(
+            "/v1/company/logo/",
+            {"file": SimpleUploadedFile("l.png", self.PNG, content_type="image/png")},
+            format="multipart", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    # ── the profile ─────────────────────────────────────────────────────────
+    def test_an_admin_updates_the_address_and_phone(self):
+        resp = self._as_admin().patch(
+            "/v1/company/",
+            {"address": "88 Vendor Way", "contact_phone": "(718) 555-0142"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(
+            sorted(resp.data["changed_fields"]), ["address", "contact_phone"],
+        )
+        self.vendor.refresh_from_db()
+        self.assertEqual(self.vendor.address, "88 Vendor Way")
+
+    def test_the_NAME_is_read_only_and_says_so(self):
+        """It is how CareCircle and Unite Us identify the company, and it appears on
+        authorizations already issued. Reported rather than silently dropped --
+        ignoring an edit someone typed is how they conclude the save is broken."""
+        resp = self._as_admin().patch(
+            "/v1/company/", {"name": "Renamed Ltd"}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "name_read_only")
+        self.vendor.refresh_from_db()
+        self.assertEqual(self.vendor.name, "Acme Repairs")
+
+    def test_an_unchanged_field_is_not_reported_as_changed(self):
+        resp = self._as_admin().patch(
+            "/v1/company/", {"address": "1 Old Road"}, format="json",
+            HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.data["changed_fields"], [])
+
+    def test_OUR_commercial_terms_are_not_in_the_payload(self):
+        """A vendor reading their own profile has no business seeing the mark-up we
+        add, or the internal notes we keep about them."""
+        from decimal import Decimal
+
+        self.vendor.admin_fee_percent = Decimal("15.00")
+        self.vendor.notes = "slow to invoice"
+        self.vendor.save(update_fields=["admin_fee_percent", "notes"])
+
+        body = json.dumps(
+            self._as_admin().get("/v1/company/", HTTP_HOST=VENDOR_HOST).data,
+            default=str,
+        )
+        for forbidden in ("admin_fee", "15.00", "notes", "slow to invoice"):
+            self.assertNotIn(forbidden, body)
+
+    def test_ANOTHER_companys_admin_sees_only_their_own(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+
+        rival = Vendor.objects.create(name="Rival Repairs", address="9 Rival St")
+        VendorUser.objects.create(
+            vendor=rival, email="boss@rival.test", name="Rita",
+            is_admin=True, password=make_password("pw-rival-1234"),
+        )
+        resp = self._api("boss@rival.test", "pw-rival-1234").get(
+            "/v1/company/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.data["name"], "Rival Repairs")
+        self.assertEqual(resp.data["address"], "9 Rival St")
+
+    # ── the logo ────────────────────────────────────────────────────────────
+    def test_a_NON_IMAGE_is_refused_by_type(self):
+        """Named explicitly: "invalid file" leaves someone guessing whether the
+        problem is the size, the format or the name."""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        resp = self._as_admin().post(
+            "/v1/company/logo/",
+            {"file": SimpleUploadedFile("x.txt", b"nope", content_type="text/plain")},
+            format="multipart", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "bad_type")
+
+    def test_an_oversized_logo_is_refused(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        big = b"\x89PNG\r\n\x1a\n" + b"\x00" * (5 * 1024 * 1024)
+        resp = self._as_admin().post(
+            "/v1/company/logo/",
+            {"file": SimpleUploadedFile("big.png", big, content_type="image/png")},
+            format="multipart", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "too_large")
+
+    def test_removing_the_logo_clears_the_KEY_but_not_the_object(self):
+        """A logo that appears on already-issued documents must not vanish from them
+        because someone changed the current one."""
+        self.vendor.logo_s3_key = "vendor-logos/x/abc-logo.png"
+        self.vendor.logo_updated_at = timezone.now()
+        self.vendor.save(update_fields=["logo_s3_key", "logo_updated_at"])
+
+        resp = self._as_admin().delete("/v1/company/logo/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.status_code, 200)
+        self.vendor.refresh_from_db()
+        self.assertEqual(self.vendor.logo_s3_key, "")
+        self.assertIsNone(self.vendor.logo_updated_at)
+
+    def test_the_logo_is_returned_as_a_PRESIGNED_url_not_a_stored_one(self):
+        """Storing a URL would leave a dead link in every document generated with
+        it, because presigned URLs expire."""
+        from .models import Vendor
+
+        field_names = {f.name for f in Vendor._meta.fields}
+        self.assertIn("logo_s3_key", field_names)
+        self.assertNotIn("logo_url", field_names)
+
+
+class LogoOptimisationTest(TestCase):
+    """Normalising a vendor logo for PDF output.
+
+    The target is PRINT, not screen: these logos only ever appear on invoices and
+    quotes.
+    """
+
+    def _image(self, size, *, mode="RGBA", fmt="PNG", pad=0):
+        import io
+
+        from PIL import Image, ImageDraw
+
+        img = Image.new(mode, size, (0, 0, 0, 0) if mode == "RGBA" else (255, 255, 255))
+        ImageDraw.Draw(img).rectangle(
+            [pad, pad, size[0] - 1 - pad, size[1] - 1 - pad], fill=(200, 30, 30, 255),
+        )
+        buf = io.BytesIO()
+        img.save(buf, format=fmt)
+        return buf.getvalue()
+
+    def _out(self, raw):
+        import io
+
+        from PIL import Image
+
+        from .services.logo_image import optimise
+
+        png, info = optimise(raw)
+        return Image.open(io.BytesIO(png)), info
+
+    def test_a_large_logo_is_scaled_to_the_print_target(self):
+        """600px on the long edge is roughly 50mm at 300 DPI -- an invoice header at
+        a resolution that does not look fuzzy on paper."""
+        from .services.logo_image import TARGET_LONG_EDGE
+
+        img, _info = self._out(self._image((2400, 2400)))
+        self.assertEqual(max(img.size), TARGET_LONG_EDGE)
+
+    def test_the_ASPECT_RATIO_is_preserved(self):
+        img, _info = self._out(self._image((3000, 500)))
+        self.assertEqual(img.size, (600, 100))
+
+    def test_a_SMALL_logo_is_never_upscaled(self):
+        """Enlarging adds no detail and makes it look worse -- blurry at a size that
+        invites scrutiny, rather than small and sharp."""
+        img, _info = self._out(self._image((240, 240)))
+        self.assertEqual(img.size, (240, 240))
+
+    def test_a_logo_too_small_to_print_well_WARNS_but_is_accepted(self):
+        """A small logo is the only one some companies have; refusing it leaves them
+        with none at all. The admin is the only person who can fix it, so the
+        warning goes to them rather than into our logs."""
+        _img, info = self._out(self._image((240, 240)))
+        self.assertIn("240x240", info["warning"])
+        self.assertIn("soft when printed", info["warning"])
+
+    def test_a_big_enough_logo_warns_about_nothing(self):
+        _img, info = self._out(self._image((1200, 400)))
+        self.assertEqual(info["warning"], "")
+
+    def test_EVERY_format_comes_out_as_PNG(self):
+        """JPEG artefacts cluster on the hard edges and small text a logo is made
+        of, and WebP is patchily supported by PDF toolchains -- a logo that silently
+        fails to embed is worse than one that looks soft."""
+        for fmt, mode in (("PNG", "RGBA"), ("JPEG", "RGB"), ("WEBP", "RGBA")):
+            img, _info = self._out(self._image((900, 900), mode=mode, fmt=fmt))
+            self.assertEqual(img.format, "PNG", fmt)
+
+    def test_TRANSPARENCY_is_preserved_not_flattened(self):
+        """Flattening onto white looks identical on a white invoice and wrong the
+        first time a logo lands on a coloured header -- a change nobody would think
+        to re-test.
+
+        The hole is INSIDE the artwork. My first version of this test used a
+        transparent margin, which the trimming step removes -- so it asserted the
+        absence of the thing it had just cut off, and failed for the right reason.
+        """
+        import io
+
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGBA", (800, 800), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([0, 0, 799, 799], fill=(200, 30, 30, 255))
+        # A see-through window in the middle, as a ring-shaped logo would have.
+        draw.rectangle([300, 300, 499, 499], fill=(0, 0, 0, 0))
+        buf = io.BytesIO(); img.save(buf, format="PNG")
+
+        out, _info = self._out(buf.getvalue())
+        self.assertEqual(out.mode, "RGBA")
+        self.assertEqual(out.getchannel("A").getextrema()[0], 0)
+
+    def test_TRANSPARENT_PADDING_is_trimmed(self):
+        """Logos arrive with a big empty border baked in, and since a document sizes
+        the image to a fixed box, that border renders the artwork small and
+        off-centre for reasons the admin cannot see."""
+        # 1200x1200 with a 300px margin: the artwork itself is 600x600.
+        img, _info = self._out(self._image((1200, 1200), pad=300))
+        self.assertEqual(img.size, (600, 600))
+
+    def test_an_OPAQUE_logo_is_not_trimmed(self):
+        img, _info = self._out(self._image((800, 800), mode="RGB", fmt="JPEG"))
+        self.assertEqual(img.size, (600, 600))
+
+    def test_a_fully_transparent_image_is_refused(self):
+        import io
+
+        from PIL import Image
+
+        from .services.logo_image import LogoError, optimise
+
+        buf = io.BytesIO()
+        Image.new("RGBA", (500, 500), (0, 0, 0, 0)).save(buf, format="PNG")
+        with self.assertRaises(LogoError) as ctx:
+            optimise(buf.getvalue())
+        self.assertIn("completely transparent", str(ctx.exception))
+
+    def test_a_non_image_is_refused_with_a_usable_message(self):
+        from .services.logo_image import LogoError, optimise
+
+        with self.assertRaises(LogoError) as ctx:
+            optimise(b"this is not an image")
+        # Tells them what to DO, not just that it failed.
+        self.assertIn("PNG", str(ctx.exception))
+
+    def test_the_dimensions_are_reported_for_document_layout(self):
+        _img, info = self._out(self._image((3000, 500)))
+        self.assertEqual((info["width"], info["height"]), (600, 100))
+
+    def test_a_JPEG_with_EXIF_orientation_is_rotated(self):
+        """Some export tools record orientation in EXIF rather than rotating the
+        pixels, and without this the logo embeds sideways."""
+        import io
+
+        from PIL import Image
+
+        from .services.logo_image import optimise
+
+        img = Image.new("RGB", (400, 200), (255, 255, 255))
+        buf = io.BytesIO()
+        exif = img.getexif()
+        exif[274] = 6  # Orientation: rotate 90
+        img.save(buf, format="JPEG", exif=exif)
+        out, info = optimise(buf.getvalue())
+        # 400x200 rotated becomes 200x400.
+        self.assertEqual((info["width"], info["height"]), (200, 400))
+
+    def test_the_stored_bytes_are_SMALLER_than_a_large_original(self):
+        from .services.logo_image import optimise
+
+        raw = self._image((2400, 2400))
+        png, _info = optimise(raw)
+        self.assertLess(len(png), len(raw))
+
+
+class SubmissionDocumentsTest(TestCase):
+    """The three PDFs produced when an assessment is submitted.
+
+    The rule running through all of them: VENDOR PRICES ONLY. The vendor receives
+    the invoice and the quote and the member can be shown the assessment, so our
+    admin fee or billed total appearing on any of them would hand out our
+    commercial position.
+    """
+
+    EEA = (
+        "Dwelling Assessment & Statement of Work (SOW) Development - "
+        "Modifications and Remediation Service - Queens"
+    )
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import (
+            ActiveProgram, BillableItem, BillingSettings, Case, CaseStatus,
+            CaseType, Client, DispatchKind, DispatchOrder, DispatchQuestionnaire,
+            DispatchSignature, Vendor, VendorUser,
+        )
+        from .services import dispatch as dispatch_svc
+        from .services.assessment_forms import build_schema
+        from .services.catalog import clear_program_domain_cache
+
+        BillingSettings.objects.update_or_create(
+            singleton_id=1, defaults={"admin_fee_percent": Decimal("10.00")},
+        )
+        ActiveProgram.objects.create(
+            program_name=self.EEA, case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            service_type=ActiveProgram.ServiceType.ENVIRONMENTAL_EXPOSURE_ASSESSMENT,
+        )
+        clear_program_domain_cache()
+
+        BillableItem.objects.create(
+            item="Dwelling assessment", option_code="",
+            billing_category="Dwelling Assessment & SOW Development",
+            vendor_price=Decimal("750.00"),
+        )
+        BillableItem.objects.create(
+            item="Grab bar at tub", option_code="grab_bar_tub",
+            billing_category="Grab Bars", main_category="Bathroom",
+            vendor_price=Decimal("498.75"),
+        )
+
+        self.vendor = Vendor.objects.create(
+            name="Acme Repairs", address="88 Vendor Way, Queens NY",
+            contact_phone="(718) 555-0142", contact_email="office@acme.test",
+        )
+        self.vendor_user = VendorUser.objects.create(
+            vendor=self.vendor, email="ada@acme.test", name="Ada Assessor",
+        )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pdf", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.EEA, case_created_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member, vendor=self.vendor,
+            referral_type="combined", case=self.case,
+            address_line1="1 Member Road", address_city="Queens",
+        )
+        self.form = DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+            answers={"mob.risk.slippery_tub": True, "mob.risk.grab_bars_absent": True},
+            interventions=[{"option": "grab_bar_tub", "qty": 2}],
+            justification="On blood thinners.", assessor_notes="Tub worn smooth.",
+            state="submitted", submitted_at=timezone.now(),
+        )
+        submission = dispatch_svc.open_submission(self.order)
+        for role, name in (("member", "Pdf Member"), ("vendor", "Ada Assessor")):
+            DispatchSignature.objects.create(
+                dispatch_submission=submission, signer_role=role, signer_name=name,
+                s3_key="", content_hash=f"h-{role}", signed_at=timezone.now(),
+            )
+
+    def _text(self, pdf_bytes):
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        return "".join(page.extract_text() or "" for page in reader.pages)
+
+    # ── the invoice ─────────────────────────────────────────────────────────
+    def test_the_invoice_bills_the_ASSESSMENT_ONLY(self):
+        """The recommended items have not been authorised, ordered or installed --
+        invoicing them would be billing for work nobody has approved."""
+        from .services.dispatch_pdf import render_invoice
+
+        text = self._text(render_invoice(self.order))
+        self.assertIn("$750.00", text)
+        self.assertNotIn("Grab bar", text)
+
+    def test_the_invoice_carries_the_vendors_own_details(self):
+        from .services.dispatch_pdf import render_invoice
+
+        text = self._text(render_invoice(self.order))
+        self.assertIn("Acme Repairs", text)
+        self.assertIn("88 Vendor Way", text)
+        self.assertIn("(718) 555-0142", text)
+
+    # ── the quote ───────────────────────────────────────────────────────────
+    def test_the_quote_totals_the_recommended_items_at_VENDOR_prices(self):
+        from .services.dispatch_pdf import render_quote
+
+        text = self._text(render_quote(self.order))
+        self.assertIn("Grab bar at tub", text)
+        # 2 x 498.75, with no fee added.
+        self.assertIn("$997.50", text)
+
+    def test_the_quote_carries_BOTH_signatures(self):
+        """The member signs because it records what they were told would be
+        requested on their behalf -- the thing most likely to be disputed."""
+        from .services.dispatch_pdf import render_quote
+
+        text = self._text(render_quote(self.order))
+        self.assertIn("Member signature", text)
+        self.assertIn("Assessor signature", text)
+        self.assertIn("Pdf Member", text)
+
+    def test_a_quote_with_NOTHING_recommended_says_so(self):
+        """An empty table and a $0.00 total looks like a rendering fault rather
+        than a finding."""
+        from .services.dispatch_pdf import render_quote
+
+        self.form.interventions = []
+        self.form.save(update_fields=["interventions"])
+        text = self._text(render_quote(self.order))
+        self.assertIn("No interventions were recommended", text)
+
+    # ── the report ──────────────────────────────────────────────────────────
+    def test_the_report_shows_every_question_answered_or_not(self):
+        """A report that silently omits what was NOT found cannot be checked
+        against the form."""
+        from .services.dispatch_pdf import render_assessment_report
+
+        text = self._text(render_assessment_report(self.order))
+        self.assertIn("Slippery tub or shower surface present", text)
+        # An unanswered one is still listed.
+        self.assertIn("Poor lighting present", text)
+
+    def test_the_report_includes_the_justification_and_notes(self):
+        from .services.dispatch_pdf import render_assessment_report
+
+        text = self._text(render_assessment_report(self.order))
+        self.assertIn("On blood thinners", text)
+        self.assertIn("Tub worn smooth", text)
+
+    def test_the_report_renders_from_the_FROZEN_snapshot(self):
+        """A form signed against one template version must not acquire the next
+        one's wording."""
+        from .services.dispatch_pdf import render_assessment_report
+
+        self.form.schema_snapshot = {
+            "version": 1, "form": "mobility", "label": "Mobility",
+            "service_code": "2.1", "categories": [],
+            "sections": [{
+                "code": "old", "title": "A Retired Section", "allows_other": False,
+                "groups": [{
+                    "code": "g", "label": "", "category": None,
+                    "requires_photo": False,
+                    "questions": [
+                        {"code": "retired.q", "label": "A question we removed"},
+                    ],
+                }],
+            }],
+        }
+        self.form.save(update_fields=["schema_snapshot"])
+        text = self._text(render_assessment_report(self.order))
+        self.assertIn("A Retired Section", text)
+        self.assertIn("A question we removed", text)
+        self.assertNotIn("Slippery tub", text)
+
+    def test_the_photographs_come_LAST(self):
+        from .models import DispatchProof
+        from .services.dispatch_pdf import render_assessment_report
+
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="", content_hash="p1",
+            intervention_group="mob.risk.bathroom",
+        )
+        text = self._text(render_assessment_report(self.order))
+        self.assertIn("Photographs", text)
+        self.assertGreater(text.index("Photographs"), text.index("Assessor Notes"))
+
+    # ── OUR pricing must appear nowhere ─────────────────────────────────────
+    def test_NONE_of_the_three_mentions_our_fee_or_billed_total(self):
+        from decimal import Decimal
+
+        from .services.dispatch_pdf import (
+            render_assessment_report, render_invoice, render_quote,
+        )
+
+        # 2 x 498.75 = 997.50; ours would bill 1097.25. And 750 -> 825.
+        forbidden = ("admin fee", "Admin Fee", "1,097.25", "825.00", "we bill")
+        for renderer in (render_invoice, render_quote, render_assessment_report):
+            text = self._text(renderer(self.order))
+            for token in forbidden:
+                self.assertNotIn(token, text, f"{renderer.__name__}: {token}")
+
+    def test_a_negotiated_vendor_price_is_the_one_that_appears(self):
+        """The documents are the vendor's, so they show what THEY charge."""
+        from decimal import Decimal
+
+        from .models import BillableItem, VendorPrice
+        from .services.dispatch_pdf import render_quote
+
+        VendorPrice.objects.create(
+            vendor=self.vendor,
+            billable_item=BillableItem.objects.get(option_code="grab_bar_tub"),
+            price=Decimal("400.00"),
+        )
+        text = self._text(render_quote(self.order))
+        self.assertIn("$800.00", text)
+        self.assertNotIn("$997.50", text)
+
+    # ── storing them ────────────────────────────────────────────────────────
+    def test_all_three_are_attached_to_the_order(self):
+        from .services.dispatch_pdf import (
+            DOC_ASSESSMENT, DOC_INVOICE, DOC_QUOTE,
+            generate_submission_documents,
+        )
+
+        docs = generate_submission_documents(
+            self.order, vendor_user=self.vendor_user,
+        )
+        self.assertEqual(
+            {d.doc_type for d in docs}, {DOC_INVOICE, DOC_QUOTE, DOC_ASSESSMENT},
+        )
+        self.assertEqual(self.order.documents.count(), 3)
+        for doc in docs:
+            self.assertTrue(doc.filename.endswith(".pdf"))
+            self.assertEqual(doc.uploaded_by_vendor_user_id, self.vendor_user.pk)
+
+    def test_the_same_assessment_renders_to_the_SAME_BYTES(self):
+        """Which is what makes content de-duplication possible. reportlab stamps a
+        creation time and a random document id by default, so the first version of
+        this left two identical invoices on the order after a resubmission."""
+        import hashlib
+
+        from .services.dispatch_pdf import render_quote
+
+        self.assertEqual(
+            hashlib.sha256(render_quote(self.order)).hexdigest(),
+            hashlib.sha256(render_quote(self.order)).hexdigest(),
+        )
+
+    def test_regenerating_IDENTICAL_documents_does_not_duplicate_them(self):
+        """A resubmission after a void must not leave two identical invoices."""
+        from .services.dispatch_pdf import generate_submission_documents
+
+        generate_submission_documents(self.order)
+        generate_submission_documents(self.order)
+        self.assertEqual(self.order.documents.count(), 3)
+
+    def test_a_CHANGED_assessment_produces_a_new_document(self):
+        """The de-duplication is on CONTENT, so a genuine correction still lands."""
+        from .services.dispatch_pdf import DOC_QUOTE, generate_submission_documents
+
+        generate_submission_documents(self.order)
+        self.form.interventions = [{"option": "grab_bar_tub", "qty": 5}]
+        self.form.save(update_fields=["interventions"])
+        generate_submission_documents(self.order)
+        self.assertEqual(
+            self.order.documents.filter(doc_type=DOC_QUOTE).count(), 2,
+        )
+
+
+class SubmissionDocumentImagesTest(TestCase):
+    """The logo, signatures and photographs must actually EMBED.
+
+    They did not. All three helpers called ``import_storage.download_to_temp``,
+    which returns an OPEN FILE OBJECT the caller must close and unlink -- not a
+    path. Every failure landed in a broad ``except`` and degraded to "(image
+    unavailable)", so three defective documents generated, stored and listed
+    without a single error surfacing. These tests assert on the EMBEDDED IMAGE
+    COUNT, which is the only thing that would have caught it.
+    """
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from .models import (
+            BillableItem, Client, DispatchKind, DispatchOrder, DispatchProof,
+            DispatchQuestionnaire, DispatchSignature, Vendor,
+        )
+        from .services import dispatch as dispatch_svc
+        from .services.assessment_forms import build_schema
+
+        BillableItem.objects.create(
+            item="Dwelling assessment", option_code="",
+            billing_category="Dwelling Assessment & SOW Development",
+            vendor_price=Decimal("750.00"),
+        )
+        self.vendor = Vendor.objects.create(
+            name="Imagery Ltd", logo_s3_key="vendor-logos/x/logo.png",
+            logo_width=600, logo_height=200,
+        )
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Img", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+            referral_type="combined",
+        )
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+            answers={"mob.risk.slippery_tub": True}, interventions=[],
+            state="submitted", submitted_at=timezone.now(),
+        )
+        submission = dispatch_svc.open_submission(self.order)
+        for role in ("member", "vendor"):
+            DispatchSignature.objects.create(
+                dispatch_submission=submission, signer_role=role,
+                signer_name=f"{role} name", s3_key=f"sig/{role}.png",
+                content_hash=f"h-{role}", signed_at=timezone.now(),
+            )
+        DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="proofs/one.png", content_hash="p1",
+            intervention_group="mob.risk.bathroom",
+        )
+
+    def _png(self, seed):
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        # A DISTINCT image per key. Handing back identical bytes made reportlab
+        # share one XObject between the logo, both signatures and the photograph,
+        # so the embedded-image count read 1 when four images were present -- the
+        # test was measuring de-duplication, not embedding.
+        Image.new("RGB", (40 + seed, 20 + seed), (seed * 30 % 255, 90, 160)).save(
+            buf, format="PNG",
+        )
+        return buf.getvalue()
+
+    def _patched(self):
+        """Every S3 read returns a real, DISTINCT PNG, so the only thing under test
+        is whether the rendering code embeds it."""
+        keys = {}
+
+        def fake_read(key):
+            keys.setdefault(key, len(keys) + 1)
+            return self._png(keys[key]), "image/png"
+
+        return mock.patch(
+            "api.services.import_storage.read_bytes", side_effect=fake_read,
+        )
+
+    def _images(self, pdf_bytes):
+        import io
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        return sum(len(list(page.images)) for page in reader.pages)
+
+    def test_the_invoice_embeds_the_LOGO(self):
+        from .services.dispatch_pdf import render_invoice
+
+        with self._patched():
+            self.assertEqual(self._images(render_invoice(self.order)), 1)
+
+    def test_the_quote_embeds_the_logo_AND_both_signatures(self):
+        from .services.dispatch_pdf import render_quote
+
+        with self._patched():
+            self.assertEqual(self._images(render_quote(self.order)), 3)
+
+    def test_the_report_embeds_the_logo_signatures_AND_photographs(self):
+        from .services.dispatch_pdf import render_assessment_report
+
+        with self._patched():
+            # logo + 2 signatures + 1 photograph
+            self.assertEqual(self._images(render_assessment_report(self.order)), 4)
+
+    def test_a_MISSING_image_degrades_rather_than_failing_the_document(self):
+        """The fallback is right -- it was the silence that was wrong. A document
+        must still be produced when an object has gone."""
+        from .services.dispatch_pdf import render_assessment_report
+
+        with mock.patch(
+            "api.services.import_storage.read_bytes", side_effect=OSError("gone"),
+        ):
+            pdf = render_assessment_report(self.order)
+        self.assertTrue(pdf.startswith(b"%PDF"))
+        self.assertEqual(self._images(pdf), 0)
+
+    def test_nothing_in_the_pdf_path_uses_download_to_temp(self):
+        """It returns an open file the caller must close and unlink, and names it
+        '.csv'. read_bytes is the documented choice for single images."""
+        import inspect
+
+        from .services import dispatch_pdf
+
+        source = inspect.getsource(dispatch_pdf)
+        # The comment explaining the trap is allowed; a CALL is not.
+        self.assertNotIn("import_storage.download_to_temp(", source)
+
+
+class MemberDispatchPhotosViewTest(TestCase):
+    """The Evidence tab's photograph list -- same shape as the documents list."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Client, DispatchKind, DispatchOrder, DispatchProof,
+            DispatchQuestionnaire, Vendor,
+        )
+        from .services.assessment_forms import build_schema
+
+        agent = Agent.objects.create(
+            name="Photo Agent", agent_code="784", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ph", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Snap Ltd"), referral_type="combined",
+        )
+        DispatchQuestionnaire.objects.create(
+            dispatch_order=self.order, modules=["combined"],
+            schema_snapshot=build_schema(["combined"]),
+        )
+        self.bathroom = DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="proofs/abc123-bath.jpg",
+            content_hash="h1", intervention_group="mob.risk.bathroom",
+            caption="Tub with no bars",
+        )
+        self.general = DispatchProof.objects.create(
+            dispatch_order=self.order, s3_key="proofs/def456-front.jpg",
+            content_hash="h2", intervention_group="",
+        )
+
+    def _photos(self):
+        resp = self.api.get(
+            f"/api/portal/members/{self.member.pk}/dispatch-photos/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {p["id"]: p for p in resp.data["photos"]}
+
+    def test_a_photo_is_labelled_with_the_SECTION_it_evidences(self):
+        """Resolved from the form's frozen snapshot, so the label says what the
+        assessor was answering when they took it."""
+        self.assertEqual(self._photos()[self.bathroom.pk]["label"], "Bathroom")
+
+    def test_a_GENERAL_photo_falls_back_to_Dwelling(self):
+        """It has no group, and "" would render as a blank row that looks like a
+        fault."""
+        self.assertEqual(self._photos()[self.general.pk]["label"], "Dwelling")
+
+    def test_the_caption_is_carried_through(self):
+        self.assertEqual(
+            self._photos()[self.bathroom.pk]["caption"], "Tub with no bars",
+        )
+
+    def test_the_filename_comes_from_the_key(self):
+        self.assertEqual(
+            self._photos()[self.bathroom.pk]["filename"], "abc123-bath.jpg",
+        )
+
+    def test_another_members_photos_are_not_returned(self):
+        from .models import Client, DispatchKind, DispatchOrder, DispatchProof
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Other", last_name="One",
+            client_added_at=timezone.now(),
+        )
+        DispatchProof.objects.create(
+            dispatch_order=DispatchOrder.objects.create(
+                kind=DispatchKind.ASSESSMENT, client=other,
+            ),
+            s3_key="proofs/theirs.jpg", content_hash="h3",
+        )
+        self.assertEqual(len(self._photos()), 2)
+
+    def test_a_failed_presign_leaves_the_urls_EMPTY_not_broken(self):
+        """The row still lists the photo -- an agent should know it exists -- but a
+        link that cannot work is worse than none, so the UI omits the button."""
+        with mock.patch(
+            "api.services.import_storage.presign_get", side_effect=OSError("no s3"),
+        ):
+            photos = self._photos()
+        self.assertEqual(len(photos), 2)
+        self.assertEqual(photos[self.bathroom.pk]["view_url"], "")
+        self.assertEqual(photos[self.bathroom.pk]["download_url"], "")
+
+    def test_the_view_url_asks_for_INLINE_with_a_filename(self):
+        """presign_get only sets a Content-Disposition when it also has a
+        filename, so inline=True on its own is silently a no-op."""
+        with mock.patch(
+            "api.services.import_storage.presign_get", return_value="https://x/",
+        ) as presign:
+            self._photos()
+        inline_calls = [c for c in presign.call_args_list if c.kwargs.get("inline")]
+        self.assertTrue(inline_calls)
+        for call in inline_calls:
+            self.assertTrue(call.kwargs.get("download_name"))
+
+
+class ProgramParentProgramTest(TestCase):
+    """The parent product on a programme: meals or boxes.
+
+    Migrations are DISABLED under the test runner (see AGENTS.md), so the data
+    migration that classifies the real 24/24/24 is verified against the clone by
+    hand. What is tested here is the FIELD and the rules it has to obey.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import ActiveProgram, Agent
+
+        agent = Agent.objects.create(
+            name="Prog Agent", agent_code="785", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        self.mtm = ActiveProgram.objects.create(
+            program_name="Medically Tailored Meals (MTM) - Test",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.MEDICALLY_TAILORED_MEALS,
+            parent_program="meals",
+        )
+        self.produce = ActiveProgram.objects.create(
+            program_name="Produce Prescription - Test",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.PRODUCE_PRESCRIPTION,
+            parent_program="boxes",
+        )
+        # A Clinically Appropriate Meals programme AS IT NOW EXISTS: the name says
+        # CAM, the service type says MTM. Migration 0297 merged them because the
+        # case data has no CAM service type -- all 3,893 cases on a CAM programme
+        # are filed as "Medically Tailored Meals". The name and parent_program are
+        # what keep the distinction.
+        self.cam = ActiveProgram.objects.create(
+            program_name="Clinically Appropriate Meals - Test",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.MEDICALLY_TAILORED_MEALS,
+            parent_program="meals",
+        )
+        # Something genuinely unclassified, for the "none" filter -- navigation and
+        # case management deliver no product at all.
+        self.unclassified = ActiveProgram.objects.create(
+            program_name="Social Service Case Management - Test",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.SOCIAL_SERVICE_CASE_MANAGEMENT,
+        )
+
+    def test_the_new_service_type_exists_with_the_right_label(self):
+        from .models import ActiveProgram
+
+        self.assertEqual(
+            ActiveProgram.ServiceType.PRODUCE_PRESCRIPTION.label,
+            "Produce Prescription/Voucher",
+        )
+
+    def test_the_OLD_service_type_is_kept(self):
+        """Only the internal programmes moved. The external ones are other
+        providers' programmes whose service type is what Unite Us sends us, and
+        renaming those would stop them matching."""
+        from .models import ActiveProgram
+
+        self.assertEqual(
+            ActiveProgram.ServiceType.FOOD_PRESCRIPTIONS.label,
+            "Food Prescriptions (Voucher / Boxes)",
+        )
+
+    def test_parent_program_has_its_OWN_enum_not_the_product_one(self):
+        """It reused ProductTypeKind while the only answers were meals and boxes.
+        Home Remediation broke that: ProductTypeKind drives FOOD DELIVERY -- reports,
+        the logistics dashboard and order handling all branch on
+        ``== ProductTypeKind.BOXES`` -- so a housing value there would leak into
+        code that packs and delivers food."""
+        from .models import ActiveProgram, ProductTypeKind, ProgramParentKind
+
+        field = ActiveProgram._meta.get_field("parent_program")
+        self.assertEqual(list(field.choices), list(ProgramParentKind.choices))
+        self.assertNotIn("home_remediation", ProductTypeKind.values)
+
+    def test_the_shared_values_are_IDENTICAL_between_the_two_enums(self):
+        """Deliberately: existing rows needed no data migration, and anything
+        comparing the two strings still agrees."""
+        from .models import ProductTypeKind, ProgramParentKind
+
+        self.assertEqual(ProgramParentKind.MEALS, ProductTypeKind.MEALS)
+        self.assertEqual(ProgramParentKind.BOXES, ProductTypeKind.BOXES)
+
+    def test_HOME_REMEDIATION_is_a_valid_parent(self):
+        from .models import ActiveProgram
+
+        program = ActiveProgram.objects.create(
+            program_name="Home Remediation - Heater - Queens",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            parent_program="home_remediation",
+        )
+        program.full_clean()
+        resp = self.api.get(f"/api/portal/settings/programs/{program.id}/")
+        self.assertEqual(resp.data["parent_program_label"], "Home Remediation")
+
+    def test_filtering_by_HOME_REMEDIATION(self):
+        from .models import ActiveProgram
+
+        ActiveProgram.objects.create(
+            program_name="Home Remediation - Heater - Queens",
+            case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+            parent_program="home_remediation",
+        )
+        names = self._filter("?parent_program=home_remediation")
+        self.assertIn("Home Remediation - Heater - Queens", names)
+        self.assertNotIn(self.mtm.program_name, names)
+
+    def test_the_migration_needs_MORE_than_the_name_prefix(self):
+        """"Home Remediation Assistance: Mold and Pest" and similar exist as
+        EXTERNAL services, so a name prefix alone would eventually sweep one in.
+        Mirrors migration 0296's three conditions."""
+        from .models import ActiveProgram
+
+        external = ActiveProgram.objects.create(
+            program_name="Home Remediation Assistance: Mold and Pest - Brooklyn",
+            case_category="External Services",
+            case_type=ActiveProgram.CaseType.HOUSING,
+        )
+        matched = ActiveProgram.objects.filter(
+            case_category__icontains="internal",
+            case_type="housing",
+            program_name__istartswith="Home Remediation",
+        )
+        self.assertNotIn(external, matched)
+
+    def test_BLANK_is_allowed_and_is_the_default(self):
+        """Navigation, case management, housing and every external programme have
+        no parent product; guessing one would file a housing assessment under
+        meals."""
+        from .models import ActiveProgram
+
+        program = ActiveProgram.objects.create(
+            program_name="Navigation Services - Test",
+            case_category="Internal Services",
+            # CaseType only covers food/housing/transportation; a navigation
+            # programme simply has none, which is itself the case being tested.
+            case_type="",
+        )
+        self.assertEqual(program.parent_program, "")
+
+    def test_the_api_exposes_the_value_and_a_label(self):
+        resp = self.api.get(f"/api/portal/settings/programs/{self.mtm.id}/")
+        self.assertEqual(resp.data["parent_program"], "meals")
+        self.assertEqual(resp.data["parent_program_label"], "Meals")
+
+    def test_an_agent_can_SET_it(self):
+        """Unlike borough, which is decoded from the name: nothing in a programme's
+        name distinguishes a meal programme from a box one, so this is a judgement
+        only a person can make."""
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.unclassified.id}/",
+            {"parent_program": "meals"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.unclassified.refresh_from_db()
+        self.assertEqual(self.unclassified.parent_program, "meals")
+
+    def test_it_can_be_CLEARED(self):
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.mtm.id}/",
+            {"parent_program": ""}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.mtm.refresh_from_db()
+        self.assertEqual(self.mtm.parent_program, "")
+
+    def test_an_INVALID_value_is_refused(self):
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.mtm.id}/",
+            {"parent_program": "sandwiches"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.mtm.refresh_from_db()
+        self.assertEqual(self.mtm.parent_program, "meals")
+
+    def test_the_label_is_READ_ONLY(self):
+        """It is derived from the value; accepting it would let the two disagree."""
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.mtm.id}/",
+            {"parent_program_label": "Sandwiches"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.mtm.refresh_from_db()
+        self.assertEqual(self.mtm.get_parent_program_display(), "Meals")
+
+    def _filter(self, query):
+        resp = self.api.get(f"/api/portal/settings/programs/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {r["program_name"] for r in resp.data["results"]}
+
+    def test_filtering_by_MEALS(self):
+        names = self._filter("?parent_program=meals")
+        # BOTH meal services, which is the point of the classification: MTM and CAM
+        # are different services delivering the same product.
+        self.assertIn(self.mtm.program_name, names)
+        self.assertIn(self.cam.program_name, names)
+        self.assertNotIn(self.produce.program_name, names)
+
+    def test_filtering_by_BOXES(self):
+        names = self._filter("?parent_program=boxes")
+        self.assertIn(self.produce.program_name, names)
+        self.assertNotIn(self.mtm.program_name, names)
+
+    def test_filtering_by_NONE_finds_the_unclassified(self):
+        """The question the column was added to answer: which programmes still have
+        no product?"""
+        names = self._filter("?parent_program=none")
+        self.assertIn(self.unclassified.program_name, names)
+        self.assertNotIn(self.mtm.program_name, names)
+        self.assertNotIn(self.cam.program_name, names)
+
+    def test_an_unknown_filter_value_is_IGNORED_not_an_error(self):
+        """Matching the existing service_type filter's behaviour: a stale bookmark
+        should show the list, not a 400."""
+        self.assertEqual(
+            self._filter("?parent_program=sandwiches"), self._filter(""),
+        )
+
+    def test_it_COMBINES_with_the_other_filters(self):
+        names = self._filter("?parent_program=meals&case_type=food")
+        self.assertIn(self.mtm.program_name, names)
+        self.assertEqual(self._filter("?parent_program=meals&case_type=housing"), set())
+
+    def test_the_PARENT_classification_covers_only_internal_food(self):
+        """Mirrors migration 0290's filters, since migrations cannot run under the
+        test runner.
+
+        Note what did NOT stay internal-only: 0292 later moved EVERY remaining row
+        off ``food_prescriptions``, external ones included, because no case in the
+        database has ever used that label -- Unite Us has always sent "Produce
+        Prescription/Voucher". The PARENT PRODUCT is still internal-only, which is
+        the distinction this test holds.
+        """
+        from .models import ActiveProgram
+
+        external = ActiveProgram.objects.create(
+            program_name="Someone Else's Food Prescriptions",
+            case_category="External Services",
+            case_type=ActiveProgram.CaseType.FOOD,
+            service_type=ActiveProgram.ServiceType.FOOD_PRESCRIPTIONS,
+        )
+        internal_food = ActiveProgram.objects.filter(
+            case_type="food", case_category__icontains="internal",
+        )
+        self.assertNotIn(external, internal_food)
+        # An external programme gets no parent product: it is another provider's,
+        # and we deliver nothing for it.
+        self.assertEqual(external.parent_program, "")
+
+
+class ProgramIsActiveTest(TestCase):
+    """The active flag on a programme: is this one of ours to offer?"""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import ActiveProgram, Agent
+
+        agent = Agent.objects.create(
+            name="Active Agent", agent_code="786", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        self.internal = ActiveProgram.objects.create(
+            program_name="Internal Test", case_category="Internal Services",
+            case_type=ActiveProgram.CaseType.FOOD, is_active=True,
+        )
+        self.external = ActiveProgram.objects.create(
+            program_name="External Test", case_category="External Services",
+            case_type=ActiveProgram.CaseType.FOOD, is_active=False,
+        )
+
+    def _names(self, query=""):
+        resp = self.api.get(f"/api/portal/settings/programs/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {r["program_name"] for r in resp.data["results"]}
+
+    def test_a_new_programme_is_ACTIVE_by_default(self):
+        """Somebody adding a programme by hand intends to use it."""
+        from .models import ActiveProgram
+
+        program = ActiveProgram.objects.create(program_name="Brand New")
+        self.assertTrue(program.is_active)
+
+    def test_BOTH_are_listed_when_the_filter_is_off(self):
+        """209 of 324 are inactive. Hiding two thirds of the table by default would
+        leave an agent unable to find a programme they know exists."""
+        names = self._names()
+        self.assertIn(self.internal.program_name, names)
+        self.assertIn(self.external.program_name, names)
+
+    def test_filtering_to_ACTIVE(self):
+        names = self._names("?is_active=true")
+        self.assertIn(self.internal.program_name, names)
+        self.assertNotIn(self.external.program_name, names)
+
+    def test_filtering_to_INACTIVE(self):
+        names = self._names("?is_active=false")
+        self.assertIn(self.external.program_name, names)
+        self.assertNotIn(self.internal.program_name, names)
+
+    def test_it_combines_with_the_other_filters(self):
+        names = self._names("?is_active=true&case_type=food")
+        self.assertIn(self.internal.program_name, names)
+        self.assertNotIn(self.external.program_name, names)
+
+    def test_an_unknown_value_is_ignored(self):
+        self.assertEqual(self._names("?is_active=maybe"), self._names())
+
+    def test_an_agent_can_toggle_it(self):
+        resp = self.api.patch(
+            f"/api/portal/settings/programs/{self.external.id}/",
+            {"is_active": True}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.external.refresh_from_db()
+        self.assertTrue(self.external.is_active)
+
+    def test_INACTIVE_DOES_NOT_MEAN_UNUSED(self):
+        """The flag is a classification, not a usage statistic. External Services
+        took 144 cases in the last six months and SCREENING 357, and both are
+        inactive -- so nothing may use this flag to decide whether a case is real.
+
+        Asserted as a property of the data model: an inactive programme's cases are
+        still there and still found.
+        """
+        from .models import Case, CaseStatus, CaseType, Client
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Live", last_name="Case",
+            client_added_at=timezone.now(),
+        )
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=member, case_type=CaseType.EXTERNAL_SERVICE,
+            case_status=CaseStatus.MANAGED,
+            program_name=self.external.program_name,
+            case_created_at=timezone.now(),
+        )
+        self.assertFalse(self.external.is_active)
+        self.assertIn(case, Case.objects.filter(client=member))
+
+    def test_the_migration_rule_matches_case_INSENSITIVELY(self):
+        """The column holds "Internal Services", "ELIGIBILITY" and "Care
+        Management" -- three conventions at once -- so an exact match would miss a
+        row somebody retyped."""
+        from django.db.models import Q
+
+        from .models import ActiveProgram
+
+        ActiveProgram.objects.create(
+            program_name="Shouty", case_category="INTERNAL SERVICES",
+        )
+        ours = Q()
+        for category in ("internal services", "eligibility", "care management"):
+            ours |= Q(case_category__iexact=category)
+        self.assertIn(
+            "Shouty",
+            set(ActiveProgram.objects.filter(ours).values_list(
+                "program_name", flat=True,
+            )),
+        )
+
+
+class RetiredServiceTypeTest(TestCase):
+    """A retired service type is hidden from the dropdown but stays valid."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Retire Agent", agent_code="787", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _options(self):
+        resp = self.api.get("/api/portal/settings/programs/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {t["value"] for t in resp.data["service_types"]}
+
+    def test_food_prescriptions_is_NOT_offered(self):
+        self.assertNotIn("food_prescriptions", self._options())
+
+    def test_clinically_appropriate_meals_is_NOT_offered(self):
+        """The case data has no such service type -- every case on a CAM programme
+        is filed as Medically Tailored Meals."""
+        self.assertNotIn("clinically_appropriate_meals", self._options())
+
+    def test_its_replacement_IS_offered(self):
+        self.assertIn("produce_prescription", self._options())
+
+    def test_every_other_service_type_is_still_offered(self):
+        from .models import ActiveProgram
+        from .portal.views_settings import RETIRED_SERVICE_TYPES
+
+        expected = set(ActiveProgram.ServiceType.values) - RETIRED_SERVICE_TYPES
+        self.assertEqual(self._options(), expected)
+
+    def test_the_choice_REMAINS_valid_on_the_model(self):
+        """Deleting it would break historical migrations and orphan any row another
+        environment still holds. It simply stops being offerable."""
+        from .models import ActiveProgram
+
+        self.assertIn("food_prescriptions", ActiveProgram.ServiceType.values)
+        program = ActiveProgram.objects.create(
+            program_name="Legacy row", service_type="food_prescriptions",
+        )
+        program.full_clean()  # would raise if the choice had been removed
+
+    def test_a_row_ALREADY_on_it_still_serialises(self):
+        """An agent must be able to see and fix such a row, not have it render
+        blank because the option went away."""
+        from .models import ActiveProgram
+
+        program = ActiveProgram.objects.create(
+            program_name="Legacy row", case_category="External Services",
+            service_type="food_prescriptions",
+        )
+        resp = self.api.get(f"/api/portal/settings/programs/{program.id}/")
+        self.assertEqual(resp.data["service_type"], "food_prescriptions")
+        self.assertEqual(
+            resp.data["service_type_label"], "Food Prescriptions (Voucher / Boxes)",
+        )
+
+
+class TagVoucherCasesCommandTest(TestCase):
+    """The tag_voucher_cases management command."""
+
+    NAME = (
+        "Medically Tailored or Nutritionally Appropriate Food Prescriptions: "
+        "Voucher - Other Eligible Populations - Brooklyn"
+    )
+
+    def setUp(self):
+        from .models import (
+            Case, CaseStatus, CaseType, Client, ClientTag,
+        )
+
+        self.tag = ClientTag.objects.create(name="Voucher Case tag")
+        self.holder = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Voucher", last_name="Holder",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.holder,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name=self.NAME, case_created_at=timezone.now(),
+        )
+        self.other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Other", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.other,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.MANAGED,
+            program_name="Medically Tailored Meals (MTM) - Other - Brooklyn",
+            case_created_at=timezone.now(),
+        )
+
+    def _run(self, *args):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("tag_voucher_cases", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def test_a_DRY_RUN_changes_nothing(self):
+        """Without --apply it reports and stops. A tagging script that writes by
+        default is one you cannot safely run to see what it would do."""
+        output = self._run()
+        self.assertIn("Dry run", output)
+        self.assertEqual(self.tag.clients.count(), 0)
+
+    def _tagged_ids(self):
+        # Compared as STRINGS: Client.pk is a UUIDField, and creating a row with a
+        # str pk leaves the in-memory instance holding a str while a reloaded one
+        # holds a UUID -- so model equality fails on the same row.
+        return {str(pk) for pk in self.tag.clients.values_list("client_id", flat=True)}
+
+    def test_apply_tags_the_member_holding_the_case(self):
+        self._run("--apply")
+        self.assertIn(str(self.holder.pk), self._tagged_ids())
+
+    def test_a_member_WITHOUT_a_voucher_case_is_untouched(self):
+        self._run("--apply")
+        self.assertNotIn(str(self.other.pk), self._tagged_ids())
+
+    def test_running_it_TWICE_changes_nothing_the_second_time(self):
+        self._run("--apply")
+        output = self._run("--apply")
+        self.assertIn("Nothing to do", output)
+        self.assertEqual(self.tag.clients.count(), 1)
+
+    def test_it_does_not_disturb_the_members_OTHER_tags(self):
+        from .models import ClientTag
+
+        other_tag = ClientTag.objects.create(name="Need Review")
+        self.holder.tags.add(other_tag)
+        self._run("--apply")
+        self.assertEqual(
+            set(self.holder.tags.values_list("name", flat=True)),
+            {"Need Review", "Voucher Case tag"},
+        )
+
+    def test_a_MISSING_tag_is_reported_rather_than_created(self):
+        """The tag carries a colour and is managed in Settings. Inventing one would
+        give production a tag that does not match the one an agent made."""
+        from .models import ClientTag
+
+        ClientTag.objects.filter(name="Voucher Case tag").delete()
+        output = self._run("--apply")
+        self.assertIn("No tag named", output)
+        self.assertEqual(ClientTag.objects.filter(name="Voucher Case tag").count(), 0)
+
+    def test_a_renamed_programme_is_reported_as_matching_NOTHING(self):
+        """So a rename shows up loudly instead of quietly shrinking the total."""
+        output = self._run()
+        self.assertIn("matched NOTHING", output)
+
+    def test_the_programme_list_is_EXPLICIT_not_a_wildcard(self):
+        """A "Voucher" pattern would also sweep in the 12 "Reauthorization: …
+        Voucher" programmes, which were not asked for."""
+        from api.management.commands.tag_voucher_cases import PROGRAM_NAMES
+
+        self.assertEqual(len(PROGRAM_NAMES), 8)
+        self.assertFalse(
+            any(n.startswith("Reauthorization") for n in PROGRAM_NAMES),
+        )
+
+
+class ServiceTrackerTest(TestCase):
+    """The business rules behind the member Overview tracker.
+
+    Each rule gets a test for firing, a test for NOT firing, and a test for the
+    thing that makes it done -- because "the rule ran" and "the rule ran correctly"
+    are different claims.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+
+    def setUp(self):
+        from .models import Client
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Track", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _screen(self, services, *, when=None):
+        from .models import Screening
+
+        return Screening.objects.create(
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=services,
+            screen_created_at=when or timezone.now(),
+        )
+
+    def _assess(self, services, *, when=None):
+        from .models import Assessment
+
+        return Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=services,
+            screen_created_at=when or timezone.now(),
+        )
+
+    def _case(self, service_type, *, case_type="internal_service", status="managed",
+              program=""):
+        from .models import Case
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member, case_type=case_type,
+            case_status=status, service_type=service_type,
+            program_name=program, case_created_at=timezone.now(),
+        )
+
+    def _tracker(self):
+        from .services.service_tracker import tracker_for
+
+        return tracker_for(self.member)
+
+    def _track(self, code):
+        for track in self._tracker()["tracks"]:
+            if track["code"] == code:
+                return track
+        return None
+
+    # ── the domain derivation, which everything else rests on ───────────────
+    def test_a_domain_comes_from_the_service_NAME(self):
+        """Screening records store full service names, not domain words -- so
+        "screened for Housing" has to be derived."""
+        from .services.service_tracker import domain_of
+
+        self.assertEqual(domain_of("Asthma Remediation (Housing)"), "Housing")
+        self.assertEqual(domain_of("Clinically Appropriate Meals (Food)"), "Food")
+
+    def test_an_UNSUFFIXED_service_still_resolves(self):
+        """Two of the 25 screening values carry no suffix at all."""
+        from .services.service_tracker import domain_of
+
+        self.assertEqual(domain_of("Pre-tenancy Services"), "Housing")
+        self.assertEqual(domain_of("Cooking Supplies"), "Food")
+
+    # ── rule 0 ──────────────────────────────────────────────────────────────
+    def _core_states(self):
+        return {i["label"]: i["state"] for i in self._track("core")["items"]}
+
+    def test_rule_0_needs_BOTH_a_care_management_and_an_eligibility_case(self):
+        """They are two different pieces of work and both are required. On the
+        production data they genuinely diverge: 23,818 members have a live care
+        management case and 54,345 an eligibility one, but only 23,091 have both --
+        31,254 are missing the care management side and 727 the eligibility side."""
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self.assertEqual(self._core_states(), {
+            "Care Management Case": "todo", "Eligibility Case": "todo",
+        })
+
+        # The care management case has case_type "navigation" -- the programme
+        # category says Care Management, and the two do not sound alike, but the
+        # split is exact across all 165,908 cases.
+        self._case("Social Service Case Management", case_type="navigation")
+        self.assertEqual(self._core_states(), {
+            "Care Management Case": "done", "Eligibility Case": "todo",
+        })
+
+        self._case("Social Service Case Management", case_type="eligibility")
+        self.assertEqual(self._core_states(), {
+            "Care Management Case": "done", "Eligibility Case": "done",
+        })
+
+    def test_an_ELIGIBILITY_case_alone_leaves_care_management_outstanding(self):
+        """The commonest real shape -- 31,254 members -- and the reason the second
+        row exists at all."""
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self._case("Social Service Case Management", case_type="eligibility")
+        self.assertEqual(self._core_states()["Care Management Case"], "todo")
+
+    def test_the_TRACK_LABELS_are_the_agreed_ones(self):
+        """Pinned because they are product decisions, not incidental strings -- both
+        have been renamed once already."""
+        self._screen([self.ECM, "Asthma Remediation (Housing)",
+                      "Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        labels = {t["code"]: t["label"] for t in self._tracker()["tracks"]}
+        self.assertEqual(labels, {
+            "core": "Care Management Case",
+            "housing": "Housing Program",
+            "food": "Food Program",
+        })
+
+    def test_rule_0_does_not_fire_without_ECM(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess(["Clinically Appropriate Meals (Food)"])
+        self.assertIsNone(self._track("core"))
+
+    # ── what counts as done ─────────────────────────────────────────────────
+    def test_a_CLOSED_case_does_not_count_as_done(self):
+        """The tracker reports outstanding work, and a closed case is not in force."""
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self._case(
+            "Social Service Case Management", case_type="eligibility",
+            status="closed",
+        )
+        self.assertEqual(self._core_states()["Eligibility Case"], "todo")
+
+    def test_a_DRAFT_case_does_not_count_either(self):
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self._case(
+            "Social Service Case Management", case_type="eligibility",
+            status="draft",
+        )
+        self.assertEqual(self._core_states()["Eligibility Case"], "todo")
+
+    def test_pending_authorization_DOES_count(self):
+        """It is a live case: the work has been done and is awaiting a decision."""
+        self._screen([self.ECM])
+        self._assess([self.ECM])
+        self._case(
+            "Social Service Case Management", case_type="eligibility",
+            status="pending_authorization",
+        )
+        self.assertEqual(self._core_states()["Eligibility Case"], "done")
+
+    # ── rule 1 ──────────────────────────────────────────────────────────────
+    def test_rule_1_fires_on_screened_housing_plus_ECM_ALONE(self):
+        """No housing eligibility result is required -- those are what the dwelling
+        assessment goes on to recommend."""
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+        track = self._track("housing")
+        self.assertIsNotNone(track)
+        self.assertEqual(track["items"][0]["label"], "Environmental Exposure Assessment")
+        self.assertEqual(track["items"][0]["state"], "todo")
+
+    # ── the dwelling assessment's PROGRESS ──────────────────────────────────
+    def _order(self, **kw):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus, Vendor
+
+        return DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name=f"V{uuid.uuid4().hex[:6]}"),
+            status=kw.pop("status", DispatchStatus.PENDING_SCHEDULE), **kw,
+        )
+
+    def _housing_row(self):
+        return self._track("housing")["items"][0]
+
+    def _housing_setup(self):
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+
+    def test_with_NO_ORDER_the_row_says_so(self):
+        """"To-do" alone would not distinguish "nobody raised the order" from
+        "the vendor has not been yet"."""
+        self._housing_setup()
+        self.assertIn("No assessment order", self._housing_row()["detail"])
+
+    def test_an_OPEN_CASE_with_no_order_is_still_TO_DO(self):
+        """Found by deleting a real order: the row read "done" beside "no assessment
+        order raised yet", because Rule 1a is satisfied by the CASE while the work
+        order is what sends a vendor. A green tick next to "nothing raised" is a
+        contradiction an agent has to reason past."""
+        self._housing_setup()
+        self._case("Environmental Exposure Assessment")
+        row = self._housing_row()
+        self.assertEqual(row["state"], "todo")
+        self.assertIn("Case open", row["detail"])
+        self.assertIn("no assessment order raised", row["detail"])
+
+    def test_with_no_order_there_is_no_RECOMMENDATIONS_row(self):
+        """"Awaiting the vendor's assessment" beside an assessment nobody has
+        ordered points at the wrong party."""
+        self._housing_setup()
+        self._case("Environmental Exposure Assessment")
+        labels = [i["label"] for i in self._track("housing")["items"]]
+        self.assertNotIn("Recommended cases", labels)
+
+    def test_an_OUT_OF_RANGE_order_reads_as_blocked(self):
+        """And it outranks everything else: a withheld order cannot progress
+        whatever its status says, and it is the one state an agent can fix."""
+        from .models import ServiceZipCode
+
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
+        self._housing_setup()
+        self._order(address_zip="33314")
+        row = self._housing_row()
+        self.assertEqual(row["state"], "blocked")
+        self.assertIn("Out of range", row["detail"])
+        self.assertIn("33314", row["detail"])
+
+    def test_PENDING_SCHEDULE_is_waiting_on_the_vendor(self):
+        self._housing_setup()
+        self._order(address_zip="11236")
+        row = self._housing_row()
+        self.assertEqual(row["state"], "waiting")
+        self.assertIn("awaiting scheduling", row["detail"])
+
+    def test_CONFIRMED_shows_the_visit_date(self):
+        from datetime import timedelta
+
+        from .models import DispatchStatus, DispatchVisit
+
+        self._housing_setup()
+        order = self._order(address_zip="11236", status=DispatchStatus.CONFIRMED)
+        DispatchVisit.objects.create(
+            dispatch_order=order,
+            scheduled_for=timezone.now() + timedelta(days=3),
+        )
+        row = self._housing_row()
+        self.assertEqual(row["state"], "waiting")
+        self.assertIn("Visit confirmed for", row["detail"])
+
+    def test_PENDING_SUBMISSION_says_the_vendor_has_been(self):
+        from .models import DispatchStatus
+
+        self._housing_setup()
+        self._order(address_zip="11236", status=DispatchStatus.PENDING_SUBMISSION)
+        self.assertIn("awaiting the vendor's submission", self._housing_row()["detail"])
+
+    def test_a_CANCELLED_order_reads_as_blocked(self):
+        from .models import DispatchStatus
+
+        self._housing_setup()
+        self._order(address_zip="11236", status=DispatchStatus.CANCELLED)
+        self.assertEqual(self._housing_row()["state"], "blocked")
+
+    def test_a_SUBMITTED_assessment_with_no_CASE_is_still_outstanding(self):
+        """Rule 1a asks for the Unite Us case, and the vendor's work being finished
+        does not open it. The detail says which half is missing."""
+        from .models import DispatchStatus
+
+        self._housing_setup()
+        self._order(address_zip="11236", status=DispatchStatus.SUBMITTED)
+        row = self._housing_row()
+        self.assertEqual(row["state"], "todo")
+        self.assertIn("the case still needs opening", row["detail"])
+
+    def test_the_progress_uses_the_SAME_rule_the_vendor_api_does(self):
+        """Otherwise the tracker could claim an order was sent while the vendor API
+        was withholding it -- two opinions about one fact."""
+        import inspect
+
+        from .services import service_tracker
+
+        self.assertIn(
+            "not_dispatchable_reason", inspect.getsource(service_tracker),
+        )
+
+    def test_rule_1_does_not_fire_when_housing_was_never_screened(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM])
+        self.assertIsNone(self._track("housing"))
+
+    def test_rule_1a_is_done_when_the_case_AND_a_finished_order_exist(self):
+        """The case alone is no longer enough, and that is the point: Rule 1a asks
+        for the case, but a case with no work order means no vendor is going. Done
+        needs both -- the case open and the assessment actually carried out."""
+        from .models import DispatchStatus, ServiceZipCode
+
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+        self._case("Environmental Exposure Assessment")
+        self._order(address_zip="11236", status=DispatchStatus.SUBMITTED)
+        self.assertEqual(self._track("housing")["items"][0]["state"], "done")
+
+    def test_recommendations_WAIT_until_the_assessment_is_submitted(self):
+        """Listing them earlier would ask an agent to open cases for work nobody
+        has assessed. Needs an ORDER as well as a case: with no order there is
+        nothing to wait for, and the row is absent instead."""
+        from .models import ServiceZipCode
+
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+        self._case("Environmental Exposure Assessment")
+        self._order(address_zip="11236")
+        states = [i["state"] for i in self._track("housing")["items"]]
+        self.assertIn("waiting", states)
+
+    # ── rules 2 and 3 ───────────────────────────────────────────────────────
+    def test_EITHER_food_case_satisfies_the_rule(self):
+        """⚠ REBUILT. The rule used to expect a SPECIFIC service and flagged the
+        other as wrong. The authorisation data says otherwise: of 322 members holding
+        the "wrong" food service, 320 are APPROVED by the payer."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        for eligibility, service in (
+            ("Food Prescriptions (Voucher / Boxes) (Food)", "Medically Tailored Meals"),
+            ("Medically Tailored Meals (MTM) (Food)", "Produce Prescription/Voucher"),
+            ("Clinically Appropriate Meals (Food)", "Produce Prescription/Voucher"),
+        ):
+            with self.subTest(eligibility=eligibility, service=service):
+                self.member.cases.all().delete()
+                self.member.assessments.all().delete()
+                self._assess([self.ECM, eligibility])
+                self._case(service)
+                row = self._track("food")["items"][0]
+                self.assertEqual(row["label"], "Food service case")
+                self.assertEqual(row["state"], "done")
+
+    def test_the_row_names_WHICH_food_case_is_open(self):
+        """"A food case" is the rule, but an agent still wants to know which."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        self._case("Produce Prescription/Voucher")
+        self.assertIn(
+            "Produce Prescription", self._track("food")["items"][0]["detail"],
+        )
+
+    def test_a_CLOSED_food_case_reads_as_ENDED_not_as_a_to_do(self):
+        """⚠ 1,461 members whose food programme had finished were showing "Food
+        service case — to-do", which reads as "nobody ever opened one". They did; it
+        ran and closed."""
+        from datetime import timedelta
+
+        from .models import Case
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(
+            case_status="closed",
+            case_closed_at=timezone.now() - timedelta(days=9),
+        )
+        row = self._track("food")["items"][0]
+        self.assertEqual(row["state"], "ended")
+        self.assertIn("Service ended", row["detail"])
+        self.assertIn("Medically Tailored Meals", row["detail"])
+
+    def test_the_ENDED_row_names_the_CLOSE_DATE(self):
+        from datetime import timedelta
+
+        from .models import Case
+
+        closed_on = (timezone.now() - timedelta(days=30)).date()
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(
+            case_status="closed", case_closed_at=timezone.now() - timedelta(days=30),
+        )
+        self.assertIn(
+            closed_on.isoformat(), self._track("food")["items"][0]["detail"],
+        )
+
+    def test_the_MOST_RECENTLY_closed_case_is_the_one_reported(self):
+        """A member with several closed cases ended the LAST one, not their first."""
+        from datetime import timedelta
+
+        from .models import Case, CaseType
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        old = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="closed",
+            service_type="Medically Tailored Meals",
+            program_name="MTM - Brooklyn", case_created_at=timezone.now(),
+        )
+        Case.objects.filter(pk=old.pk).update(
+            case_closed_at=timezone.now() - timedelta(days=200),
+        )
+        recent = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="closed",
+            service_type="Produce Prescription/Voucher",
+            program_name="Boxes - Brooklyn", case_created_at=timezone.now(),
+        )
+        Case.objects.filter(pk=recent.pk).update(
+            case_closed_at=timezone.now() - timedelta(days=3),
+        )
+        self.assertIn(
+            "Produce Prescription/Voucher",
+            self._track("food")["items"][0]["detail"],
+        )
+
+    def test_a_LIVE_case_outranks_a_closed_one(self):
+        from datetime import timedelta
+
+        from .models import Case, CaseType
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        closed = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="closed",
+            service_type="Medically Tailored Meals",
+            program_name="MTM - Brooklyn", case_created_at=timezone.now(),
+        )
+        Case.objects.filter(pk=closed.pk).update(
+            case_closed_at=timezone.now() - timedelta(days=5),
+        )
+        self._case("Produce Prescription/Voucher")      # live
+        row = self._track("food")["items"][0]
+        self.assertEqual(row["state"], "done")
+
+    def test_a_closed_case_keeps_the_track_VISIBLE_with_no_food_eligibility(self):
+        """⚠ The member who surfaced this: screened for Food, ECM only on the
+        assessment, an APPROVED meals case closed in September -- and the whole track
+        vanished, so the profile gave no sign a food programme had ever existed."""
+        from datetime import timedelta
+
+        from .models import Case
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM])                 # NO food service named
+        self._case("Medically Tailored Meals")
+        Case.objects.filter(client=self.member).update(
+            case_status="closed", case_closed_at=timezone.now() - timedelta(days=9),
+        )
+        track = self._track("food")
+        self.assertIsNotNone(track)
+        self.assertEqual(track["items"][0]["state"], "ended")
+
+    def test_with_NO_food_eligibility_and_NO_case_the_track_stays_absent(self):
+        """The 116 approved-case members this guard was written for: demanding a food
+        case a member was never assessed for would invent a requirement."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM])
+        self.assertIsNone(self._track("food"))
+
+    def test_NO_food_case_is_still_outstanding(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        row = self._track("food")["items"][0]
+        self.assertEqual(row["state"], "todo")
+        self.assertIn("either satisfies", row["detail"])
+
+    def test_BOTH_spellings_of_a_result_are_accepted(self):
+        """The bare form appears on a few dozen older records and means the same."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM)"])
+        self.assertIsNotNone(self._track("food"))
+
+    def test_the_food_track_is_ABSENT_when_no_food_result_applies(self):
+        """Rather than an empty track: a member screened for food but assessed for
+        nothing food-related has no food work outstanding."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Asthma Remediation (Housing)"])
+        self.assertIsNone(self._track("food"))
+
+    # ── a scheduled reauthorization ─────────────────────────────────────────
+    def _food_setup(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+
+    def _reauth(self, *, service_type="Medically Tailored Meals", days=30,
+                status="approved", is_extension=True, case_status="open"):
+        from datetime import timedelta
+
+        from .models import Case, CaseType
+
+        start = timezone.localdate() + timedelta(days=days)
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=case_status,
+            service_type=service_type, is_extension=is_extension,
+            service_authorization_status=status,
+            service_authorization_approval_starts_at=start,
+            service_authorization_approval_ends_at=start + timedelta(days=180),
+            case_created_at=timezone.now(),
+        )
+
+    def _serving(self, service_type="Medically Tailored Meals"):
+        """The case being extended. deferred_extension_case_ids requires one of the
+        SAME kind and scope, or the extension is not deferred at all."""
+        from datetime import timedelta
+
+        from .models import Case, CaseType
+
+        today = timezone.localdate()
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+            service_type=service_type,
+            service_authorization_status="approved",
+            service_authorization_approval_starts_at=today - timedelta(days=150),
+            service_authorization_approval_ends_at=today + timedelta(days=30),
+            case_created_at=timezone.now(),
+        )
+
+    def _food_labels(self):
+        return [i["label"] for i in self._track("food")["items"]]
+
+    def test_a_SCHEDULED_reauthorization_appears_below_its_service(self):
+        """It is the same service continuing, not a second one -- and without the row
+        an agent sees a window about to end with no sign the next is approved, which
+        is exactly when somebody opens a duplicate."""
+        self._food_setup()
+        self._serving()
+        self._reauth()
+        labels = self._food_labels()
+        self.assertEqual(labels[0], "Food service case")
+        self.assertEqual(labels[1], "Reauthorization scheduled")
+
+    def test_it_is_WAITING_not_outstanding(self):
+        """It is approved and activates on its own date. Marking it to-do would have
+        an agent chasing work that is already done."""
+        self._food_setup()
+        self._serving()
+        self._reauth()
+        row = self._track("food")["items"][1]
+        self.assertEqual(row["state"], "waiting")
+
+    def test_the_start_date_is_shown_with_the_month_readable(self):
+        """str.capitalize() lower-cased the rest and turned "25 Oct" into "25 oct"."""
+        self._food_setup()
+        self._serving()
+        self._reauth(days=33)
+        detail = self._track("food")["items"][1]["detail"]
+        self.assertTrue(detail.startswith("Starts "))
+        self.assertNotEqual(detail, detail.lower())
+
+    def test_a_reauth_for_EITHER_food_service_appears(self):
+        """⚠ REVERSED by the rebuild, and correctly. There used to be a row per
+        service, so a voucher reauthorization under the meals row was wrong. There is
+        now ONE food row -- meals and boxes are interchangeable -- so a scheduled
+        reauthorization of either belongs in it."""
+        self._food_setup()
+        self._serving(service_type="Produce Prescription/Voucher")
+        self._reauth(service_type="Produce Prescription/Voucher")
+        self.assertIn("Reauthorization scheduled", self._food_labels())
+
+    def test_a_CLOSED_reauth_case_never_appears(self):
+        """It will never activate, so it is not scheduled."""
+        self._food_setup()
+        self._serving()
+        self._reauth(case_status="closed")
+        self.assertNotIn("Reauthorization scheduled", self._food_labels())
+
+    def test_an_UNAPPROVED_reauth_does_not_count_as_scheduled(self):
+        self._food_setup()
+        self._serving()
+        self._reauth(status="pending")
+        self.assertNotIn("Reauthorization scheduled", self._food_labels())
+
+    def test_a_non_extension_case_is_not_a_reauthorization(self):
+        self._food_setup()
+        self._serving()
+        self._reauth(is_extension=False)
+        self.assertNotIn("Reauthorization scheduled", self._food_labels())
+
+    def test_it_defers_to_the_LIFECYCLE_helper(self):
+        """Recomputing "is it scheduled?" here would be a second opinion on a rule
+        with a design document behind it."""
+        import inspect
+
+        from .services import service_tracker
+
+        self.assertIn(
+            "deferred_extension_case_ids", inspect.getsource(service_tracker),
+        )
+
+    # ── which record the rules read ─────────────────────────────────────────
+    def test_the_LATEST_screening_wins(self):
+        from datetime import timedelta
+
+        old = timezone.now() - timedelta(days=90)
+        self._screen(["Asthma Remediation (Housing)"], when=old)
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        self.assertIsNone(self._track("housing"))
+        self.assertIsNotNone(self._track("food"))
+
+    def test_an_older_screening_is_IGNORED_entirely(self):
+        """The tracker works from the most recent record only -- it does not report
+        what an earlier one said. 229 of 53,678 members have an older screening
+        naming a domain the newest does not, and those members show one fewer track
+        than the union of their history would give. That is the intended reading."""
+        from datetime import timedelta
+
+        self._screen(
+            ["Asthma Remediation (Housing)"],
+            when=timezone.now() - timedelta(days=90),
+        )
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM])
+        tracker = self._tracker()
+        self.assertNotIn("superseded", tracker)
+        self.assertEqual(tracker["phase1"]["screening"]["domains"], ["Food"])
+        self.assertIsNone(self._track("housing"))
+
+    def test_a_member_with_NOTHING_gets_no_tracks_and_no_error(self):
+        self.assertEqual(self._tracker()["tracks"], [])
+        self.assertFalse(self._tracker()["phase1"]["screening"]["done"])
+
+    def test_the_gateway_lists_only_the_domains_we_SERVE(self):
+        """We screen for four and act on two. The others are reported separately so
+        the list does not look incomplete."""
+        self._screen([
+            "Clinically Appropriate Meals (Food)",
+            "Private Transportation (must also have at least one other HRSN need) (Transportation)",
+        ])
+        phase1 = self._tracker()["phase1"]["screening"]
+        self.assertEqual(phase1["domains"], ["Food"])
+        self.assertEqual(phase1["other_domains"], ["Transportation"])
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class VendorPasswordWhitespaceTest(TestCase):
+    """A password is OPAQUE -- it is stored exactly as supplied.
+
+    Provisioning used to `.strip()` the password while the login endpoint did not,
+    so a pasted password with a leading or trailing space was stored without it and
+    then rejected with it. That is why the first real vendor admin could not log in,
+    and the symptom is the worst kind: correct credentials, "Email or password is
+    incorrect."
+    """
+
+    PASSWORD = "probe-pass-9876 "   # note the trailing space
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, Vendor
+
+        agent = Agent.objects.create(
+            name="Pw Agent", agent_code="788", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        self.vendor = Vendor.objects.create(name="Whitespace Co")
+
+    def _provision(self, password):
+        return self.api.post(
+            f"/api/portal/settings/vendors/{self.vendor.pk}/admin-user/",
+            {"name": "Ada", "email": "ada@whitespace.test", "password": password},
+            format="json",
+        )
+
+    def _login(self, password):
+        return APIClient().post(
+            "/v1/auth/login/",
+            {"email": "ada@whitespace.test", "password": password},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+
+    def test_a_password_with_a_TRAILING_SPACE_works_as_typed(self):
+        self.assertEqual(self._provision(self.PASSWORD).status_code, 201)
+        self.assertEqual(self._login(self.PASSWORD).status_code, 200)
+
+    def test_the_STRIPPED_version_is_a_different_password_and_is_refused(self):
+        """The other half of the same claim: it is stored as supplied, so trimming
+        it must NOT let you in."""
+        self._provision(self.PASSWORD)
+        self.assertEqual(self._login(self.PASSWORD.strip()).status_code, 401)
+
+    def test_a_LEADING_space_works_too(self):
+        self.assertEqual(self._provision(" leading-space-pw").status_code, 201)
+        self.assertEqual(self._login(" leading-space-pw").status_code, 200)
+
+    def test_an_ordinary_password_is_unaffected(self):
+        self.assertEqual(self._provision("ordinary-pass-1").status_code, 201)
+        self.assertEqual(self._login("ordinary-pass-1").status_code, 200)
+
+    def test_the_length_check_still_applies(self):
+        resp = self._provision("short")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_a_WHITESPACE_ONLY_password_still_means_generate_one(self):
+        """The distinction my first attempt at this fix broke. Not stripping at all
+        turned "   " into a 3-character password and a 400, when it has always meant
+        "generate one for me" -- caught by an existing test, which is the only reason
+        it did not ship."""
+        resp = self._provision("   ")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(resp.data["temporary_password"])
+        self.assertFalse(resp.data["password_was_supplied"])
+
+    def test_NO_code_path_strips_a_password_on_the_way_in(self):
+        """Asserted against the source, because the bug was one `.strip()` in four
+        similar places and fixing three of them would look identical from outside.
+        """
+        import inspect
+
+        from .portal import views_settings
+        from .vendor import views as vendor_views
+
+        for module in (views_settings, vendor_views):
+            source = inspect.getsource(module)
+            # The banned shape assigns the STRIPPED value. Trimming only to DECIDE
+            # whether anything was supplied is fine, and is what replaced it.
+            self.assertNotIn(
+                'password") or "").strip()', source, module.__name__,
+            )
+            self.assertIn('if _raw.strip() else ""', source, module.__name__)
+
+
+@override_settings(VENDOR_API_HOST=VENDOR_HOST, ALLOWED_HOSTS=["*"])
+class OutOfServiceAreaNotDispatchedTest(TestCase):
+    """An order outside the service area is NEVER sent to the vendor.
+
+    One reached a vendor's work list at ZIP 33314 (Florida). A vendor cannot service
+    an address we do not cover, and the trip is billable whether or not the visit
+    was ever possible.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchKind, DispatchOrder, DispatchStatus, ServiceZipCode,
+            Vendor, VendorUser,
+        )
+
+        # A whitelist with something in it: an EMPTY table is inert by design, so a
+        # test that forgot this would pass for the wrong reason.
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
+
+        self.vendor = Vendor.objects.create(name="Area Co")
+        VendorUser.objects.create(
+            vendor=self.vendor, email="tom@area.test", name="Tom",
+            password=make_password("area-pass-1234"),
+        )
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Area", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=member, vendor=self.vendor,
+            status=DispatchStatus.PENDING_SCHEDULE, address_zip="33314",
+        )
+
+    def _api(self):
+        resp = APIClient().post(
+            "/v1/auth/login/",
+            {"email": "tom@area.test", "password": "area-pass-1234"},
+            format="json", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+        return api
+
+    def test_an_out_of_area_order_is_ABSENT_from_the_work_list(self):
+        resp = self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(resp.data, [])
+
+    def test_it_cannot_be_opened_by_ID_either(self):
+        """404, not a message about the service area: the vendor cannot fix it and
+        the dwelling's ZIP is not theirs to know."""
+        resp = self._api().get(
+            f"/v1/work/{self.order.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_correcting_the_ADDRESS_sends_it_with_no_other_action(self):
+        """The reason the rule is a filter and not a creation error: the order has
+        to exist for the address to be editable."""
+        self.order.address_zip = "11236"
+        self.order.save(update_fields=["address_zip"])
+
+        resp = self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST)
+        self.assertEqual(len(resp.data), 1)
+        detail = self._api().get(
+            f"/v1/work/{self.order.pk}/", HTTP_HOST=VENDOR_HOST,
+        )
+        self.assertEqual(detail.status_code, 200)
+
+    def test_an_IN_AREA_order_is_unaffected(self):
+        from .models import Client, DispatchKind, DispatchOrder, DispatchStatus
+
+        good = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, vendor=self.vendor,
+            client=Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name="Good", last_name="Member",
+                client_added_at=timezone.now(),
+            ),
+            status=DispatchStatus.PENDING_SCHEDULE, address_zip="11236",
+        )
+        ids = {o["id"] for o in self._api().get("/v1/work/", HTTP_HOST=VENDOR_HOST).data}
+        self.assertIn(str(good.pk), ids)
+        self.assertNotIn(str(self.order.pk), ids)
+
+    def test_a_WORK_ORDER_inherits_its_parents_address(self):
+        """It is the same dwelling, so it is withheld for the same reason -- and a
+        work order carries no address of its own to check."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+        from .services import dispatch as dispatch_svc
+
+        child = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, parent=self.order,
+            client=self.order.client, vendor=self.vendor,
+            status=DispatchStatus.PENDING_SCHEDULE,
+        )
+        self.assertFalse(dispatch_svc.is_dispatchable(child))
+
+    def test_an_order_with_NO_ZIP_is_NOT_withheld(self):
+        """Not knowing where a dwelling is differs from knowing we do not cover it.
+        An order can carry a full street address with the ZIP blank and still be a
+        serviceable visit -- and withholding these broke 14 existing vendor tests
+        whose fixtures are ordinary orders with no address at all."""
+        from .services import dispatch as dispatch_svc
+
+        self.order.address_zip = ""
+        self.order.save(update_fields=["address_zip"])
+        self.assertTrue(dispatch_svc.is_dispatchable(self.order))
+
+    def test_an_UNCONFIGURED_whitelist_withholds_NOTHING(self):
+        """An empty ZIP table is inert everywhere else, and a gate that withheld
+        every order on a fresh database would be this bug's twin."""
+        from .models import ServiceZipCode
+        from .services import dispatch as dispatch_svc
+
+        ServiceZipCode.objects.all().delete()
+        self.assertTrue(dispatch_svc.is_dispatchable(self.order))
+
+    def test_the_CRM_is_told_the_reason(self):
+        """Otherwise the panel shows Pending Schedule with no hint that nothing was
+        sent -- which is how this went unnoticed."""
+        from .services import dispatch as dispatch_svc
+
+        self.assertIn(
+            "33314", dispatch_svc.not_dispatchable_reason(self.order),
+        )
+
+
+class AssessmentAddressEditTest(TestCase):
+    """Correcting a dwelling address from the Details tab, and what it unblocks."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import (
+            Agent, Client, DispatchKind, DispatchOrder, DispatchStatus,
+            ServiceZipCode, Vendor,
+        )
+
+        ServiceZipCode.objects.create(zip="11236", borough="Brooklyn", is_active=True)
+        agent = Agent.objects.create(
+            name="Addr Agent", agent_code="789", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Addr", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.order = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=self.member,
+            vendor=Vendor.objects.create(name="Addr Co"),
+            status=DispatchStatus.PENDING_SCHEDULE,
+            address_line1="7840 Southwest 30th Street", address_city="Davie",
+            address_state="FL", address_zip="33314",
+            address_formatted="7840 Southwest 30th Street, Davie, FL 33314",
+            # A phone and a referral type, because the PATCH validates the RESULTING
+            # ORDER rather than the payload -- "an edit must not leave an order in a
+            # state the wizard would have refused to create". A fixture without them
+            # is an order the wizard could never have made, and it fails for that
+            # reason rather than anything to do with the address.
+            contact_phone="(718) 555-0142", contact_phone_type="mobile",
+            referral_type="combined",
+        )
+
+    def _orders(self):
+        resp = self.api.get(
+            f"/api/portal/members/{self.member.pk}/dispatch-orders/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def _patch(self, body):
+        return self.api.patch(
+            f"/api/portal/members/{self.member.pk}/assessment-order/{self.order.pk}/",
+            body, format="json",
+        )
+
+    def test_the_payload_carries_the_address_in_PARTS(self):
+        """service_address is a display string; you cannot put it back into an
+        autocomplete field and get the same components out."""
+        address = self._orders()[0]["address"]
+        self.assertEqual(address["street"], "7840 Southwest 30th Street")
+        self.assertEqual(address["city"], "Davie")
+        self.assertEqual(address["zip"], "33314")
+
+    def test_correcting_the_address_CLEARS_the_withheld_reason(self):
+        self.assertIn("33314", self._orders()[0]["withheld_reason"])
+
+        resp = self._patch({
+            "address_line1": "1234 East 80th Street", "address_city": "Brooklyn",
+            "address_state": "NY", "address_zip": "11236",
+            "address_formatted": "1234 East 80th Street, Brooklyn, NY 11236",
+        })
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(self._orders()[0]["withheld_reason"], "")
+
+    def test_the_FORMATTED_address_is_updated_too(self):
+        """It is what the vendor app and the PDFs display, so a corrected address
+        that left it stale would show the OLD one everywhere it matters."""
+        self._patch({
+            "address_line1": "1234 East 80th Street", "address_city": "Brooklyn",
+            "address_state": "NY", "address_zip": "11236",
+            "address_formatted": "1234 East 80th Street, Brooklyn, NY 11236",
+        })
+        self.assertEqual(
+            self._orders()[0]["service_address"],
+            "1234 East 80th Street, Brooklyn, NY 11236",
+        )
+
+    def test_the_change_is_reported_field_by_field(self):
+        resp = self._patch({"address_zip": "11236"})
+        self.assertEqual(resp.data["changed_fields"], ["address_zip"])
+
+    def test_a_no_op_patch_reports_NOTHING_changed(self):
+        """The editor stays open saying so, rather than closing as though it had
+        saved -- which is how an edit came to look successful while leaving no
+        history."""
+        resp = self._patch({"address_zip": "33314"})
+        self.assertEqual(resp.data["changed_fields"], [])
+
+    def test_the_address_is_NOT_editable_once_confirmed(self):
+        """The details have been acted on by then -- a vendor may already be on the
+        way to the old address."""
+        from .models import DispatchStatus
+
+        self.order.status = DispatchStatus.CONFIRMED
+        self.order.save(update_fields=["status"])
+        resp = self._patch({"address_zip": "11236"})
+        self.assertEqual(resp.status_code, 409)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.address_zip, "33314")
+
+
+class HousingRecommendationFamilyTest(TestCase):
+    """Which programme family a recommended product belongs to, and what counts as
+    already opened."""
+
+    def test_air_quality_and_temperature_are_HOME_REMEDIATION(self):
+        """⚠ REGRESSION. _CATEGORY_FAMILY read `if module == "ventilation"`, and when
+        the questionnaires were rebuilt around five product categories that module
+        ceased to exist -- so every air-quality and temperature product silently
+        became a Home Accessibility programme. The names it built matched nothing in
+        ActiveProgram, so each one reported exists=False and read as "no such
+        programme -- it must be created"."""
+        from .services.case_recommendations import _CATEGORY_FAMILY
+
+        for label in (
+            "Air Filtration Devices", "De-humidifier", "Humidifier",
+            "Air Conditioner", "Heater",
+        ):
+            self.assertEqual(
+                _CATEGORY_FAMILY[label], "Home Remediation", label,
+            )
+
+    def test_the_others_are_HOME_ACCESSIBILITY(self):
+        from .services.case_recommendations import _CATEGORY_FAMILY
+
+        for label in (
+            "Bathroom Facilities", "Non-skid Surfaces", "Grab Bars",
+            "Doors & Cabinet Handles", "Handrails",
+        ):
+            self.assertEqual(
+                _CATEGORY_FAMILY[label],
+                "Home Accessibility and Safety Modification",
+                label,
+            )
+
+    def test_EVERY_product_category_has_a_family(self):
+        """So a new category cannot quietly inherit the wrong one -- which is exactly
+        how the bug above survived."""
+        from .services.assessment_forms import INTERVENTIONS
+        from .services.case_recommendations import _CATEGORY_FAMILY
+
+        for groups in INTERVENTIONS.values():
+            for group in groups:
+                self.assertIn(group["label"], _CATEGORY_FAMILY)
+
+    def test_a_CLOSED_case_still_counts_as_already_opened(self):
+        """"Does one of these exist?" -- not "is one live?". A closed remediation
+        case means the work was done, and recommending it again would have an agent
+        open a duplicate."""
+        from .models import Case, CaseType, Client
+        from .services.case_recommendations import _existing_housing_cases
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Hx", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=member, case_type=CaseType.INTERNAL_SERVICE,
+            case_status="closed",
+            program_name="Home Remediation - De-humidifier - Queens",
+            case_created_at=timezone.now(),
+        )
+        self.assertIn(("De-humidifier", "Queens"), _existing_housing_cases(member))
+
+    def test_a_CANCELLED_case_counts_too(self):
+        from .models import Case, CaseType, Client
+        from .services.case_recommendations import _existing_housing_cases
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Cx", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=member, case_type=CaseType.INTERNAL_SERVICE,
+            case_status="cancelled",
+            program_name="Home Remediation - Heater - Brooklyn",
+            case_created_at=timezone.now(),
+        )
+        self.assertIn(("Heater", "Brooklyn"), _existing_housing_cases(member))
+
+    def test_the_BOROUGH_has_to_match(self):
+        """A Brooklyn heater case does not cover a Queens dwelling -- the programmes
+        are per borough, so the case genuinely has to be opened again."""
+        from .models import Case, CaseType, Client
+        from .services.case_recommendations import _existing_housing_cases
+
+        member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bx", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=member, case_type=CaseType.INTERNAL_SERVICE,
+            case_status="open",
+            program_name="Home Remediation - Heater - Brooklyn",
+            case_created_at=timezone.now(),
+        )
+        existing = _existing_housing_cases(member)
+        self.assertIn(("Heater", "Brooklyn"), existing)
+        self.assertNotIn(("Heater", "Queens"), existing)
+
+
+class ServiceTrackerBoroughTest(TestCase):
+    """Does each opened case sit in the borough the member's COVERAGE names?
+
+    ⚠ NOT their address. The coverage plan names the borough that is PAYING --
+    "Public Health Solutions - Brooklyn NY1115 Enhanced HRSN Services" -- and that is
+    the borough a case must be opened in, whatever address the member lives at.
+
+    The address version produced false positives: one member had all three cases
+    flagged wrong because she lives in Manhattan, when her coverage is Brooklyn and
+    the cases were right. Across 500 members the mismatch count fell from 36 to 9.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+
+    def setUp(self):
+        from .models import ActiveProgram, Client, ServiceZipCode
+
+        for zip_code, borough in (
+            ("11236", "Brooklyn"), ("11103", "Queens"), ("10002", "Manhattan"),
+        ):
+            ServiceZipCode.objects.create(
+                zip=zip_code, borough=borough, is_active=True,
+            )
+        for borough in ("Brooklyn", "Queens"):
+            ActiveProgram.objects.create(
+                program_name=f"Enhanced Care Management - Level 2 Only - {borough}",
+                case_category="Care Management", borough=borough,
+            )
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bor", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _coverage(self, borough, *, status="enrolled",
+                  plan="Enhanced HRSN Services"):
+        from .models import SocialCareCoverage
+
+        return SocialCareCoverage.objects.create(
+            client=self.member, coverage_id=uuid.uuid4(), status=status,
+            plan_name=f"Public Health Solutions - {borough} NY1115 {plan}",
+        )
+
+    def _address(self, zip_code, kind="current"):
+        from .models import Address
+
+        return Address.objects.create(
+            client=self.member, type=kind, zip=zip_code, city="X", state="NY",
+        )
+
+    def _setup_ecm(self, borough):
+        from .models import Assessment, Case, CaseType, Screening
+
+        Screening.objects.create(
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=[self.ECM],
+            screen_created_at=timezone.now(),
+        )
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=[self.ECM],
+            screen_created_at=timezone.now(),
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member, case_type=CaseType.NAVIGATION,
+            case_status="managed", service_type="Social Service Case Management",
+            program_name=f"Enhanced Care Management - Level 2 Only - {borough}",
+            case_created_at=timezone.now(),
+        )
+
+    def _care_row(self):
+        from .services.service_tracker import tracker_for
+
+        tracker = tracker_for(self.member)
+        track = next(t for t in tracker["tracks"] if t["code"] == "core")
+        return tracker, track["items"][0]
+
+    def test_a_case_in_the_COVERAGE_borough_matches(self):
+        self._coverage("Queens")
+        self._setup_ecm("Queens")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "Queens")
+        self.assertIs(row["borough_match"], True)
+
+    def test_a_case_in_ANOTHER_borough_is_flagged(self):
+        self._coverage("Queens")
+        self._setup_ecm("Brooklyn")
+        _tracker, row = self._care_row()
+        self.assertIs(row["borough_match"], False)
+
+    def test_the_ADDRESS_is_IGNORED(self):
+        """⚠ The whole point of the change. A member living in Manhattan whose
+        coverage is Brooklyn belongs to Brooklyn, and her Brooklyn cases are right --
+        the address version flagged all three as wrong."""
+        self._address("10002")                 # Manhattan
+        self._coverage("Brooklyn")
+        self._setup_ecm("Brooklyn")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "Brooklyn")
+        self.assertIs(row["borough_match"], True)
+
+    def test_a_NON_ENROLLED_coverage_does_not_count(self):
+        self._coverage("Queens", status="non_enrolled")
+        self._setup_ecm("Brooklyn")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "")
+        self.assertIsNone(row["borough_match"])
+
+    def test_an_EXPIRED_coverage_does_not_count(self):
+        self._coverage("Queens", status="expired")
+        self._setup_ecm("Brooklyn")
+        self.assertEqual(self._care_row()[0]["home_borough"], "")
+
+    def test_SCREENING_AND_NAVIGATION_plans_do_not_count(self):
+        """⚠ The rule is Enhanced HRSN SPECIFICALLY, and it costs coverage: 1,799 of
+        3,000 sampled members have no enrolled Enhanced HRSN row, and 1,491 of them
+        hold an enrolled Screening and Navigation plan that names a borough. Widening
+        the rule would answer most of them -- recorded here so the trade-off is
+        visible rather than rediscovered."""
+        self._coverage("Queens", plan="MCO Screening and Navigation")
+        self._coverage("Queens", plan="FFS Screening and Navigation")
+        self._setup_ecm("Brooklyn")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "")
+        self.assertIsNone(row["borough_match"])
+
+    def test_a_NON_NYC_region_is_not_treated_as_a_borough(self):
+        """The same plan shape covers Hudson Valley, Long Island and the Southern
+        Tier -- 57 rows. They are not boroughs we can compare a programme against."""
+        self._coverage("Hudson Valley Region")
+        self._setup_ecm("Brooklyn")
+        self.assertEqual(self._care_row()[0]["home_borough"], "")
+
+    def test_with_NO_coverage_the_check_is_UNKNOWN_not_wrong(self):
+        """Painting "we could not tell" red accuses good data of being wrong."""
+        self._setup_ecm("Brooklyn")
+        tracker, row = self._care_row()
+        self.assertEqual(tracker["home_borough"], "")
+        self.assertIsNone(row["borough_match"])
+
+    def test_a_programme_with_no_borough_is_UNKNOWN_too(self):
+        from .models import Case, CaseType
+
+        self._coverage("Queens")
+        self._setup_ecm("Queens")
+        self.member.cases.all().delete()
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member, case_type=CaseType.NAVIGATION,
+            case_status="managed", service_type="Social Service Case Management",
+            program_name="Care Management Services",
+            case_created_at=timezone.now(),
+        )
+        _tracker, row = self._care_row()
+        self.assertEqual(row["borough"], "")
+        self.assertIsNone(row["borough_match"])
+
+    def test_service_boroughs_knows_the_three_without_a_ZIP_table(self):
+        from .models import ServiceZipCode
+        from .services.service_area import service_boroughs
+
+        ServiceZipCode.objects.all().delete()
+        self.assertEqual(service_boroughs(), {"Brooklyn", "Manhattan", "Queens"})
+
+
+class ServiceTrackerAlertsTest(TestCase):
+    """The bad scenarios: things that do not ADD UP, not things merely unfinished.
+
+    All are rare on real data -- 0, 1, 1 and 6 in a 600-member sample -- which is what
+    makes a red banner the right weight. A warning firing on a third of members gets
+    scrolled past, and is then worse than nothing.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+    MTM = "Medically Tailored Meals (MTM) (Food)"
+    VOUCHER = "Food Prescriptions (Voucher / Boxes) (Food)"
+
+    def setUp(self):
+        from .models import Client
+
+        self.member = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Alert", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+
+    def _screen(self, services):
+        from .models import Screening
+
+        Screening.objects.create(
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=services,
+            screen_created_at=timezone.now(),
+        )
+
+    def _assess(self, services):
+        from .models import Assessment
+
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=services,
+            screen_created_at=timezone.now(),
+        )
+
+    def _case(self, service_type, program=""):
+        from .models import Case, CaseType
+
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.member,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+            service_type=service_type, program_name=program,
+            case_created_at=timezone.now(),
+        )
+
+    def _codes(self):
+        from .services.service_tracker import tracker_for
+
+        return [a["code"] for a in tracker_for(self.member)["alerts"]]
+
+    def _alerts(self):
+        from .services.service_tracker import tracker_for
+
+        return {a["code"]: a for a in tracker_for(self.member)["alerts"]}
+
+    # ── 1 and 3: a need with no qualification ───────────────────────────────
+    def test_1_housing_screened_without_ECM(self):
+        """No case can be opened at all, so every track is absent -- and without the
+        alert the tracker would show nothing, which reads as "nothing to do"."""
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess(["Nutritional Counseling and Education (Food)"])
+        self.assertIn("no_ecm_housing", self._codes())
+
+    def test_3_food_screened_without_ECM(self):
+        self._screen([self.MTM])
+        self._assess(["Pre-tenancy Services"])
+        self.assertIn("no_ecm_food", self._codes())
+
+    def test_BOTH_domains_screened_without_ECM_gives_both(self):
+        self._screen([self.MTM, "Asthma Remediation (Housing)"])
+        self._assess([])
+        self.assertEqual(
+            set(self._codes()), {"no_ecm_food", "no_ecm_housing"},
+        )
+
+    def test_it_is_a_WARNING_not_an_error(self):
+        """The member may genuinely not qualify. That is a fact to check, not a
+        mistake somebody made."""
+        self._screen([self.MTM])
+        self._assess([])
+        self.assertEqual(self._alerts()["no_ecm_food"]["severity"], "warning")
+
+    def test_with_ECM_there_is_no_such_alert(self):
+        self._screen([self.MTM, "Asthma Remediation (Housing)"])
+        self._assess([self.ECM, self.MTM])
+        codes = self._codes()
+        self.assertNotIn("no_ecm_food", codes)
+        self.assertNotIn("no_ecm_housing", codes)
+
+    # ── 4: the wrong kind of food case -- REMOVED ─────────────────────────
+    def test_a_food_case_on_EITHER_service_raises_NOTHING(self):
+        """⚠ THE ALERTS WERE REMOVED, and this asserts their absence.
+
+        They fired when a member held a meals case with voucher eligibility, or the
+        reverse. The authorisation data says both are normal:
+
+            meals-eligible, holding a BOX case      219    218 approved
+            boxes-eligible, holding a MEALS case    103    102 approved
+            NO food eligibility, holding either     217    212 approved
+
+        320 of 322 approved by the payer -- and 198 of the third group were opened
+        AFTER the assessment that supposedly forbids them, so it is not a timing
+        artefact either. An alert that calls 320 approved cases an error is noise.
+
+        I built them from the eligibility strings without asking whether the payer
+        agreed. That was one query away.
+        """
+        # ⚠ ONLY the boxes-eligible + MEALS case direction is silent here. The
+        # reverse -- meals-only eligibility holding a BOXES case -- became a WARNING
+        # (rule 4), and is asserted in its own test below. The programme is still not
+        # HELD for it, which is the part that matters.
+        self.member.cases.all().delete()
+        self.member.assessments.all().delete()
+        self._screen([self.MTM])
+        self._assess([self.ECM, self.VOUCHER])
+        self._case("Medically Tailored Meals")
+        self.assertEqual(self._codes(), [])
+
+    def test_rule4_meals_only_with_a_BOXES_case_WARNS_but_does_not_hold(self):
+        """⚠ A warning, never a hold: 218 of 219 such cases are APPROVED by the
+        payer, so holding them would stop deliveries for members whose case is
+        fine."""
+        self._screen([self.MTM])
+        self._assess([self.ECM, self.MTM])
+        self._case("Produce Prescription/Voucher")
+        codes = self._codes()
+        self.assertEqual(codes, ["boxes_case_meals_only"])
+        # _alerts() is keyed BY CODE in this class, not a list.
+        self.assertEqual(
+            self._alerts()["boxes_case_meals_only"]["severity"], "warning",
+        )
+
+    def test_a_food_case_with_NO_food_eligibility_raises_nothing_either(self):
+        """116 such members hold an APPROVED food case."""
+        self._screen([self.MTM])
+        self._assess([self.ECM])
+        self._case("Medically Tailored Meals")
+        self.assertEqual(self._codes(), [])
+
+    # ── 2: deliberately NOT an alert ────────────────────────────────────────
+    def test_2_a_missing_dwelling_case_is_a_ROW_not_an_alert(self):
+        """It is 6% of members -- by far the commonest state in the tracker -- and
+        already the first row of the housing track, in amber, saying which half is
+        missing. Repeating it as a banner would teach an agent to ignore the banner."""
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Asthma Remediation (Housing)"])
+        self._assess([self.ECM])
+        tracker = tracker_for(self.member)
+        self.assertEqual(tracker["alerts"], [])
+        housing = next(t for t in tracker["tracks"] if t["code"] == "housing")
+        self.assertEqual(housing["items"][0]["state"], "todo")
+
+
+class PauseReasonTest(TestCase):
+    """The pause-reason catalogue, and who sets what.
+
+    Replaces a free-text box that produced 200 distinct strings across 1,341 pauses,
+    of which one bulk campaign was 937 and one entry was a pasted UUID.
+    """
+
+    def setUp(self):
+        from .models import PauseReason
+
+        # Migrations are disabled under the test runner, so the seed migration has
+        # NOT run -- the catalogue must be built here or every lookup returns None
+        # and the assertions pass for the wrong reason.
+        # ALL THIRTEEN. The backfill command refuses to run against an incomplete
+        # catalogue -- which is correct, and caught a short fixture here.
+        for code, label, system in (
+            ("insurance_invalid", "Insurance expired or invalid", True),
+            ("member_cancelled", "Member cancelled", False),
+            ("address_problem", "Address problem", False),
+            ("away_travelling", "Away / traveling", False),
+            ("too_much_food", "Too much food", False),
+            ("not_home", "Not home", False),
+            ("delivery_issue", "Delivery issue", False),
+            ("pending_review", "Pending review", False),
+            ("case_type_switch", "Case Type Switch", True),
+            ("nutritionist_paused", "Nutritionist Paused", True),
+            ("out_of_orbit", "Out of Orbit", True),
+            ("out_of_range", "Out of Range", True),
+            ("uncategorized", "Uncategorized", False),
+        ):
+            PauseReason.objects.create(code=code, label=label, is_system=system)
+
+    def _profile(self, **kw):
+        """A member profile needs an ENROLLMENT -- enrollment_id is NOT NULL, so a
+        profile built from a client alone fails with an IntegrityError rather than
+        anything to do with pause reasons."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pause", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        household = Household.objects.create(name="Pause HH")
+        HouseholdMember.objects.create(
+            household=household, client=client, is_primary=True,
+        )
+        enrollment = EnrollmentVerification.objects.create(
+            client=client, household=household,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        return MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client,
+            status=kw.pop("status", MemberStatus.ACTIVE), **kw,
+        )
+
+    # ── the helper ──────────────────────────────────────────────────────────
+    def test_setting_a_reason(self):
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        pr.set_pause_reason(profile, pr.OUT_OF_ORBIT)
+        profile.refresh_from_db()
+        self.assertEqual(profile.pause_reason.code, "out_of_orbit")
+
+    def test_an_UNKNOWN_code_does_not_raise(self):
+        """A missing catalogue row must never break a pause: stopping the deliveries
+        is the important half and the reason is the label on it."""
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        self.assertIsNone(pr.set_pause_reason(profile, "no_such_reason"))
+        profile.refresh_from_db()
+        self.assertIsNone(profile.pause_reason)
+
+    def test_overwrite_False_keeps_an_AGENTS_reason(self):
+        """The eligibility reconcile runs on every import; a re-import must not
+        relabel a pause somebody already explained."""
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        pr.set_pause_reason(profile, pr.UNCATEGORIZED)
+        pr.set_pause_reason(profile, pr.INSURANCE_INVALID, overwrite=False)
+        profile.refresh_from_db()
+        self.assertEqual(profile.pause_reason.code, "uncategorized")
+
+    def test_clearing_on_the_way_back_to_service(self):
+        """A reason left on an ACTIVE member reads as a current problem."""
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        pr.set_pause_reason(profile, pr.OUT_OF_ORBIT)
+        pr.clear_pause_reason(profile)
+        profile.refresh_from_db()
+        self.assertIsNone(profile.pause_reason)
+
+    # ── the picker ──────────────────────────────────────────────────────────
+    def test_the_picker_HIDES_system_reasons(self):
+        """An agent choosing "Out of Range" by hand would assert something the ZIP
+        check has not found, and each system reason has its own remedy."""
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Pr Agent", agent_code="790", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        codes = [
+            r["code"] for r in
+            api.get("/api/portal/settings/pause-reasons/").data
+        ]
+        self.assertIn("member_cancelled", codes)
+        for system in ("out_of_range", "out_of_orbit", "nutritionist_paused",
+                       "case_type_switch", "insurance_invalid"):
+            self.assertNotIn(system, codes)
+
+        # ?all=1 for a FILTER, which must be able to name a reason it cannot set.
+        all_codes = [
+            r["code"] for r in
+            api.get("/api/portal/settings/pause-reasons/?all=1").data
+        ]
+        self.assertIn("out_of_range", all_codes)
+
+    def test_a_RETIRED_reason_is_not_offered(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        PauseReason.objects.filter(code="member_cancelled").update(is_active=False)
+        agent = Agent.objects.create(
+            name="Pr2", agent_code="791", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        codes = [r["code"] for r in api.get("/api/portal/settings/pause-reasons/").data]
+        self.assertNotIn("member_cancelled", codes)
+
+    def test_retiring_a_reason_does_NOT_delete_the_profile(self):
+        """SET_NULL, not CASCADE -- the alternative loses a member's dietary profile
+        because somebody tidied a dropdown."""
+        from .models import MemberDietaryProfile, PauseReason
+        from .services import pause_reasons as pr
+
+        profile = self._profile()
+        pr.set_pause_reason(profile, pr.OUT_OF_ORBIT)
+        PauseReason.objects.filter(code="out_of_orbit").delete()
+        self.assertTrue(
+            MemberDietaryProfile.objects.filter(pk=profile.pk).exists(),
+        )
+
+    # ── the backfill's classification ───────────────────────────────────────
+    def _classify(self, profile, note=None):
+        from api.management.commands.backfill_pause_reasons import Command
+        from .models import MemberStatus
+
+        by_status = {
+            MemberStatus.OUT_OF_ORBIT: "out_of_orbit",
+            MemberStatus.OUT_OF_RANGE: "out_of_range",
+            MemberStatus.NUTRITIONIST_PAUSED: "nutritionist_paused",
+        }
+        notes = {profile.client_id: note} if note else {}
+        return Command()._classify(profile, by_status, notes)
+
+    def test_the_STATUS_wins_over_everything(self):
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.OUT_OF_ORBIT)
+        code, how = self._classify(profile, note="member cancelled")
+        self.assertEqual((code, how), ("out_of_orbit", "status"))
+
+    def test_the_BULK_CAMPAIGN_is_not_given_a_category(self):
+        """"9/1 HH Close" is 937 of 1,341 pause notes -- 70% -- and is one day's bulk
+        work, not a reason anybody chose. Letting it match a keyword would invent a
+        category that then dominates every report built on this field."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED)
+        code, _how = self._classify(profile, note="9/1 HH Close")
+        self.assertEqual(code, "uncategorized")
+
+    def test_a_ZIP_eligibility_failure_is_OUT_OF_RANGE(self):
+        """Even though the STATUS is PAUSED: the gate pauses a member individually
+        rather than setting the status. 403 members read as unclassifiable until this
+        was added, for a reason the catalogue already named."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.client.ineligible_reasons = ["home ZIP 33314 is outside the coverage area"]
+        profile.client.save(update_fields=["ineligible_reasons"])
+        code, how = self._classify(profile)
+        self.assertEqual(code, "out_of_range")
+        self.assertIn("ZIP", how)
+
+    def test_a_MEDICAID_TYPE_failure_stays_uncategorised(self):
+        """⚠ 497 members. It is the largest ineligibility gate in the system and the
+        catalogue has no reason for it -- calling it "insurance" would be a guess that
+        reads as a fact."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.client.ineligible_reasons = [
+            "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MAP",
+        ]
+        profile.client.save(update_fields=["ineligible_reasons"])
+        code, _how = self._classify(profile)
+        self.assertEqual(code, "uncategorized")
+
+    def test_pause_locked_means_a_CASE_TYPE_SWITCH(self):
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED, pause_locked=True)
+        code, _how = self._classify(profile)
+        self.assertEqual(code, "case_type_switch")
+
+    def test_insurance_before_cancel_in_the_note_patterns(self):
+        """"cancel policy" is an insurance problem, so the order of the patterns is
+        load-bearing rather than cosmetic."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED)
+        code, _how = self._classify(profile, note="had to cancel her insurance policy")
+        self.assertEqual(code, "insurance_invalid")
+
+    def test_a_note_matching_NOTHING_is_uncategorised_not_blank(self):
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED)
+        code, how = self._classify(profile, note="1d2903bc-e6a5-49a2-8c03-0062ac13c442")
+        self.assertEqual(code, "uncategorized")
+        self.assertIn("matched nothing", how)
+
+    def test_the_backfill_REFUSES_an_incomplete_catalogue(self):
+        """It caught a short test fixture. Better than running and quietly sending
+        every unmatched member to a reason that does not exist."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import PauseReason
+
+        PauseReason.objects.filter(code="too_much_food").delete()
+        out = StringIO()
+        call_command("backfill_pause_reasons", stdout=out, stderr=out)
+        self.assertIn("catalogue is missing", out.getvalue())
+
+    def test_INACTIVE_is_not_in_scope(self):
+        """It is a terminal end state, not a pause, and it has no pause note.
+        Including it put 1,339 members into Uncategorized and made the field
+        two-thirds noise."""
+        from api.management.commands.backfill_pause_reasons import Command
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus
+
+        self._profile(status=MemberStatus.INACTIVE)
+        out = StringIO()
+        call_command("backfill_pause_reasons", "--apply", stdout=out, stderr=out)
+        self.assertIn("0 profile(s)", out.getvalue())
+
+
+class PausedMembersTabTest(TestCase):
+    """Urgent Care -> Paused: every member not receiving service, and why."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        for code, label in (
+            ("out_of_range", "Out of Range"),
+            ("member_cancelled", "Member cancelled"),
+            ("uncategorized", "Uncategorized"),
+        ):
+            PauseReason.objects.create(code=code, label=label)
+        agent = Agent.objects.create(
+            name="Pm Agent", agent_code="792", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _member(self, name, status, reason_code=None, **kw):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, PauseReason,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        household = Household.objects.create(name=f"{name} HH")
+        HouseholdMember.objects.create(
+            household=household, client=client, is_primary=True,
+        )
+        enrollment = EnrollmentVerification.objects.create(
+            client=client, household=household,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client, status=status,
+            pause_reason=(
+                PauseReason.objects.get(code=reason_code) if reason_code else None
+            ),
+            **kw,
+        )
+        return client
+
+    def _get(self, query=""):
+        resp = self.api.get(f"/api/portal/members/paused/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_it_lists_paused_members_with_the_reason(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        row = data["results"][0]
+        self.assertEqual(row["member_status_label"], "Paused")
+        self.assertEqual(row["pause_reason_label"], "Member cancelled")
+
+    def test_ACTIVE_members_are_absent(self):
+        from .models import MemberStatus
+
+        self._member("Grace", MemberStatus.ACTIVE)
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_INACTIVE_and_REMOVED_are_EXCLUDED(self):
+        """They stop service too, but they are terminal -- "their service ended" and
+        "they were split into their own case" -- not a pause anyone should act on.
+        ~1,350 rows nobody can do anything about, on a page for work needing
+        attention."""
+        from .models import MemberStatus
+
+        self._member("Inez", MemberStatus.INACTIVE)
+        self._member("Remi", MemberStatus.REMOVED)
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_the_other_three_paused_statuses_are_included(self):
+        from .models import MemberStatus
+
+        self._member("Orb", MemberStatus.OUT_OF_ORBIT, "uncategorized")
+        self._member("Rng", MemberStatus.OUT_OF_RANGE, "out_of_range")
+        self._member("Nut", MemberStatus.NUTRITIONIST_PAUSED)
+        self.assertEqual(self._get()["count"], 3)
+
+    def test_filtering_by_reason(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        self._member("Bob", MemberStatus.OUT_OF_RANGE, "out_of_range")
+        data = self._get("?reason=out_of_range")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["name"], "Bob Member")
+
+    def test_filtering_by_NO_REASON_finds_the_backlog(self):
+        """The filter an agent actually works through."""
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        self._member("Nul", MemberStatus.PAUSED)
+        data = self._get("?reason=none")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["name"], "Nul Member")
+
+    def test_an_unknown_reason_is_ignored_not_rejected(self):
+        """A stale bookmark should show the list, not a 400 -- matching how the
+        other filters in this codebase behave."""
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        self.assertEqual(self._get("?reason=nonsense")["count"], 0)
+
+    def test_it_reports_the_PAUSED_profile_not_just_the_first(self):
+        """A client can hold several profiles across enrollments. Reporting the
+        first would show "Active" beside a member the page listed precisely because
+        they are not."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, PauseReason,
+        )
+
+        client = self._member("Duo", MemberStatus.ACTIVE)
+        other_hh = Household.objects.create(name="Duo HH2")
+        HouseholdMember.objects.filter(client=client).delete()
+        HouseholdMember.objects.create(
+            household=other_hh, client=client, is_primary=True,
+        )
+        enrollment = EnrollmentVerification.objects.create(
+            client=client, household=other_hh,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client, status=MemberStatus.PAUSED,
+            pause_reason=PauseReason.objects.get(code="member_cancelled"),
+        )
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["member_status_label"], "Paused")
+
+    def test_a_LOCKED_pause_is_flagged(self):
+        """An agent cannot lift it from the Program tab -- Customer Service must
+        dismiss the CaseMismatchFlag."""
+        from .models import MemberStatus
+
+        self._member("Lok", MemberStatus.PAUSED, "uncategorized", pause_locked=True)
+        self.assertTrue(self._get()["results"][0]["pause_locked"])
+
+    def test_searching_by_name(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        self._member("Bob", MemberStatus.PAUSED, "member_cancelled")
+        data = self._get("?search=Ada")
+        self.assertEqual(data["count"], 1)
+
+    # ── the description column ──────────────────────────────────────────────
+    def test_the_agents_own_words_are_shown(self):
+        from .models import MemberStatus, Note, NoteSource
+
+        client = self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused. Reason: wants Halal meals, driver brought wrong",
+        )
+        self.assertIn(
+            "Halal", self._get()["results"][0]["pause_description"],
+        )
+
+    def test_the_NUTRITIONIST_prefix_is_read_too(self):
+        """A different prefix, and omitting it would blank the description for
+        exactly the members whose reason an agent most needs to read."""
+        from .models import MemberStatus, Note, NoteSource
+
+        client = self._member("Nut", MemberStatus.NUTRITIONIST_PAUSED)
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused by Nutritionist. Reason: awaiting renal review",
+        )
+        self.assertIn(
+            "renal review", self._get()["results"][0]["pause_description"],
+        )
+
+    def test_the_MOST_RECENT_note_wins(self):
+        from datetime import timedelta
+
+        from .models import MemberStatus, Note, NoteSource
+
+        client = self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        old = Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused. Reason: first time",
+        )
+        Note.objects.filter(pk=old.pk).update(
+            created_at=timezone.now() - timedelta(days=30),
+        )
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused. Reason: second time",
+        )
+        self.assertEqual(
+            self._get()["results"][0]["pause_description"], "second time",
+        )
+
+    def test_a_SYSTEM_pause_falls_back_to_the_stored_reasons(self):
+        """An out-of-range member has no agent note, but "home ZIP 33314 is outside
+        the coverage area" is exactly what an agent needs to read."""
+        from .models import MemberStatus
+
+        client = self._member("Rng", MemberStatus.OUT_OF_RANGE, "out_of_range")
+        client.ineligible_reasons = ["home ZIP 33314 is outside the coverage area"]
+        client.save(update_fields=["ineligible_reasons"])
+        self.assertIn("33314", self._get()["results"][0]["pause_description"])
+
+    def test_an_unpause_note_is_NOT_treated_as_a_description(self):
+        from .models import MemberStatus, Note, NoteSource
+
+        client = self._member("Ada", MemberStatus.PAUSED, "member_cancelled")
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member unpaused. Reason: back from holiday",
+        )
+        self.assertEqual(self._get()["results"][0]["pause_description"], "")
+
+
+class HoldHouseholdCasesCommandTest(TestCase):
+    """The 9/23 bulk hold: tag + On Hold for governing open household cases.
+
+    ⚠ This command STOPS SERVICE. An On Hold enrollment leaves every future Purchase
+    Order, so the narrowings below are the difference between holding 721 households
+    and holding the wrong ones.
+    """
+
+    TAG = "9/23 HH HOLD"
+
+    def _member(self, name, *, household=True, case_status="open",
+                stage=None, second_case=False):
+        from .models import (
+            Case, CaseHouseholdType, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="HH",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name=f"{name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=case_status, service_type="Medically Tailored Meals",
+            household_type=(
+                CaseHouseholdType.HOUSEHOLD if household
+                else CaseHouseholdType.INDIVIDUAL
+            ),
+            case_created_at=timezone.now(),
+        )
+        EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=stage or EnrollmentStage.SERVICE_ACTIVE,
+        )
+        return client, case
+
+    def _run(self, *args):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("hold_household_cases", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def _stage(self, client):
+        from .models import EnrollmentVerification
+
+        return EnrollmentVerification.objects.filter(client=client).first().stage
+
+    def _tags(self, client):
+        return set(client.tags.values_list("name", flat=True))
+
+    # ── the happy path ──────────────────────────────────────────────────────
+    def test_it_tags_and_holds(self):
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Ada")
+        self._run("--apply")
+        self.assertEqual(self._stage(client), EnrollmentStage.ON_HOLD)
+        self.assertIn(self.TAG, self._tags(client))
+
+    def test_a_DRY_RUN_changes_nothing(self):
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Ada")
+        output = self._run()
+        self.assertIn("Dry run", output)
+        self.assertEqual(self._stage(client), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(self._tags(client), set())
+
+    def test_the_tag_is_CREATED_when_missing(self):
+        from .models import ClientTag
+
+        self._member("Ada")
+        self.assertFalse(ClientTag.objects.filter(name=self.TAG).exists())
+        self._run("--apply")
+        self.assertTrue(ClientTag.objects.filter(name=self.TAG).exists())
+
+    def test_running_it_TWICE_changes_nothing_the_second_time(self):
+        client, _case = self._member("Ada")
+        self._run("--apply")
+        output = self._run("--apply")
+        self.assertIn("tagged 0", output)
+        self.assertIn("held 0", output)
+        self.assertEqual(len(self._tags(client)), 1)
+
+    # ── the three narrowings ────────────────────────────────────────────────
+    def test_an_INDIVIDUAL_case_is_out_of_scope(self):
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Ind", household=False)
+        self._run("--apply")
+        self.assertEqual(self._stage(client), EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(self._tags(client), set())
+
+    def test_a_CLOSED_case_is_out_of_scope(self):
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Cls", case_status="closed")
+        self._run("--apply")
+        self.assertEqual(self._stage(client), EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_a_CLOSED_ENROLLMENT_is_skipped_ENTIRELY_not_even_tagged(self):
+        """Moving it to On Hold would REOPEN it -- a different and much larger action
+        than the one asked for. 7 of 729 on real data."""
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Cle", stage=EnrollmentStage.CLOSED)
+        output = self._run("--apply")
+        self.assertEqual(self._stage(client), EnrollmentStage.CLOSED)
+        self.assertEqual(self._tags(client), set())
+        self.assertIn("skipped ENTIRELY", output)
+
+    def test_an_already_HELD_enrollment_is_still_tagged(self):
+        """82 of 729 are already On Hold. They are in scope -- the tag records that
+        they were part of this batch -- but the hold is a no-op."""
+        from .models import EnrollmentStage
+
+        client, _case = self._member("Hld", stage=EnrollmentStage.ON_HOLD)
+        self._run("--apply")
+        self.assertIn(self.TAG, self._tags(client))
+        self.assertEqual(self._stage(client), EnrollmentStage.ON_HOLD)
+
+    def test_ONE_bad_member_does_not_roll_back_the_others(self):
+        """Committed per member, not in one transaction over all 729: a single bad
+        transition must not undo 700 good ones, and a re-run picks up where it
+        stopped."""
+        from .models import EnrollmentStage
+
+        good, _c1 = self._member("Good")
+        other, _c2 = self._member("Alsogood")
+        self._run("--apply")
+        self.assertEqual(self._stage(good), EnrollmentStage.ON_HOLD)
+        self.assertEqual(self._stage(other), EnrollmentStage.ON_HOLD)
+
+    def test_the_hold_is_recorded_in_the_stage_history(self):
+        """A bulk change nobody can trace is how 'why is this household on hold?'
+        becomes unanswerable six months later."""
+        from .models import StageEvent
+
+        client, _case = self._member("Ada")
+        self._run("--apply")
+        events = StageEvent.objects.filter(client=client, to_stage="on_hold")
+        self.assertTrue(events.exists())
+        self.assertIn("9/23", events.first().note)
+
+
+class NutritionistPausedTabTest(TestCase):
+    """The Nutritionist queue's second tab: members THEY paused."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        self.reason = PauseReason.objects.create(
+            code="nutritionist_paused", label="Nutritionist Paused", is_system=True,
+        )
+        PauseReason.objects.create(code="member_cancelled", label="Member cancelled")
+
+        def api_for(group):
+            agent = Agent.objects.create(
+                name=f"N {group}", agent_code=str(abs(hash(group)) % 9000 + 800),
+                group=group,
+            )
+            acc = AccessToken()
+            acc["agent_id"] = str(agent.id)
+            acc["agent_code"] = agent.agent_code
+            acc["agent_name"] = agent.name
+            acc["agent_group"] = agent.group
+            client = APIClient()
+            client.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+            return client
+
+        self.api = api_for("Nutritionist")
+        self.api_for = api_for
+
+    def _member(self, name, status, reason=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Nut",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name=f"{name} HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enrollment = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=client, status=status,
+            member_name=f"{name} Nut", pause_reason=reason,
+        )
+        return client
+
+    def _get(self, query=""):
+        resp = self.api.get(f"/api/portal/nutritionist/paused/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_it_lists_nutritionist_paused_members(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["pause_reason_label"], "Nutritionist Paused")
+
+    def test_an_AGENT_pause_is_NOT_listed(self):
+        """Not the Nutritionist's to lift. Listing it would invite them to act on a
+        pause somebody else owns, for a reason they cannot see."""
+        from .models import MemberStatus, PauseReason
+
+        self._member(
+            "Agt", MemberStatus.PAUSED,
+            PauseReason.objects.get(code="member_cancelled"),
+        )
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_OUT_OF_ORBIT_and_active_members_are_absent(self):
+        from .models import MemberStatus
+
+        self._member("Orb", MemberStatus.OUT_OF_ORBIT)
+        self._member("Act", MemberStatus.ACTIVE)
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_the_shape_MATCHES_pending_review(self):
+        """The two tabs share a row component and the review drawer, so a missing
+        key renders as a blank row rather than an error."""
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        row = self._get()["results"][0]
+        for key in ("client_id", "primary_name", "program_name", "verified_at",
+                    "authorization_status", "members"):
+            self.assertIn(key, row)
+
+    def test_searching_by_name(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        self._member("Bob", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        self.assertEqual(self._get("?search=Ada")["count"], 1)
+
+    def test_MANAGEMENT_may_see_it_too(self):
+        from .models import MemberStatus
+
+        self._member("Ada", MemberStatus.NUTRITIONIST_PAUSED, self.reason)
+        resp = self.api_for("Management").get("/api/portal/nutritionist/paused/")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_another_group_is_REFUSED(self):
+        """Same gate as Pending Review -- a queue that leaks to every agent is not a
+        Nutritionist queue."""
+        resp = self.api_for("Logistics").get("/api/portal/nutritionist/paused/")
+        self.assertEqual(resp.status_code, 403)
+
+
+class NutritionistApproveResumesTest(TestCase):
+    """The SIGNATURE resumes a Nutritionist-paused member.
+
+    A paused member has to be APPROVED to come back -- not returned to service by a
+    button that skips the review. So the Paused tab opens the drawer in signature
+    mode and the approval is what resumes them.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        self.reason = PauseReason.objects.create(
+            code="nutritionist_paused", label="Nutritionist Paused", is_system=True,
+        )
+        agent = Agent.objects.create(
+            name="Ap Agent", agent_code="881", group="Nutritionist",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _household(self, statuses, menu_type="Regular"):
+        """⚠ `menu_type` matters: "no menu type is assigned yet" is one of the meal
+        rule's Out of Orbit conditions, so a fixture without one never reaches the
+        behaviour under test."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pri", last_name="Apr",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Apr HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=EnrollmentStage.VERIFIED,
+            verified_at=timezone.now(),
+        )
+        profiles = []
+        for i, status in enumerate(statuses):
+            member = primary if i == 0 else Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=f"M{i}", last_name="Apr",
+                client_added_at=timezone.now(),
+            )
+            if i:
+                HouseholdMember.objects.create(
+                    household=hh, client=member, is_primary=False,
+                )
+            profiles.append(MemberDietaryProfile.objects.create(
+                enrollment=enr, client=member, status=status, menu_type=menu_type,
+                member_name=f"{member.first_name} Apr",
+                pause_reason=(
+                    self.reason if status == MemberStatus.NUTRITIONIST_PAUSED else None
+                ),
+            ))
+        return primary, enr, profiles
+
+    def _approve(self, primary, *, resume=False):
+        body = {"signature": "N Agent", "signature_image": "data:image/png;base64,x"}
+        if resume:
+            body["resume_paused"] = True
+        return self.api.post(
+            f"/api/portal/members/{primary.client_id}/nutritionist-approve/",
+            body, format="json",
+        )
+
+    def test_the_signature_RESUMES_when_asked(self):
+        from .models import MemberStatus
+
+        primary, _enr, profiles = self._household([MemberStatus.NUTRITIONIST_PAUSED])
+        resp = self._approve(primary, resume=True)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        profiles[0].refresh_from_db()
+        self.assertNotEqual(profiles[0].status, MemberStatus.NUTRITIONIST_PAUSED)
+        self.assertIsNone(profiles[0].pause_reason)
+
+    def test_an_ORDINARY_approval_leaves_a_paused_member_paused(self):
+        """⚠ THE REASON THE FLAG EXISTS. A Nutritionist working the main queue pauses
+        one member of a household and approves the rest -- which is why the PDF loop
+        skips a paused member at all. If approval always resumed, that pause would be
+        undone by the very next click and Pause would be meaningless."""
+        from .models import MemberStatus
+
+        primary, _enr, profiles = self._household([
+            MemberStatus.NUTRITIONIST_PAUSED, MemberStatus.ACTIVE,
+        ])
+        resp = self._approve(primary)          # no resume_paused
+        self.assertEqual(resp.status_code, 200, resp.content)
+        profiles[0].refresh_from_db()
+        self.assertEqual(profiles[0].status, MemberStatus.NUTRITIONIST_PAUSED)
+        self.assertIsNotNone(profiles[0].pause_reason)
+
+    def test_it_reports_WHAT_the_signature_did(self):
+        """The meal rule may land them Out of Orbit, so the drawer says which rather
+        than claiming they are back in service."""
+        from .models import MemberStatus
+
+        primary, _enr, _p = self._household([MemberStatus.NUTRITIONIST_PAUSED])
+        resp = self._approve(primary, resume=True)
+        self.assertEqual(len(resp.data["resumed"]), 1)
+        self.assertIn("status_label", resp.data["resumed"][0])
+
+    def test_a_member_with_NO_menu_type_lands_OUT_OF_ORBIT(self):
+        """Resuming does not guarantee a return to service. Forcing Active would put
+        an unfulfillable member on the next Purchase Order."""
+        from .models import MemberStatus
+
+        primary, _enr, profiles = self._household(
+            [MemberStatus.NUTRITIONIST_PAUSED], menu_type="",
+        )
+        resp = self._approve(primary, resume=True)
+        self.assertEqual(resp.data["resumed"][0]["status"], MemberStatus.OUT_OF_ORBIT)
+
+    def test_an_ACTIVE_member_is_untouched_by_the_flag(self):
+        from .models import MemberStatus
+
+        primary, _enr, profiles = self._household([MemberStatus.ACTIVE])
+        resp = self._approve(primary, resume=True)
+        self.assertEqual(resp.data["resumed"], [])
+        profiles[0].refresh_from_db()
+        self.assertEqual(profiles[0].status, MemberStatus.ACTIVE)
+
+
+class NutritionistDrawerEnrollmentTest(TestCase):
+    """The review drawer must show the enrollment IN FORCE.
+
+    ⚠ It used to take the newest VERIFIED enrollment, falling back to the newest by
+    verified_at -- so a DISREGARDED or CLOSED row could win. On the Paused tab that
+    hid the paused member from the drawer for 12 of 25 members: the drawer showed a
+    different household's profiles, so there was nothing to resume.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        PauseReason.objects.create(
+            code="nutritionist_paused", label="Nutritionist Paused", is_system=True,
+        )
+        agent = Agent.objects.create(
+            name="Dw Agent", agent_code="871", group="Nutritionist",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _two_enrollments(self, dead_stage, live_stage, live_status):
+        """A member with a TERMINAL enrollment and a live one.
+
+        The dead enrollment gets the newer verified_at, so the old chain would
+        choose it -- which is exactly the production shape.
+        """
+        from datetime import timedelta
+
+        from .models import (
+            Client, EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile, MemberStatus, PauseReason,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dwl", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Dwl HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+
+        dead = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=dead_stage,
+            verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=dead, client=client, status=MemberStatus.PENDING,
+            member_name="Dwl Member",
+        )
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=live_stage,
+            verified_at=timezone.now() - timedelta(days=30),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, status=live_status,
+            member_name="Dwl Member",
+            pause_reason=(
+                PauseReason.objects.get(code="nutritionist_paused")
+                if live_status == MemberStatus.NUTRITIONIST_PAUSED else None
+            ),
+        )
+        return client
+
+    def test_a_DISREGARDED_enrollment_does_not_win(self):
+        from .models import EnrollmentStage, MemberStatus
+
+        client = self._two_enrollments(
+            EnrollmentStage.DISREGARDED, EnrollmentStage.ON_HOLD,
+            MemberStatus.NUTRITIONIST_PAUSED,
+        )
+        resp = self.api.get(
+            f"/api/portal/members/{client.client_id}/nutritionist-review/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        statuses = [m["status"] for m in resp.data["members"]]
+        self.assertIn(MemberStatus.NUTRITIONIST_PAUSED, statuses)
+
+    def test_a_CLOSED_enrollment_does_not_win_either(self):
+        from .models import EnrollmentStage, MemberStatus
+
+        client = self._two_enrollments(
+            EnrollmentStage.CLOSED, EnrollmentStage.SERVICE_ACTIVE,
+            MemberStatus.NUTRITIONIST_PAUSED,
+        )
+        resp = self.api.get(
+            f"/api/portal/members/{client.client_id}/nutritionist-review/",
+        )
+        statuses = [m["status"] for m in resp.data["members"]]
+        self.assertIn(MemberStatus.NUTRITIONIST_PAUSED, statuses)
+
+    def test_the_PAUSED_TAB_only_lists_rows_the_drawer_can_act_on(self):
+        """A member whose paused profile is on a DEAD enrollment is not listed. They
+        would open the drawer, find no paused member, and have no way to tell whether
+        the tab or the drawer was wrong. One of 25 on real data."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus, PauseReason,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Stale", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Stale HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        dead = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.DISREGARDED,
+        )
+        # The paused profile is on the DEAD enrollment.
+        MemberDietaryProfile.objects.create(
+            enrollment=dead, client=client,
+            status=MemberStatus.NUTRITIONIST_PAUSED, member_name="Stale Member",
+            pause_reason=PauseReason.objects.get(code="nutritionist_paused"),
+        )
+        live = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=live, client=client, status=MemberStatus.ACTIVE,
+            member_name="Stale Member",
+        )
+        resp = self.api.get("/api/portal/nutritionist/paused/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_the_main_queue_is_UNAFFECTED(self):
+        """Clients with a VERIFIED enrollment resolved to the SAME row in 45 of 45
+        cases on real data, so the sign-off flow does not change."""
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ver", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Ver HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.VERIFIED,
+            verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, status=MemberStatus.PENDING,
+            member_name="Ver Member",
+        )
+        resp = self.api.get(
+            f"/api/portal/members/{client.client_id}/nutritionist-review/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(len(resp.data["members"]), 1)
+
+
+class HoldReasonTest(TestCase):
+    """The on-hold reason catalogue.
+
+    Replaces free text: 7,379 holds across 443 distinct notes, 1,961 of them agent
+    free text with 1,556 distinct reasons.
+    """
+
+    SEED = [
+        ("pending_case_closure", "Pending Case Closure", "none", False),
+        ("wrong_case_type", "Wrong Case Type Opened", "auto", False),
+        ("not_enhanced_member", "Not an Enhanced Member", "none", False),
+        ("governing_case_denied", "Governing Case Denied", "auto", True),
+        ("governing_case_closed", "Governing Case Closed", "auto", True),
+        ("social_coverage_invalid", "Social care coverage expired/missing", "auto", True),
+        ("insurance_invalid", "Insurance expired/missing", "auto", True),
+        ("member_requested", "Member wants to pause", "manual", False),
+        ("zip_out_of_coverage", "Delivery ZIP outside coverage", "none", True),
+        ("medicaid_type_not_served", "Medicaid plan type not served", "none", True),
+        ("all_members_paused", "All household members paused", "auto", True),
+        ("uncategorized", "Uncategorized", "none", False),
+    ]
+
+    def setUp(self):
+        from .models import HoldReason
+
+        # Migrations are disabled under the test runner, so the seed migration has
+        # NOT run -- build the catalogue here or every lookup returns None and the
+        # assertions pass for the wrong reason.
+        for order, (code, label, policy, is_system) in enumerate(self.SEED, 1):
+            HoldReason.objects.create(
+                code=code, label=label, resume_policy=policy,
+                is_system=is_system, sort_order=order,
+            )
+
+    def _enrollment(self, stage=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Hold", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Hold HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        return EnrollmentVerification.objects.create(
+            client=client, household=hh,
+            stage=stage or EnrollmentStage.SERVICE_ACTIVE,
+        )
+
+    # ── advance_enrollment stamps both places ───────────────────────────────
+    def test_holding_stamps_the_enrollment_AND_the_event(self):
+        """The enrollment carries the CURRENT reason for filtering; the event
+        carries history, so "why was this held in July" stays answerable."""
+        from .models import EnrollmentStage, StageEvent
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True,
+            hold_reason="governing_case_denied",
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "governing_case_denied")
+        event = StageEvent.objects.filter(
+            enrollment=enr, to_stage=EnrollmentStage.ON_HOLD,
+        ).first()
+        self.assertEqual(event.hold_reason.code, "governing_case_denied")
+
+    def test_a_hold_with_NO_reason_named_is_Uncategorized_not_NULL(self):
+        """A reason the backfill can find, unlike an empty column."""
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True)
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "uncategorized")
+
+    def test_LEAVING_on_hold_clears_the_reason(self):
+        """A reason on a serving enrollment reads as a current problem, and any hold
+        queue filters on this field."""
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True, hold_reason="member_requested",
+        )
+        advance_enrollment(enr, EnrollmentStage.SERVICE_ACTIVE, force=True)
+        enr.refresh_from_db()
+        self.assertIsNone(enr.hold_reason)
+
+    def test_the_HISTORY_survives_a_resume(self):
+        """The whole reason the event is stamped too."""
+        from .models import EnrollmentStage, StageEvent
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True,
+            hold_reason="governing_case_closed",
+        )
+        advance_enrollment(enr, EnrollmentStage.SERVICE_ACTIVE, force=True)
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True, hold_reason="member_requested",
+        )
+        codes = list(
+            StageEvent.objects.filter(
+                enrollment=enr, to_stage=EnrollmentStage.ON_HOLD,
+            ).order_by("entered_at").values_list("hold_reason__code", flat=True)
+        )
+        self.assertEqual(codes, ["governing_case_closed", "member_requested"])
+
+    def test_an_UNKNOWN_code_does_not_break_the_hold(self):
+        """Stopping the household's deliveries is the operative half; the reason is
+        the label on it."""
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True, hold_reason="no_such_code",
+        )
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+    def test_retiring_a_reason_does_NOT_delete_the_enrollment(self):
+        """SET_NULL, not CASCADE -- the alternative loses an enrollment because
+        somebody tidied a dropdown."""
+        from .models import EnrollmentStage, EnrollmentVerification, HoldReason
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(
+            enr, EnrollmentStage.ON_HOLD, force=True, hold_reason="member_requested",
+        )
+        HoldReason.objects.filter(code="member_requested").delete()
+        self.assertTrue(
+            EnrollmentVerification.objects.filter(pk=enr.pk).exists(),
+        )
+
+    # ── the picker ──────────────────────────────────────────────────────────
+    def test_the_picker_HIDES_system_reasons(self):
+        """Choosing "Governing Case Denied" by hand would assert something the case
+        data has not said, and each system reason has its own remedy."""
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Hr Agent", agent_code="893", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        rows = api.get("/api/portal/settings/hold-reasons/").data
+        codes = [r["code"] for r in rows]
+        self.assertIn("pending_case_closure", codes)
+        for system in ("governing_case_denied", "governing_case_closed",
+                       "insurance_invalid", "zip_out_of_coverage",
+                       "medicaid_type_not_served", "all_members_paused",
+                       "social_coverage_invalid"):
+            self.assertNotIn(system, codes)
+        # The resume policy rides along, so the UI can say what will lift the hold.
+        self.assertIn("resume_policy", rows[0])
+
+        all_codes = [
+            r["code"] for r in
+            api.get("/api/portal/settings/hold-reasons/?all=1").data
+        ]
+        self.assertIn("governing_case_denied", all_codes)
+
+    # ── the four-way ineligible split ───────────────────────────────────────
+    def test_the_INELIGIBLE_note_is_split_by_the_stored_reasons(self):
+        """⚠ One note covers FOUR gates -- expired insurance, missing insurance, an
+        unserved Medicaid plan type and an out-of-coverage ZIP -- so it cannot be
+        classified from the note at all."""
+        from .models import Client
+        from .services.hold_reasons import reason_for_ineligibility
+
+        cases = [
+            (["Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MAP"],
+             "medicaid_type_not_served"),
+            (["all medical insurance plans are expired"], "insurance_invalid"),
+            (["no medical insurance on file"], "insurance_invalid"),
+            (["home ZIP 33314 is outside the coverage area"], "zip_out_of_coverage"),
+            (["home state NJ is not served"], "zip_out_of_coverage"),
+            (["something nobody has seen before"], "uncategorized"),
+            ([], "uncategorized"),
+        ]
+        for stored, expected in cases:
+            with self.subTest(stored=stored):
+                client = Client.objects.create(
+                    client_id=str(uuid.uuid4()), first_name="I", last_name="N",
+                    ineligible_reasons=stored,
+                )
+                self.assertEqual(reason_for_ineligibility(client), expected)
+
+    def test_MEDICAID_is_checked_before_insurance(self):
+        """The Medicaid string contains "FFS" and sits beside insurance wording;
+        matching insurance first would swallow all 16,898 of them."""
+        from .models import Client
+        from .services.hold_reasons import reason_for_ineligibility
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="M", last_name="X",
+            ineligible_reasons=[
+                "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MAP",
+                "all medical insurance plans are expired",
+            ],
+        )
+        self.assertEqual(
+            reason_for_ineligibility(client), "medicaid_type_not_served",
+        )
+
+    # ── the backfill ────────────────────────────────────────────────────────
+    def _classify(self, note, *, ineligible_reasons=None):
+        from api.management.commands.backfill_hold_reasons import Command
+        from .models import Client, EnrollmentStage, StageEvent
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="B", last_name="F",
+            ineligible_reasons=ineligible_reasons or [],
+        )
+        event = StageEvent.objects.create(
+            entity_type="enrollment", client=client,
+            to_stage=EnrollmentStage.ON_HOLD, note=note,
+        )
+        return Command()._classify(event)
+
+    def test_the_machine_written_notes_classify(self):
+        for note, expected in (
+            ("Auto-paused: sole internal-service meal/box case denied.",
+             "governing_case_denied"),
+            ("Auto-paused: last open internal-service meal/box case closed.",
+             "governing_case_closed"),
+            ("Automatically placed on hold — all household members paused.",
+             "all_members_paused"),
+            ("Automatically placed on hold — delivery ZIP outside coverage area "
+             "(Out of Range).", "zip_out_of_coverage"),
+            ("Auto-hold: social care coverage expired/missing by import.",
+             "social_coverage_invalid"),
+            ("Roster import: placed on hold. Reason: Pending Closure",
+             "pending_case_closure"),
+        ):
+            with self.subTest(note=note[:40]):
+                self.assertEqual(self._classify(note)[0], expected)
+
+    def test_the_AGREED_uncategorized_ones_stay_uncategorized(self):
+        """⚠ By DECISION, not failure. Over-interpreting a July spreadsheet's
+        wording is how a category stops meaning anything."""
+        for note in (
+            "Cancelled reconcile -> on_hold: governing case open + authorization "
+            "approved.",
+            "Bulk hold 9/23: governing household case.",
+            "Bulk pause: Services paused per Unite Us cases list.",
+            "Kept On Hold: the prior household was paused; a new governing case "
+            "must not auto-resume it.",
+            "Roster import: placed on hold. Reason: Reason Unknown (Potentially "
+            "Authorization Status)",
+        ):
+            with self.subTest(note=note[:40]):
+                self.assertEqual(self._classify(note)[0], "uncategorized")
+
+    def test_an_agent_note_is_keyword_matched_and_labelled_HONESTLY(self):
+        code, how = self._classify(
+            "Placed on hold by A. Reason: member wants to pause, too much food",
+        )
+        self.assertEqual(code, "member_requested")
+        self.assertEqual(how, "agent free text")
+
+    def test_an_agent_note_saying_out_of_range_is_NOT_called_machine_written(self):
+        """A bare /Out of Range/ pattern matched agent text too -- same verdict,
+        but reported as machine-written, and it would equally have matched an agent
+        writing "not out of range"."""
+        code, how = self._classify(
+            "Placed on hold by A. Reason: OUT OF RANGE zip",
+        )
+        self.assertEqual(code, "zip_out_of_coverage")
+        self.assertEqual(how, "agent free text")
+
+    def test_an_unmatched_agent_note_is_uncategorized(self):
+        code, how = self._classify("Placed on hold by A. Reason: qqq zzz")
+        self.assertEqual(code, "uncategorized")
+        self.assertIn("matched nothing", how)
+
+    def test_the_backfill_REFUSES_an_incomplete_catalogue(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import HoldReason
+
+        HoldReason.objects.filter(code="member_requested").delete()
+        out = StringIO()
+        call_command("backfill_hold_reasons", stdout=out, stderr=out)
+        self.assertIn("catalogue is missing", out.getvalue())
+
+    def test_the_AGENT_hold_endpoint_stores_the_chosen_category(self):
+        """The generic per-program On Hold on the Program tab -- distinct from the
+        Close flow, where the category is implied by the action."""
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, EnrollmentStage
+
+        enr = self._enrollment()
+        agent = Agent.objects.create(
+            name="Hold Agent", agent_code="894", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        resp = api.post(
+            f"/api/portal/members/{enr.client.client_id}/hold/",
+            {"reason": "member is travelling", "hold_reason_code": "member_requested"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "member_requested")
+
+    def test_a_hold_with_NO_code_supplied_still_succeeds(self):
+        """⚠ Deliberately not a 400. A hold somebody needs to place now must not be
+        blocked by a missing dropdown; Uncategorized is findable, unlike a NULL."""
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, EnrollmentStage
+
+        enr = self._enrollment()
+        agent = Agent.objects.create(
+            name="Hold Agent2", agent_code="895", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+        resp = api.post(
+            f"/api/portal/members/{enr.client.client_id}/hold/",
+            {"reason": "no category given"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "uncategorized")
+
+    def test_the_backfill_is_idempotent(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        enr = self._enrollment()
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="member_requested")
+        out = StringIO()
+        call_command("backfill_hold_reasons", "--apply", stdout=out, stderr=out)
+        self.assertIn("already set, skipped", out.getvalue())
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "member_requested")
+
+
+class OnHoldTabTest(TestCase):
+    """Urgent Care -> On Hold: every held household, and what will lift it."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, HoldReason
+
+        for code, label, policy, is_system in (
+            ("pending_case_closure", "Pending Case Closure", "none", False),
+            ("all_members_paused", "All household members paused", "auto", True),
+            ("member_requested", "Member wants to pause", "manual", False),
+            ("uncategorized", "Uncategorized", "none", False),
+        ):
+            HoldReason.objects.create(
+                code=code, label=label, resume_policy=policy, is_system=is_system,
+            )
+        agent = Agent.objects.create(
+            name="Oh Agent", agent_code="896", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _household(self, name, stage, reason_code=None, *, members=1):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, HoldReason, Household,
+            HouseholdMember, MemberDietaryProfile,
+        )
+
+        primary = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name=name, last_name="Held",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name=f"{name} HH")
+        HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=primary, household=hh, stage=stage,
+            program_name="Medically Tailored Meals (MTM) - Other - Brooklyn",
+            hold_reason=(
+                HoldReason.objects.get(code=reason_code) if reason_code else None
+            ),
+        )
+        for i in range(members):
+            member = primary if i == 0 else Client.objects.create(
+                client_id=str(uuid.uuid4()), first_name=f"{name}{i}",
+                last_name="Held", client_added_at=timezone.now(),
+            )
+            if i:
+                HouseholdMember.objects.create(
+                    household=hh, client=member, is_primary=False,
+                )
+            MemberDietaryProfile.objects.create(
+                enrollment=enr, client=member, member_name=f"{member.first_name} Held",
+            )
+        return primary, enr
+
+    def _get(self, query=""):
+        resp = self.api.get(f"/api/portal/members/on-hold/{query}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_it_lists_held_households_with_the_reason(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        row = data["results"][0]
+        self.assertEqual(row["hold_reason_label"], "Pending Case Closure")
+        self.assertEqual(row["resume_policy"], "none")
+
+    def test_a_SERVING_household_is_absent(self):
+        from .models import EnrollmentStage
+
+        self._household("Act", EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_a_household_appears_ONCE_however_many_members(self):
+        """⚠ The unit is the HOUSEHOLD. A hold lives on the enrollment and drops the
+        whole household off every PO, so listing each member would show one hold four
+        times and make the backlog look four times its size."""
+        from .models import EnrollmentStage
+
+        self._household("Big", EnrollmentStage.ON_HOLD, "pending_case_closure",
+                        members=4)
+        self.assertEqual(self._get()["count"], 1)
+
+    def test_filtering_by_a_SYSTEM_reason(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self._household("Sys", EnrollmentStage.ON_HOLD, "all_members_paused")
+        data = self._get("?reason=all_members_paused")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["name"], "Sys Held")
+
+    def test_filtering_by_NO_reason_finds_the_backlog(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self._household("Nul", EnrollmentStage.ON_HOLD)
+        data = self._get("?reason=none")
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["name"], "Nul Held")
+
+    def test_it_reports_the_HELD_enrollment_not_just_the_first(self):
+        """A client can hold several enrollments. Reporting the first would show a
+        serving programme beside a household the page listed precisely because it is
+        not being served."""
+        from .models import EnrollmentStage, EnrollmentVerification, HoldReason
+
+        # ⚠ Two enrollments on the SAME household, which is the real shape: a
+        # client can only belong to one household (HouseholdMember.client is
+        # unique), so a "second enrollment" is always a second row against the
+        # same household -- exactly what the production data showed.
+        primary, serving = self._household("Duo", EnrollmentStage.SERVICE_ACTIVE)
+        EnrollmentVerification.objects.create(
+            client=primary, household=serving.household,
+            stage=EnrollmentStage.ON_HOLD,
+            hold_reason=HoldReason.objects.get(code="member_requested"),
+        )
+        data = self._get()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["results"][0]["hold_reason_label"], "Member wants to pause")
+
+    def test_the_hold_NOTE_rides_along(self):
+        """The detail no catalogue carries."""
+        from .models import EnrollmentStage, StageEvent
+
+        _primary, enr = self._household(
+            "Ntx", EnrollmentStage.ON_HOLD, "member_requested",
+        )
+        StageEvent.objects.create(
+            entity_type="enrollment", enrollment=enr, client=enr.client,
+            to_stage=EnrollmentStage.ON_HOLD,
+            note="Placed on hold by A. Reason: away until December",
+        )
+        self.assertEqual(
+            self._get()["results"][0]["hold_note"], "away until December",
+        )
+
+    def test_an_unknown_reason_is_ignored_not_rejected(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self.assertEqual(self._get("?reason=nonsense")["count"], 0)
+
+    def test_searching_by_name(self):
+        from .models import EnrollmentStage
+
+        self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self._household("Bob", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self.assertEqual(self._get("?search=Ada")["count"], 1)
+
+
+class InternalServiceRulesTest(TestCase):
+    """Holding a programme whose GOVERNING case the latest assessment won't support.
+
+    Runs from reconcile_client_eligibility, so it applies on the extension save AND
+    the CSV import.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+    MTM = "Medically Tailored Meals (MTM) (Food)"
+    CAM = "Clinically Appropriate Meals (Food)"
+    BOXES = "Food Prescriptions (Voucher / Boxes) (Food)"
+
+    def setUp(self):
+        from .models import HoldReason
+
+        for code, label in (
+            ("not_enhanced_member", "Not an Enhanced Member"),
+            ("wrong_case_type", "Wrong Case Type Opened"),
+            ("uncategorized", "Uncategorized"),
+        ):
+            HoldReason.objects.create(code=code, label=label)
+
+    def _member(self, *, eligible, case_service, stage=None, assessments=None):
+        from .models import (
+            Assessment, Case, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Isr", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        # ⚠ The member must PASS the hard eligibility gates, or those fire first and
+        # hold the enrollment for a missing insurance -- which is correct behaviour
+        # and means this rule is never reached. That is what my first version of
+        # test_it_runs_from_the_shared_reconcile_path actually proved.
+        from .models import (
+            Insurance, InsurancePlanType, RecordStatus, SocialCareCoverage,
+            SocialCareCoverageStatus,
+        )
+
+        Insurance.objects.create(
+            client=client, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE, plan_name="NY Medicaid",
+        )
+        SocialCareCoverage.objects.create(
+            client=client, coverage_id=uuid.uuid4(),
+            status=SocialCareCoverageStatus.ENROLLED, plan_name="Social Care",
+        )
+        hh = Household.objects.create(name="Isr HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+
+        # Older assessments first, so "latest" is unambiguous.
+        from datetime import timedelta
+
+        for offset, services in enumerate(assessments or []):
+            Assessment.objects.create(
+                assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+                eligible_services=services,
+                screen_created_at=timezone.now() - timedelta(days=90 - offset),
+            )
+        if eligible is not None:
+            Assessment.objects.create(
+                assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+                eligible_services=eligible, screen_created_at=timezone.now(),
+            )
+        case = None
+        if case_service:
+            case = Case.objects.create(
+                case_id=uuid.uuid4(), client=client,
+                case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+                service_type=case_service, program_name=f"{case_service} - Brooklyn",
+                case_created_at=timezone.now(),
+            )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=stage or EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Isr Member",
+        )
+        return client, enr
+
+    def _apply(self, client):
+        from .services.internal_service_rules import apply_internal_service_rules
+
+        return apply_internal_service_rules(client, actor_label="system: test")
+
+    # ── rule 2: the ECM gateway ─────────────────────────────────────────────
+    def test_rule2_no_ECM_holds_as_NOT_ENHANCED(self):
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_rule2_writes_the_agreed_reason_text(self):
+        from .models import Note
+
+        client, _enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self._apply(client)
+        note = Note.objects.filter(client=client).first()
+        self.assertIn("not an Enhanced Care Management (Level 2)", note.body)
+
+    def test_rule2_is_checked_BEFORE_the_case_type(self):
+        """The gateway. There is no point judging WHICH food case is right for a
+        member who is not entitled to internal services at all."""
+        client, enr = self._member(
+            eligible=[self.BOXES],           # no ECM, and a wrong-type case
+            case_service="Medically Tailored Meals",
+        )
+        self._apply(client)
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_ECM_present_and_a_matching_case_is_left_alone(self):
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.ECM, self.MTM], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(self._apply(client), [])
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+
+    # ── rule 3: boxes-only cannot hold a meals case ─────────────────────────
+    def test_rule3_boxes_only_with_a_MEALS_case_holds(self):
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.ECM, self.BOXES],
+            case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "wrong_case_type")
+        event = enr.stage_events.filter(to_stage=EnrollmentStage.ON_HOLD).first()
+        self.assertIn("wrong case", event.note)
+
+    def test_rule3_leaves_a_BOXES_case_alone(self):
+        client, enr = self._member(
+            eligible=[self.ECM, self.BOXES],
+            case_service="Produce Prescription/Voucher",
+        )
+        self.assertEqual(self._apply(client), [])
+
+    # ── rule 4 is NOT a hold ────────────────────────────────────────────────
+    def test_rule4_meals_only_with_a_BOXES_case_does_NOT_hold(self):
+        """⚠ The asymmetry, and the most important test here. 218 of 219 such cases
+        are APPROVED by the payer, so holding them would stop deliveries for members
+        whose case is fine. It is a Service Tracker warning instead."""
+        from .models import EnrollmentStage
+
+        for eligibility in ([self.ECM, self.MTM], [self.ECM, self.CAM]):
+            with self.subTest(eligibility=eligibility):
+                client, enr = self._member(
+                    eligible=eligibility,
+                    case_service="Produce Prescription/Voucher",
+                )
+                self.assertEqual(self._apply(client), [])
+                enr.refresh_from_db()
+                self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+
+    # ── rule 1: only the latest assessment counts ───────────────────────────
+    def test_rule1_an_EARLIER_assessment_does_not_rescue_the_member(self):
+        """"A client may qualify in a previous case for a food program but not in
+        the last one, so now he gets on hold."""
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            assessments=[[self.ECM, self.MTM]],     # qualified before
+            eligible=[self.MTM],                    # latest has NO ECM
+            case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_rule1_an_earlier_FAILING_assessment_does_not_condemn_the_member(self):
+        """The mirror. The newest assessment governs in both directions."""
+        client, enr = self._member(
+            assessments=[[self.MTM]],               # no ECM back then
+            eligible=[self.ECM, self.MTM],          # latest is fine
+            case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(self._apply(client), [])
+
+    # ── scope limits ────────────────────────────────────────────────────────
+    def test_NO_assessment_means_no_verdict(self):
+        """⚠ 6,002 of 17,028 members with a live governing case -- 35% -- have no
+        assessment. Reading silence as "not qualified" would hold a third of the book
+        on the next import."""
+        client, enr = self._member(
+            eligible=None, case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(self._apply(client), [])
+
+    def test_an_assessment_with_an_EMPTY_service_list_is_also_no_verdict(self):
+        client, _enr = self._member(
+            eligible=[], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(self._apply(client), [])
+
+    def test_NO_governing_case_means_nothing_to_judge(self):
+        client, _enr = self._member(eligible=[self.MTM], case_service=None)
+        self.assertEqual(self._apply(client), [])
+
+    def test_an_ALREADY_HELD_enrollment_is_left_alone_reason_and_all(self):
+        """Re-importing must not relabel a hold an agent has explained, nor rewrite
+        the same StageEvent on every run."""
+        from .models import EnrollmentStage, HoldReason
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+            stage=EnrollmentStage.ON_HOLD,
+        )
+        enr.hold_reason = HoldReason.objects.get(code="uncategorized")
+        enr.save(update_fields=["hold_reason"])
+        self.assertEqual(self._apply(client), [])
+        enr.refresh_from_db()
+        self.assertEqual(enr.hold_reason.code, "uncategorized")
+
+    def test_it_is_idempotent(self):
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        self.assertEqual(self._apply(client), [])
+        self.assertEqual(
+            enr.stage_events.filter(to_stage=EnrollmentStage.ON_HOLD).count(), 1,
+        )
+
+    def test_it_runs_from_the_shared_reconcile_path(self):
+        """The one that both the extension save and the CSV import call."""
+        from .models import EnrollmentStage
+        from .services.eligibility import reconcile_client_eligibility
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        reconcile_client_eligibility(client)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_the_command_DRY_RUNS_by_default(self):
+        """⚠ The command exists because these rules otherwise have no dry run: they
+        fire on import, so without it the first sight of the blast radius is after
+        154 enrollments are already held."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        out = StringIO()
+        call_command("apply_internal_service_rules", stdout=out, stderr=out)
+        self.assertIn("Dry run", out.getvalue())
+        self.assertIn("Not an Enhanced Member", out.getvalue())
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.SERVICE_ACTIVE)
+
+    def test_the_command_APPLIES_and_reports_the_scope_split(self):
+        """95% of what these rules hold is individual-scope, and the report has to
+        say so -- a hold lives on the ENROLLMENT, so a household-scope one stops
+        service for every dependent too."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import Case, EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        Case.objects.filter(client=client).update(household_type="individual")
+        out = StringIO()
+        call_command("apply_internal_service_rules", "--apply", stdout=out, stderr=out)
+        self.assertIn("individual", out.getvalue())
+        self.assertIn("held 1", out.getvalue())
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
+
+    def test_the_command_NAMES_households_with_dependents_at_risk(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import Case, Client, HouseholdMember
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        Case.objects.filter(client=client).update(household_type="household")
+        dependent = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endant",
+        )
+        HouseholdMember.objects.create(
+            household=enr.household, client=dependent, is_primary=False,
+        )
+        out = StringIO()
+        call_command("apply_internal_service_rules", stdout=out, stderr=out)
+        self.assertIn("dependent", out.getvalue())
+        self.assertIn("Isr Member", out.getvalue())
+
+    def test_there_is_NO_auto_resume(self):
+        """By decision. Releasing members automatically is a separate, riskier
+        piece: a held programme waits for an agent."""
+        from .models import Assessment, EnrollmentStage
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self._apply(client)
+        # The member now passes: a newer assessment WITH ECM.
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+            eligible_services=[self.ECM, self.MTM],
+            screen_created_at=timezone.now(),
+        )
+        self._apply(client)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+
+
+class InternalServiceRulesTriggerTest(TestCase):
+    """WHERE the hold rules run.
+
+    ⚠ They were hooked only to the CLIENT paths at first, which is the wrong input:
+    rules 2 and 3 judge the GOVERNING CASE, and the governing case is exactly what a
+    CASE write changes -- the eligibility assessment barely moves. So an agent could
+    open a meals case for a boxes-only member and nothing would hold it until that
+    client happened to be imported again, and a case opened and closed between two
+    client imports was never judged at all.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+    BOXES = "Food Prescriptions (Voucher / Boxes) (Food)"
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, HoldReason
+
+        for code, label in (
+            ("not_enhanced_member", "Not an Enhanced Member"),
+            ("wrong_case_type", "Wrong Case Type Opened"),
+            ("uncategorized", "Uncategorized"),
+        ):
+            HoldReason.objects.create(code=code, label=label)
+        self.agent = Agent.objects.create(
+            name="Trig Agent", agent_code="897", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(self.agent.id)
+        acc["agent_code"] = self.agent.agent_code
+        acc["agent_name"] = self.agent.name
+        acc["agent_group"] = self.agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _member_awaiting_a_case(self):
+        """A member who passes every hard gate, is boxes-only eligible, and has NO
+        case yet -- so the case write is the thing that creates the violation."""
+        from .models import (
+            Assessment, Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, Insurance, InsurancePlanType, MemberDietaryProfile,
+            RecordStatus, SocialCareCoverage, SocialCareCoverageStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Trg", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Insurance.objects.create(
+            client=client, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE, plan_name="NY Medicaid",
+        )
+        SocialCareCoverage.objects.create(
+            client=client, coverage_id=uuid.uuid4(),
+            status=SocialCareCoverageStatus.ENROLLED, plan_name="Social Care",
+        )
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+            eligible_services=[self.ECM, self.BOXES],
+            screen_created_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Trg HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Trg Member",
+        )
+        return client, enr
+
+    def _wrong_case(self, client):
+        """A MEALS case for a boxes-only member -- a rule 3 violation."""
+        from .models import Case, CaseType
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+            service_type="Medically Tailored Meals",
+            program_name="Medically Tailored Meals (MTM) - Other - Brooklyn",
+            case_created_at=timezone.now(),
+        )
+
+    def test_a_CASE_save_through_the_viewset_holds_the_programme(self):
+        """The gap this closes. Previously nothing held until a CLIENT save."""
+        from .models import EnrollmentStage
+        from .views import CaseViewSet
+
+        client, enr = self._member_awaiting_a_case()
+        case = self._wrong_case(client)
+
+        # Exercise the hook the viewset calls, with a request carrying an agent.
+        view = CaseViewSet()
+        view.request = type("R", (), {"user": self.agent})()
+        view._apply_internal_service_rules(case)
+
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "wrong_case_type")
+
+    def test_a_case_with_NO_client_is_a_no_op(self):
+        from .views import CaseViewSet
+
+        view = CaseViewSet()
+        view.request = type("R", (), {"user": self.agent})()
+        view._apply_internal_service_rules(
+            type("C", (), {"client": None, "pk": None})(),
+        )  # must not raise
+
+    def test_a_rule_failure_never_breaks_the_case_write(self):
+        """Wrapped in try/except for exactly this: a hold is worth having, but not
+        at the cost of losing the case the agent just saved."""
+        from unittest.mock import patch
+
+        from .views import CaseViewSet
+
+        client, _enr = self._member_awaiting_a_case()
+        case = self._wrong_case(client)
+        view = CaseViewSet()
+        view.request = type("R", (), {"user": self.agent})()
+        with patch(
+            "api.services.internal_service_rules.apply_internal_service_rules",
+            side_effect=RuntimeError("boom"),
+        ):
+            view._apply_internal_service_rules(case)   # must not raise
+
+    def test_the_CSV_cases_import_runs_them_too(self):
+        """The cases importer changes the governing case, so it has to judge it --
+        the clients importer alone would leave a cases-only run unjudged."""
+        from .models import EnrollmentStage
+        from .services.csv_import import CsvImporter
+
+        client, enr = self._member_awaiting_a_case()
+        self._wrong_case(client)
+
+        importer = CsvImporter.__new__(CsvImporter)
+        importer.reconcile_client_ids = {client.pk}
+        importer.reconcile_touched_cases()
+
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(enr.hold_reason.code, "wrong_case_type")
+
+
+class HoldPauseDatesTest(TestCase):
+    """paused_at / resumed_at on the member, held_at / hold_resumed_at on the
+    enrollment, and the date-range filters over both."""
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, HoldReason, PauseReason
+
+        PauseReason.objects.create(code="member_cancelled", label="Member cancelled")
+        for code, label in (
+            ("member_requested", "Member wants to pause"),
+            ("uncategorized", "Uncategorized"),
+        ):
+            HoldReason.objects.create(code=code, label=label)
+        agent = Agent.objects.create(
+            name="Dt Agent", agent_code="898", group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _profile(self, status=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dt", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Dt HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        return MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Dt Member",
+            status=status or MemberStatus.ACTIVE,
+        )
+
+    # ── the member timestamps ───────────────────────────────────────────────
+    def test_pausing_stamps_paused_at(self):
+        from .models import MemberStatus
+
+        profile = self._profile()
+        self.assertIsNone(profile.paused_at)
+        profile.status = MemberStatus.PAUSED
+        profile.save()
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.paused_at)
+
+    def test_EVERY_pause_status_stamps_it(self):
+        """Stamped in save() off the status transition, so all four get it without
+        eleven call sites remembering -- which is exactly how pause_reason was
+        silently dropped in two places."""
+        from .models import MemberStatus
+
+        for status in (MemberStatus.PAUSED, MemberStatus.NUTRITIONIST_PAUSED,
+                       MemberStatus.OUT_OF_ORBIT, MemberStatus.OUT_OF_RANGE):
+            with self.subTest(status=status):
+                profile = self._profile()
+                profile.status = status
+                profile.save()
+                profile.refresh_from_db()
+                self.assertIsNotNone(profile.paused_at)
+
+    def test_INACTIVE_does_NOT_stamp_paused_at(self):
+        """⚠ Narrower than MEMBER_PAUSED_STATUSES on purpose. Inactive is terminal,
+        not a pause anybody resumes from, and including it would stamp 1,353 members
+        the Paused tab does not even list."""
+        from .models import MemberStatus
+
+        profile = self._profile()
+        profile.status = MemberStatus.INACTIVE
+        profile.save()
+        profile.refresh_from_db()
+        self.assertIsNone(profile.paused_at)
+
+    def test_resuming_stamps_resumed_at_and_KEEPS_paused_at(self):
+        """So "paused on the 3rd, resumed on the 11th" is answerable."""
+        from .models import MemberStatus
+
+        profile = self._profile()
+        profile.status = MemberStatus.PAUSED
+        profile.save()
+        profile.refresh_from_db()
+        paused_at = profile.paused_at
+
+        profile.status = MemberStatus.ACTIVE
+        profile.save()
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.resumed_at)
+        self.assertEqual(profile.paused_at, paused_at)
+
+    def test_pausing_AGAIN_clears_the_old_resume_date(self):
+        """Otherwise a currently-paused member reads as resumed."""
+        from .models import MemberStatus
+
+        profile = self._profile()
+        for status in (MemberStatus.PAUSED, MemberStatus.ACTIVE, MemberStatus.PAUSED):
+            profile.status = status
+            profile.save()
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.paused_at)
+        self.assertIsNone(profile.resumed_at)
+
+    def test_a_save_with_update_fields_still_stamps_them(self):
+        """⚠ The failure mode that bit pause_reason twice: save() adds the fields to
+        update_fields itself rather than trusting every caller to list them."""
+        from .models import MemberStatus
+
+        profile = self._profile()
+        profile.status = MemberStatus.PAUSED
+        profile.save(update_fields=["status"])
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.paused_at)
+
+    def test_a_status_change_that_is_NOT_a_pause_touches_neither(self):
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PENDING)
+        profile.status = MemberStatus.ACTIVE
+        profile.save()
+        profile.refresh_from_db()
+        self.assertIsNone(profile.paused_at)
+        self.assertIsNone(profile.resumed_at)
+
+    # ── the enrollment timestamps ───────────────────────────────────────────
+    def test_holding_stamps_held_at_and_resuming_stamps_hold_resumed_at(self):
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        profile = self._profile()
+        enr = profile.enrollment
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="member_requested")
+        enr.refresh_from_db()
+        self.assertIsNotNone(enr.held_at)
+        held_at = enr.held_at
+
+        advance_enrollment(enr, EnrollmentStage.SERVICE_ACTIVE, force=True)
+        enr.refresh_from_db()
+        self.assertIsNotNone(enr.hold_resumed_at)
+        self.assertEqual(enr.held_at, held_at)
+
+    def test_a_RE_HOLD_does_not_move_held_at(self):
+        """⚠ "How long has this been held?" is the question the field exists to
+        answer, and it would reset every time an import re-held the enrollment."""
+        from .models import EnrollmentStage
+        from .services.lifecycle import advance_enrollment
+
+        profile = self._profile()
+        enr = profile.enrollment
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="member_requested")
+        enr.refresh_from_db()
+        held_at = enr.held_at
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="uncategorized")
+        enr.refresh_from_db()
+        self.assertEqual(enr.held_at, held_at)
+
+    # ── the filters ─────────────────────────────────────────────────────────
+    def _paused_on(self, when):
+        from .models import MemberDietaryProfile, MemberStatus, PauseReason
+
+        profile = self._profile()
+        profile.status = MemberStatus.PAUSED
+        profile.pause_reason = PauseReason.objects.get(code="member_cancelled")
+        profile.save()
+        MemberDietaryProfile.objects.filter(pk=profile.pk).update(paused_at=when)
+        return profile
+
+    def test_the_paused_range_is_INCLUSIVE_at_both_ends(self):
+        """⚠ A naive __lte on a DateTimeField compares against midnight and excludes
+        everything that happened during the chosen day -- which reads as missing data,
+        not as an off-by-one."""
+        from datetime import timedelta
+
+        when = timezone.now().replace(hour=15, minute=30)
+        self._paused_on(when)
+        day = when.date().isoformat()
+        resp = self.api.get(
+            f"/api/portal/members/paused/?paused_from={day}&paused_to={day}"
+        )
+        self.assertEqual(resp.data["count"], 1)
+        # And excluded by a range that ends the day before.
+        before = (when.date() - timedelta(days=1)).isoformat()
+        resp = self.api.get(f"/api/portal/members/paused/?paused_to={before}")
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_a_MALFORMED_date_is_ignored_not_rejected(self):
+        """A stale bookmark should show the list, matching every other filter here."""
+        self._paused_on(timezone.now())
+        resp = self.api.get("/api/portal/members/paused/?paused_from=nonsense")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["count"], 1)
+
+    def test_the_held_range_filters_the_on_hold_tab(self):
+        from datetime import timedelta
+
+        from .models import EnrollmentStage, EnrollmentVerification
+        from .services.lifecycle import advance_enrollment
+
+        profile = self._profile()
+        enr = profile.enrollment
+        advance_enrollment(enr, EnrollmentStage.ON_HOLD, force=True,
+                           hold_reason="member_requested")
+        when = timezone.now() - timedelta(days=10)
+        EnrollmentVerification.objects.filter(pk=enr.pk).update(held_at=when)
+
+        day = when.date().isoformat()
+        resp = self.api.get(
+            f"/api/portal/members/on-hold/?held_from={day}&held_to={day}"
+        )
+        self.assertEqual(resp.data["count"], 1)
+        today = timezone.localdate().isoformat()
+        resp = self.api.get(f"/api/portal/members/on-hold/?held_from={today}")
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_the_backfill_recovers_BOTH_dates_from_the_timeline(self):
+        """⚠ An earlier version of this command claimed resumed_at was
+        unrecoverable -- it read status_changed_at, which cannot tell a resume from
+        any other status change, and fell back to notes for 1,000 of them.
+
+        TimelineEvent had it all along: 4,407 member_paused and 1,552
+        member_unpaused rows, in the same table this codebase already writes those
+        events to. Reading it recovered 1,843 resume dates instead of 1,000, and
+        1,367 FULL pause/resume cycles that were previously impossible."""
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus, TimelineEvent
+
+        profile = self._profile()          # ACTIVE, i.e. resumed
+        paused_when = timezone.now() - timedelta(days=20)
+        resumed_when = timezone.now() - timedelta(days=5)
+        TimelineEvent.objects.create(
+            client=profile.client, event_type="member_paused",
+            occurred_at=paused_when, title="Member Paused",
+        )
+        TimelineEvent.objects.create(
+            client=profile.client, event_type="member_unpaused",
+            occurred_at=resumed_when, title="Member Unpaused",
+        )
+        out = StringIO()
+        call_command("backfill_hold_pause_dates", "--apply", stdout=out, stderr=out)
+        profile.refresh_from_db()
+        self.assertEqual(profile.paused_at, paused_when)
+        self.assertEqual(profile.resumed_at, resumed_when)
+
+    def test_the_backfill_does_NOT_carry_a_stale_resume_onto_a_paused_member(self):
+        """An earlier resume ended a PREVIOUS cycle. Carrying it over would make a
+        currently-paused member read as resumed."""
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus, TimelineEvent
+
+        profile = self._profile(status=MemberStatus.PAUSED)
+        TimelineEvent.objects.create(
+            client=profile.client, event_type="member_unpaused",
+            occurred_at=timezone.now() - timedelta(days=30),
+            title="Member Unpaused",
+        )
+        TimelineEvent.objects.create(
+            client=profile.client, event_type="member_paused",
+            occurred_at=timezone.now() - timedelta(days=2), title="Member Paused",
+        )
+        out = StringIO()
+        call_command("backfill_hold_pause_dates", "--apply", stdout=out, stderr=out)
+        profile.refresh_from_db()
+        self.assertIsNotNone(profile.paused_at)
+        self.assertIsNone(profile.resumed_at)
+
+    def test_the_backfill_leaves_a_NEVER_PAUSED_member_alone(self):
+        """⚠ status_changed_at must NOT be used as a resume date: for a member who
+        was never paused it is simply their last status change, and writing it would
+        invent a pause for ~21,000 active members."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.ACTIVE)
+        profile.status = MemberStatus.PENDING
+        profile.save()                      # stamps status_changed_at, no pause
+        out = StringIO()
+        call_command("backfill_hold_pause_dates", "--apply", stdout=out, stderr=out)
+        profile.refresh_from_db()
+        self.assertIsNone(profile.paused_at)
+        self.assertIsNone(profile.resumed_at)
+
+    def test_the_backfill_recovers_the_hold_dates_from_StageEvent(self):
+        from datetime import timedelta
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import EnrollmentStage, EnrollmentVerification, StageEvent
+
+        profile = self._profile()
+        enr = profile.enrollment
+        held_when = timezone.now() - timedelta(days=9)
+        event = StageEvent.objects.create(
+            entity_type="enrollment", enrollment=enr, client=enr.client,
+            from_stage=EnrollmentStage.SERVICE_ACTIVE,
+            to_stage=EnrollmentStage.ON_HOLD,
+        )
+        # ⚠ entered_at is auto_now_add, so passing it to create() is SILENTLY
+        # ignored -- the row lands with "now" and the assertion fails against a date
+        # that was never stored. Same trap as Case.case_created_at.
+        StageEvent.objects.filter(pk=event.pk).update(entered_at=held_when)
+        EnrollmentVerification.objects.filter(pk=enr.pk).update(
+            stage=EnrollmentStage.ON_HOLD,
+        )
+        out = StringIO()
+        call_command("backfill_hold_pause_dates", "--apply", stdout=out, stderr=out)
+        enr.refresh_from_db()
+        self.assertEqual(enr.held_at, held_when)
+
+    def test_the_rows_carry_the_dates(self):
+        self._paused_on(timezone.now())
+        row = self.api.get("/api/portal/members/paused/").data["results"][0]
+        self.assertIsNotNone(row["paused_at"])
+        self.assertIn("resumed_at", row)
+
+
+class NutritionistPauseInfoTest(TestCase):
+    """The review drawer shows WHY a paused member was paused.
+
+    ⚠ Informational only. It must NOT reach the signed nutrition PDF -- see the
+    last test.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, PauseReason
+
+        self.reason = PauseReason.objects.create(
+            code="nutritionist_paused", label="Nutritionist Paused", is_system=True,
+        )
+        agent = Agent.objects.create(
+            name="Pi Agent", agent_code="899", group="Nutritionist",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _paused_member(self, note_body=None, status=None):
+        from .models import (
+            Client, EnrollmentStage, EnrollmentVerification, Household,
+            HouseholdMember, MemberDietaryProfile, MemberStatus, Note, NoteSource,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pi", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Pi HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, stage=EnrollmentStage.SERVICE_ACTIVE,
+            verified_at=timezone.now(),
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Pi Member",
+            status=status or MemberStatus.NUTRITIONIST_PAUSED,
+            pause_reason=(
+                self.reason
+                if (status or MemberStatus.NUTRITIONIST_PAUSED)
+                == MemberStatus.NUTRITIONIST_PAUSED else None
+            ),
+        )
+        if note_body:
+            Note.objects.create(
+                client=client, source=NoteSource.AGENT, body=note_body,
+            )
+        return client, enr
+
+    def _review(self, client):
+        resp = self.api.get(
+            f"/api/portal/members/{client.client_id}/nutritionist-review/",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_it_returns_the_reason_and_the_note(self):
+        client, _enr = self._paused_member(
+            "Member paused by Nutritionist. Reason: kidney disease, need labs",
+        )
+        info = self._review(client)["pause_info"][str(client.client_id)]
+        self.assertEqual(info["reason_label"], "Nutritionist Paused")
+        self.assertIn("kidney disease", info["note"])
+        self.assertEqual(info["status_label"], "Nutritionist Paused")
+
+    def test_the_AGENT_note_prefix_is_read_too(self):
+        """A member paused by an agent and later reviewed by the Nutritionist. The
+        other prefix would blank the reason for exactly those."""
+        client, _enr = self._paused_member(
+            "Member paused. Reason: member asked to stop for a month",
+        )
+        info = self._review(client)["pause_info"][str(client.client_id)]
+        self.assertIn("asked to stop", info["note"])
+
+    def test_the_MOST_RECENT_note_wins(self):
+        from .models import Note, NoteSource
+
+        client, _enr = self._paused_member(
+            "Member paused. Reason: the first one",
+        )
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT,
+            body="Member paused by Nutritionist. Reason: the second one",
+        )
+        info = self._review(client)["pause_info"][str(client.client_id)]
+        self.assertEqual(info["note"], "the second one")
+
+    def test_an_ACTIVE_member_gets_no_entry(self):
+        from .models import MemberStatus
+
+        client, _enr = self._paused_member(status=MemberStatus.ACTIVE)
+        self.assertEqual(self._review(client)["pause_info"], {})
+
+    def test_a_pause_with_NO_note_still_reports_the_category(self):
+        client, _enr = self._paused_member()
+        info = self._review(client)["pause_info"][str(client.client_id)]
+        self.assertEqual(info["reason_label"], "Nutritionist Paused")
+        self.assertEqual(info["note"], "")
+
+    def test_it_is_NOT_in_the_shared_PDF_CONTEXT(self):
+        """⚠ THE POINT OF ADDING IT IN THE VIEW. nutrition_review_context is shared
+        with render_member_nutrition_pdf, so a field added there would print on the
+        signed clinical document. This is informational for the Nutritionist deciding
+        whether to resume -- not part of the nutrition review."""
+        from .services.nutrition_pdf import nutrition_review_context
+
+        _client, enr = self._paused_member(
+            "Member paused by Nutritionist. Reason: kidney disease",
+        )
+        ctx = nutrition_review_context(enr)
+        self.assertNotIn("pause_info", ctx)
+        # And no member row smuggles it in under another name.
+        for member in ctx.get("members", []):
+            for key in member:
+                self.assertNotIn("pause", key.lower(), f"{key} leaks into the PDF")

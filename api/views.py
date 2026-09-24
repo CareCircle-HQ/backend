@@ -752,15 +752,45 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
         except Exception:  # noqa: BLE001 - tracking must never break the write
             logger.exception("record_case_change failed for %s", getattr(case, "pk", None))
 
+    def _apply_internal_service_rules(self, case):
+        """Re-judge the GOVERNING case against the latest eligibility assessment.
+
+        ⚠ THIS HAS TO RUN ON A CASE SAVE, not only on a client save. Rules 2 and 3
+        judge the governing case, and the governing case is exactly what a case write
+        changes -- the assessment barely moves. Hooked only to the client paths, an
+        agent could open a meals case for a boxes-only member and nothing would hold
+        it until that client happened to be imported again; a case opened and closed
+        between two client imports was never judged at all.
+        """
+        client = getattr(case, "client", None)
+        if client is None:
+            return
+        try:
+            from api.services.internal_service_rules import (
+                apply_internal_service_rules,
+            )
+
+            apply_internal_service_rules(
+                Client.objects.get(pk=client.pk),
+                actor_label=getattr(self.request.user, "name", "") or "",
+            )
+        except Exception:  # noqa: BLE001 - never let a rule break a case write
+            logger.exception(
+                "internal-service rules failed for case %s",
+                getattr(case, "pk", None),
+            )
+
     def perform_create(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
         self._record_case_change(serializer.instance)
+        self._apply_internal_service_rules(serializer.instance)
 
     def perform_update(self, serializer):
         serializer.save()
         _safe_timeline(timeline.event_for_case, serializer.instance, self.request)
         self._record_case_change(serializer.instance)
+        self._apply_internal_service_rules(serializer.instance)
 
     @action(detail=False, methods=["post"])
     def bulk(self, request):
@@ -798,6 +828,15 @@ class CaseViewSet(BulkUpsertMixin, viewsets.ModelViewSet):
                 # Housing dispatch, same contract as above: once per client, on
                 # the complete case picture.
                 reconcile_dispatch_orders(client)
+                # And the internal-service hold rules -- ONCE per client, AFTER the
+                # authorization reconcile has settled which case governs. Running it
+                # per row would judge a partial picture: a closed case written before
+                # its open successor would look like the governing one.
+                from api.services.internal_service_rules import (
+                    apply_internal_service_rules,
+                )
+
+                apply_internal_service_rules(client, actor_label="system: ext bulk")
             except Exception:  # noqa: BLE001 - never fail the write on a reconcile
                 logger.exception("bulk case reconcile failed for client %s", cid)
         return response

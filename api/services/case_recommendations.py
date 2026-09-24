@@ -38,12 +38,28 @@ _CATEGORY_TO_PROGRAM_ITEM = {
     g["label"]: g["program_item"]
     for groups in INTERVENTIONS.values() for g in groups if g["program_item"]
 }
+# Which PROGRAMME FAMILY each product category belongs to.
+#
+# ⚠ KEYED ON THE CATEGORY, not on a module name. This used to read
+# ``"Home Remediation" if module == "ventilation"``, and when the questionnaires were
+# rebuilt around five product categories the "ventilation" module ceased to exist --
+# so EVERY air-quality and temperature product silently became a Home Accessibility
+# programme. The names it then built ("Home Accessibility and Safety Modification -
+# De-humidifier - Queens") match nothing in ActiveProgram, so every one of those
+# recommendations reported exists=False and read as "no such programme -- it must be
+# created".
+#
+# An explicit set, so a new category is a KeyError-shaped gap in one place rather
+# than a wrong answer everywhere: air quality and temperature are remediation of the
+# dwelling's environment, the rest are modifications to the building.
+_REMEDIATION_CATEGORIES = {"air_quality", "temperature"}
+
 _CATEGORY_FAMILY = {
     g["label"]: (
-        "Home Remediation" if module == "ventilation"
+        "Home Remediation" if category in _REMEDIATION_CATEGORIES
         else "Home Accessibility and Safety Modification"
     )
-    for module, groups in INTERVENTIONS.items() for g in groups
+    for category, groups in INTERVENTIONS.items() for g in groups
 }
 
 

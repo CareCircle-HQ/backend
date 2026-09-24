@@ -209,6 +209,31 @@ nohup python -u manage.py <cmd> > /tmp/<cmd>.log 2>&1 < /dev/null &          # l
   Always confirm a background job actually started (`pgrep -f`), rather than
   assuming the `&` succeeded.
 
+### A local dev server started with `--noreload` serves STALE CODE
+
+`runserver --noreload` is useful for readable logs (the autoreloader doubles every
+line), but it does exactly what it says: a process started before you wrote a
+module will never import it, and Django gives no hint. Symptoms look like the
+feature not working rather than the server being old:
+
+```
+vendor server started   14:44:40
+dispatch_pdf.py written 14:55        <- the running process cannot see it
+result                  three real submissions produced zero PDFs
+```
+
+This has now cost two debugging cycles in one day -- the same shape as the earlier
+"vendor payload showed no phone number" report. Before concluding a new feature is
+broken, compare the two:
+
+```
+ps -o lstart= -p $(pgrep -f "runserver 8001" | head -1)
+ls -l api/services/<the new module>.py
+```
+
+Restart after adding a module, or drop `--noreload` and accept the doubled logs.
+PRODUCTION is not affected: `deploy.sh` reloads gunicorn, which re-imports.
+
 **Check for a duplicate before starting one.** Two concurrent `--prune` passes
 delete each other's rows:
 

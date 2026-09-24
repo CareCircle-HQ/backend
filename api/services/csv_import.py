@@ -1375,6 +1375,9 @@ class CsvImporter:
         is the reconcile the deferred per-save calls were skipped in favor of.
         Each client is isolated -- one reconcile hiccup never fails the run."""
         from api.services.dispatch import reconcile_dispatch_orders
+        from api.services.internal_service_rules import (
+            apply_internal_service_rules,
+        )
         from api.services.lifecycle import reconcile_internal_service_authorization
 
         ids = list(self.reconcile_client_ids)
@@ -1395,6 +1398,17 @@ class CsvImporter:
                     # complete case picture. A member can arrive with several Home
                     # Remediation cases in one payload.
                     reconcile_dispatch_orders(client)
+                    # The internal-service hold rules, on the CASES import too.
+                    #
+                    # ⚠ The clients import already runs them via
+                    # reconcile_client_eligibility, but rules 2 and 3 judge the
+                    # GOVERNING CASE -- which this import is what changes. Without
+                    # this, a wrong case arriving in a cases-only run was not judged
+                    # until the next clients run happened to touch that member.
+                    #
+                    # AFTER the authorization reconcile, so it reads the settled
+                    # governing case rather than a half-applied one.
+                    apply_internal_service_rules(client)
                 except Exception:  # noqa: BLE001 - never fail the run on a reconcile hiccup
                     logger.warning(
                         "csv_import reconcile failed for %s", client.pk, exc_info=True

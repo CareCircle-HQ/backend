@@ -62,6 +62,7 @@ from ..models import (
     MemberStatus,
     PAUSABLE_MEMBER_STATUSES,
     MEMBER_PAUSED_STATUSES,
+    MEMBER_PAUSE_TIMESTAMP_STATUSES,
     SERVICE_EXCLUDED_MEMBER_STATUSES,
     MenuType,
     Note,
@@ -137,6 +138,7 @@ from ..services.lifecycle import (
     reopen_for_verification,
     split_dependent_into_own_enrollment,
 )
+from ..services import pause_reasons as pr
 from ..services import timeline
 from ..services.warnings import sync_household_warnings
 from ..serializers import (
@@ -331,6 +333,7 @@ def _hold_household_for_range(enrollment, author):
                 f"Automatically placed on hold — delivery ZIP outside coverage "
                 f"area (Out of Range).{f' Actioned via {author}.' if author else ''}"
             ),
+            hold_reason=_hold.ZIP_OUT_OF_COVERAGE,
         )
         return True
     except InvalidTransition:
@@ -500,6 +503,17 @@ def _resume_household_after_range(enrollment):
         return False
 
 
+def pause_reason_obj(code, *, fallback=None):
+    """The PauseReason for ``code``, or the fallback. None when neither exists.
+
+    A thin wrapper so a view can assign to ``profile.pause_reason`` inline without
+    every call site importing the service and handling a missing catalogue row.
+    """
+    from ..services import pause_reasons as _pr
+
+    return _pr.reason_for(code) or (_pr.reason_for(fallback) if fallback else None)
+
+
 _ALL_PAUSED_HOLD_NOTE = "Automatically placed on hold — all household members paused."
 _ALL_PAUSED_RESUME_NOTE = "Service resumed — a household member returned from pause."
 
@@ -507,6 +521,8 @@ _ALL_PAUSED_RESUME_NOTE = "Service resumed — a household member returned from 
 # for service). A not-yet-verified enrollment isn't serving anyone, so pausing its
 # members must NOT drive it to On Hold -- otherwise a later resume would advance it
 # to Service Active and strand it Active without ever being verified.
+from api.services import hold_reasons as _hold
+
 _ALL_PAUSED_HOLDABLE_STAGES = {
     EnrollmentStage.VERIFIED,
     EnrollmentStage.KITCHEN_ASSIGNMENT,
@@ -534,6 +550,7 @@ def _reconcile_all_paused_hold(enrollment):
         try:
             advance_enrollment(
                 enrollment, EnrollmentStage.ON_HOLD, note=_ALL_PAUSED_HOLD_NOTE,
+                hold_reason=_hold.ALL_MEMBERS_PAUSED,
             )
         except InvalidTransition:
             pass
@@ -3691,6 +3708,338 @@ class UnlinkedMembersListView(PortalGenericAPIView):
         return self.get_paginated_response(rows)
 
 
+def _date_range_filter(qs, params, field, prefix):
+    """Apply ``?<prefix>_from`` / ``?<prefix>_to`` as an inclusive date range.
+
+    Inclusive at BOTH ends, using __date so a caller passing today's date gets
+    today's rows. A naive ``__lte`` on a DateTimeField would compare against
+    midnight and silently exclude everything that happened during the chosen day --
+    which reads as missing data, not as an off-by-one.
+
+    A malformed date is IGNORED rather than 400'd, matching every other filter here:
+    a stale bookmark should show the list.
+    """
+    from datetime import date as _date
+
+    for suffix, lookup in (("from", "gte"), ("to", "lte")):
+        raw = (params.get(f"{prefix}_{suffix}") or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = _date.fromisoformat(raw)
+        except ValueError:
+            continue
+        qs = qs.filter(**{f"{field}__date__{lookup}": parsed})
+    return qs
+
+
+class PausedMembersListView(UnlinkedMembersListView):
+    """Urgent Care -> Paused tab.
+
+    Every member currently in a non-serving status, with WHY. Reuses the row
+    serialization and the eligibility/navigation columns from
+    :class:`UnlinkedMembersListView`; only the population and two extra columns
+    differ.
+
+    ⚠ INACTIVE AND REMOVED ARE EXCLUDED. They also stop service, but they are
+    terminal -- "their service ended" and "they were split into their own case" --
+    not a pause somebody is expected to act on. Including them would add ~1,350 rows
+    nobody can do anything about to a page whose whole purpose is work needing
+    attention.
+    """
+
+    # The same four the backfill treats as pauses, for exactly the same reason.
+    PAUSED_STATUSES = (
+        MemberStatus.PAUSED,
+        MemberStatus.NUTRITIONIST_PAUSED,
+        MemberStatus.OUT_OF_ORBIT,
+        MemberStatus.OUT_OF_RANGE,
+    )
+
+    def get_queryset(self):
+        params = self.request.query_params
+        qs = Client.objects.filter(
+            member_profiles__status__in=self.PAUSED_STATUSES,
+        ).prefetch_related(
+            "insurances", "cases", "assessments", "tags",
+            "member_profiles__pause_reason",
+        ).distinct()
+
+        # ?reason=<code>, or ?reason=none for the ones nobody has classified --
+        # which is the filter that actually gets used, because it IS the backlog.
+        reason = (params.get("reason") or "").strip()
+        if reason == "none":
+            qs = qs.filter(
+                member_profiles__status__in=self.PAUSED_STATUSES,
+                member_profiles__pause_reason__isnull=True,
+            )
+        elif reason:
+            qs = qs.filter(
+                member_profiles__status__in=self.PAUSED_STATUSES,
+                member_profiles__pause_reason__code=reason,
+            )
+
+        status = (params.get("status") or "").strip()
+        if status in [s_.value for s_ in self.PAUSED_STATUSES]:
+            qs = qs.filter(member_profiles__status=status)
+
+        # WHEN they were paused, and when they came back.
+        #
+        # ⚠ Both ranges filter the SAME member_profiles join as the status/reason
+        # filters above, so a household is matched only when ONE profile satisfies
+        # everything -- not when one member was paused in July and another resumed
+        # in September.
+        qs = _date_range_filter(qs, params, "member_profiles__paused_at", "paused")
+        qs = _date_range_filter(qs, params, "member_profiles__resumed_at", "resumed")
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+        return qs.order_by("last_name", "first_name").distinct()
+
+    # The prefixes a pause description is written under. The Nutritionist writes a
+    # different one, and omitting it would show a blank description for exactly the
+    # members whose reason an agent most needs to read.
+    PAUSE_NOTE_PREFIXES = (
+        "Member paused. Reason:",
+        "Member paused by Nutritionist. Reason:",
+    )
+
+    def _pause_descriptions(self, clients):
+        """client_id -> the most recent pause description, in ONE query.
+
+        Batched rather than fetched per row: 1,374 pause notes against a page of 25
+        members is a query per row otherwise, on a page an agent opens to scan.
+
+        ⚠ NOT filtered to notes written AFTER the current pause. A member paused,
+        resumed and paused again shows the older description -- there is no link
+        between a note and a pause, only a timestamp. Better a slightly stale
+        sentence than a blank column, but it is why this is labelled "last note"
+        rather than "the reason".
+        """
+        from api.models import Note
+
+        ids = [c.client_id for c in clients]
+        if not ids:
+            return {}
+        found = {}
+        # Ordered oldest-first so the LAST write per client wins.
+        for client_id, body in (
+            Note.objects
+            .filter(client_id__in=ids)
+            .order_by("created_at")
+            .values_list("client_id", "body")
+        ):
+            for prefix in self.PAUSE_NOTE_PREFIXES:
+                if body.startswith(prefix):
+                    found[client_id] = body.split("Reason:", 1)[1].strip()
+                    break
+        return found
+
+    def _paused_profile(self, client):
+        """The paused profile to report on.
+
+        A client can hold several profiles across enrollments. The one that matters
+        is the paused one -- reporting the first profile would show "Active" beside a
+        member the page has listed precisely because they are not.
+        """
+        for profile in client.member_profiles.all():
+            if profile.status in self.PAUSED_STATUSES:
+                return profile
+        return None
+
+    def get(self, request):
+        page = self.paginate_queryset(self.get_queryset())
+        descriptions = self._pause_descriptions(page or [])
+        rows = []
+        for c in page or []:
+            profile = self._paused_profile(c)
+            reason = getattr(profile, "pause_reason", None) if profile else None
+            rows.append({
+                "id": str(c.client_id),
+                "name": s._full_name(c),
+                "date_of_birth": c.date_of_birth.isoformat()
+                if c.date_of_birth else None,
+                "medicaid_id": s.medicaid_member_id(c) or "",
+                "eligible_services": self._eligible_services(c),
+                "eligibility_case": self._case_cell(
+                    self._case_of_type(c, CaseType.ELIGIBILITY)
+                ),
+                "navigation_case": self._case_cell(
+                    self._case_of_type(c, CaseType.NAVIGATION)
+                ),
+                "tags": _client_tags_payload(c),
+                # The two columns this tab exists for.
+                "member_status": profile.status if profile else "",
+                "member_status_label": (
+                    MemberStatus(profile.status).label if profile else ""
+                ),
+                "pause_reason_code": reason.code if reason else "",
+                "pause_reason_label": reason.label if reason else "",
+                "paused_at": (
+                    profile.paused_at.isoformat()
+                    if profile and profile.paused_at else None
+                ),
+                "resumed_at": (
+                    profile.resumed_at.isoformat()
+                    if profile and profile.resumed_at else None
+                ),
+                # An agent cannot lift this one from the Program tab -- Customer
+                # Service must dismiss the CaseMismatchFlag -- so it is worth
+                # showing rather than leaving them to find out by clicking.
+                "pause_locked": bool(profile.pause_locked) if profile else False,
+                # WHAT THE AGENT ACTUALLY WROTE. The category is countable; this is
+                # the detail no catalogue carries -- "member wants Halal meals and
+                # the driver brought the wrong ones" is not a category.
+                #
+                # Falls back to the stored ineligibility reasons, which ARE the
+                # description for a system pause: an out-of-range member has no agent
+                # note, but "home ZIP 33314 is outside the coverage area" is exactly
+                # what an agent needs to read.
+                "pause_description": (
+                    descriptions.get(c.client_id)
+                    or "; ".join(getattr(c, "ineligible_reasons", None) or [])
+                ),
+            })
+        return self.get_paginated_response(rows)
+
+
+class OnHoldMembersListView(UnlinkedMembersListView):
+    """Urgent Care -> On Hold. Every household whose programme is On Hold, and WHY.
+
+    The unit is the HOUSEHOLD, not the member: a hold lives on the enrollment and
+    drops the whole household off every Purchase Order. Listing each member would
+    show the same hold four times and make the backlog look four times its size.
+
+    Reuses the row serialization and the eligibility/navigation columns from
+    :class:`UnlinkedMembersListView`; the hold columns are the point of the tab.
+    """
+
+    def get_queryset(self):
+        params = self.request.query_params
+        qs = Client.objects.filter(
+            enrollments__stage=EnrollmentStage.ON_HOLD,
+        ).distinct().prefetch_related(
+            "insurances", "cases", "assessments", "tags",
+            "enrollments__hold_reason",
+        )
+
+        # ?reason=<code>, or ?reason=none for holds nobody has classified -- which is
+        # the filter that gets used, because it IS the backlog.
+        reason = (params.get("reason") or "").strip()
+        if reason == "none":
+            qs = qs.filter(
+                enrollments__stage=EnrollmentStage.ON_HOLD,
+                enrollments__hold_reason__isnull=True,
+            )
+        elif reason:
+            qs = qs.filter(
+                enrollments__stage=EnrollmentStage.ON_HOLD,
+                enrollments__hold_reason__code=reason,
+            )
+
+        # WHEN it was held, and when it was resumed. Same join as the reason filter
+        # above, so one enrollment must satisfy both rather than two different ones.
+        qs = _date_range_filter(qs, params, "enrollments__held_at", "held")
+        qs = _date_range_filter(
+            qs, params, "enrollments__hold_resumed_at", "resumed",
+        )
+
+        search = (params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, TypeError, AttributeError):
+                pass
+            qs = qs.filter(cond)
+        return qs.order_by("last_name", "first_name").distinct()
+
+    def _held_enrollment(self, client):
+        """The held enrollment to report on.
+
+        A client can hold several enrollments; the one that matters is the On Hold
+        one. Taking the first would show a serving programme beside a member the page
+        listed precisely because they are not being served.
+        """
+        held = [
+            e for e in client.enrollments.all()
+            if e.stage == EnrollmentStage.ON_HOLD
+        ]
+        held.sort(key=lambda e: e.stage_at or e.opened_at, reverse=True)
+        return held[0] if held else None
+
+    def get(self, request):
+        page = self.paginate_queryset(self.get_queryset())
+        rows = []
+        for c in page or []:
+            enr = self._held_enrollment(c)
+            reason = getattr(enr, "hold_reason", None) if enr else None
+            # The note the hold was placed with -- the detail no catalogue carries.
+            note = ""
+            if enr is not None:
+                event = (
+                    StageEvent.objects.filter(
+                        enrollment=enr, to_stage=EnrollmentStage.ON_HOLD,
+                    ).order_by("-entered_at").first()
+                )
+                body = (event.note or "") if event else ""
+                note = (
+                    body.split("Reason:", 1)[1].strip()
+                    if "Reason:" in body else body
+                )
+            rows.append({
+                "id": str(c.client_id),
+                "name": s._full_name(c),
+                "medicaid_id": s.medicaid_member_id(c) or "",
+                "eligible_services": self._eligible_services(c),
+                "tags": _client_tags_payload(c),
+                "program_name": (enr.program_name if enr else "") or "",
+                "held_since": (
+                    (enr.stage_at or enr.opened_at).isoformat()
+                    if enr and (enr.stage_at or enr.opened_at) else None
+                ),
+                "hold_reason_code": reason.code if reason else "",
+                "hold_reason_label": reason.label if reason else "",
+                "held_at": (
+                    enr.held_at.isoformat() if enr and enr.held_at else None
+                ),
+                "hold_resumed_at": (
+                    enr.hold_resumed_at.isoformat()
+                    if enr and enr.hold_resumed_at else None
+                ),
+                # What it takes to come off the hold. The catalogue knows; an agent
+                # working a backlog of 3,969 needs it on the row, not two clicks away.
+                "resume_policy": reason.resume_policy if reason else "",
+                "resume_detail": reason.resume_detail if reason else "",
+                "hold_note": note,
+            })
+        return self.get_paginated_response(rows)
+
+
 class NoNavigationMembersListView(UnlinkedMembersListView):
     """Urgent Care -> No Navigation tab.
 
@@ -4806,6 +5155,10 @@ class HouseholdMemberEditView(PortalAPIView):
         reactivate = data.pop("reactivate", False)
         deactivate = data.pop("deactivate", False)
         pause = data.pop("pause", False)
+        # Popped alongside `pause`: a control field, not a model field. Leaving it in
+        # `data` would make the generic assignment loop below try to set a `str` on
+        # the FK.
+        pause_reason_code = (data.pop("pause_reason_code", "") or "").strip()
         unpause = data.pop("unpause", False)
         restore_range = data.pop("restore_range", False)
         pause_reason = (data.pop("pause_reason", "") or "").strip()
@@ -4860,6 +5213,12 @@ class HouseholdMemberEditView(PortalAPIView):
             mv.status = MemberStatus.PAUSED
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
+            # The agent's chosen reason. Falls back to Uncategorized rather than
+            # blank: the whole point of the catalogue is that every pause has an
+            # answer, and a nullable field quietly fills with NULLs otherwise.
+            mv.pause_reason = pause_reason_obj(
+                pause_reason_code, fallback=pr.UNCATEGORIZED,
+            )
             mv.save()
             # Retract any already-committed upcoming delivery so the pause stops
             # shipments (+ billing) now, not just future PO generation.
@@ -4935,6 +5294,7 @@ class HouseholdMemberEditView(PortalAPIView):
             # the meal rule. Clear the kitchen meal result so they're excluded
             # from every delivery schedule / Purchase Order until reactivated.
             mv.status = MemberStatus.OUT_OF_ORBIT
+            mv.pause_reason = pause_reason_obj(pr.OUT_OF_ORBIT)
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
             mv.save()
@@ -5365,12 +5725,21 @@ class MemberServiceHoldView(PortalAPIView):
                 {"reason": "A reason is required to place service on hold."},
                 status=http.HTTP_400_BAD_REQUEST,
             )
+        # The CATEGORY, alongside the free-text note. Both, not either: the category
+        # is what can be counted and filtered, the note is what an agent reads six
+        # months later.
+        #
+        # Not required, and deliberately so: a hold that somebody needs to place now
+        # must not 400 on a missing dropdown. Missing falls back to Uncategorized --
+        # a reason the backfill can find, unlike a NULL.
+        hold_reason_code = (request.data.get("hold_reason_code") or "").strip()
         agent = current_agent(request)
         author = agent.name if agent else ""
         try:
             advance_enrollment(
                 enr, EnrollmentStage.ON_HOLD,
                 note=f"Placed on hold by {author or 'support portal'}. Reason: {reason}",
+                hold_reason=hold_reason_code or _hold.UNCATEGORIZED,
             )
         except InvalidTransition as exc:
             return Response({"error": str(exc)}, status=http.HTTP_400_BAD_REQUEST)
@@ -6186,6 +6555,223 @@ class NutritionistPendingSplitListView(PortalAPIView):
         return Response({"count": len(results), "results": results})
 
 
+class NutritionistPausedListView(NutritionistPendingSplitListView):
+    """GET: members the NUTRITIONIST paused -- the other half of their queue.
+
+    Only ``NUTRITIONIST_PAUSED``. An agent pause, an Out of Orbit or an eligibility
+    pause are not the Nutritionist's to lift, and listing them here would invite a
+    Nutritionist to act on a pause somebody else owns for a reason they cannot see.
+
+    Same response shape and the same review drawer as Pending Review, so the two
+    tabs behave identically. Nutritionist + Management only -- inherited, along with
+    the search.
+    """
+
+    def get(self, request):
+        agent = current_agent(request)
+        allowed = bool(agent and (
+            agent.group in ("Nutritionist", "Management")
+            or getattr(agent, "is_manager", False)
+        ))
+        if not allowed:
+            return Response(
+                {"detail": "Nutritionist access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        from ..services.lifecycle import governing_internal_case
+        from .serializers import active_enrollment
+
+        clients = Client.objects.filter(
+            member_profiles__status=MemberStatus.NUTRITIONIST_PAUSED,
+        ).distinct()
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            cond = (
+                Q(first_name__icontains=search) | Q(last_name__icontains=search)
+                | Q(insurances__external_member_id__icontains=search)
+            )
+            parts = search.split()
+            if len(parts) >= 2:
+                cond |= Q(first_name__icontains=parts[0]) & Q(
+                    last_name__icontains=parts[-1]
+                )
+            try:
+                cond |= Q(client_id=uuid.UUID(search))
+            except (ValueError, AttributeError, TypeError):
+                pass
+            clients = clients.filter(cond).distinct()
+
+        results = []
+        for c in clients:
+            gov = active_enrollment(c)
+            case = (gov.case or governing_internal_case(gov)) if gov else None
+            profiles = list(gov.member_profiles.all()) if gov else []
+            members = [
+                {"name": p.member_name or "", "status": p.status} for p in profiles
+            ]
+            paused = next(
+                (p for p in profiles
+                 if p.status == MemberStatus.NUTRITIONIST_PAUSED), None,
+            )
+            # ⚠ SCOPED TO THE ENROLLMENT IN FORCE. The queryset above matches ANY of
+            # the client's profiles, and a member can carry a stale paused profile on
+            # a disregarded enrollment -- which the review drawer, correctly, does not
+            # show. Listing them gives a row a Nutritionist cannot act on: they open
+            # the drawer, find no paused member, and have no way to tell whether the
+            # tab or the drawer is wrong.
+            #
+            # One member of 25 on real data. A row that cannot be acted on is worse
+            # than an absent one.
+            if paused is None:
+                continue
+            results.append({
+                "client_id": str(c.client_id),
+                "primary_name": f"{c.first_name} {c.last_name}".strip()
+                or str(c.client_id),
+                "program_name": (gov.program_name if gov else "")
+                or getattr(case, "program_name", "") or "",
+                "verified_at": gov.verified_at.isoformat()
+                if (gov and gov.verified_at) else None,
+                "authorization_status": getattr(
+                    case, "service_authorization_status", "",
+                ) or "",
+                "members": members,
+                # WHY, from the catalogue -- the tab exists so a Nutritionist can see
+                # their own paused members and act, and "paused" without a reason is
+                # the thing they would have to go and look up.
+                "pause_reason_label": (
+                    paused.pause_reason.label
+                    if paused is not None and paused.pause_reason_id else ""
+                ),
+            })
+        results.sort(key=lambda r: r["primary_name"].lower())
+        return Response({"count": len(results), "results": results})
+
+
+class MemberNutritionistResumeMemberView(PortalAPIView):
+    """POST: return a NUTRITIONIST_PAUSED member to service.
+
+    The mirror of MemberNutritionistDenyMemberView, and deliberately narrow: it
+    refuses any other status. An agent pause, an Out of Orbit or an eligibility
+    pause are not the Nutritionist's to lift -- each has its own remedy, and lifting
+    one from here would put a member back into service past a gate that is still
+    failing.
+
+    Resuming re-runs the KITCHEN-AWARE meal rule rather than assuming Active. A
+    member paused weeks ago may have a menu or allergy set the assigned kitchen can
+    no longer fulfil, and forcing them Active would put an unfulfillable member on
+    the next Purchase Order.
+    """
+
+    def post(self, request, client_id):
+        from ..services.lifecycle import advance_enrollment
+        from ..services.timeline import emit_timeline_event
+
+        agent = current_agent(request)
+        if not (agent and (
+            agent.group in ("Nutritionist", "Management")
+            or getattr(agent, "is_manager", False)
+        )):
+            return Response(
+                {"detail": "Only a Nutritionist can resume a member."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        member_id = request.data.get("member_id") or ""
+        note_text = (request.data.get("reason") or "").strip()
+
+        enr = s.active_enrollment(client)
+        if enr is None:
+            return Response(
+                {"error": "This household has no active enrollment."},
+                status=http.HTTP_404_NOT_FOUND,
+            )
+        mv = (
+            enr.member_profiles.filter(client_id=member_id).first()
+            if member_id else None
+        )
+        if mv is None:
+            return Response(
+                {"error": "Member not found in this household."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        if mv.status != MemberStatus.NUTRITIONIST_PAUSED:
+            # Names the status, because "cannot resume" without it sends an agent
+            # looking for a bug rather than to the right remedy.
+            return Response(
+                {
+                    "error": (
+                        "This member is not Nutritionist Paused "
+                        f"(currently {MemberStatus(mv.status).label}), so a "
+                        "Nutritionist cannot resume them."
+                    ),
+                },
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        # The meal rule decides where they land: Active, or Out of Orbit when the
+        # assigned kitchen cannot fulfil them. allow_resume lets it move the member
+        # OFF a paused status, which it otherwise refuses.
+        reconcile_member_kitchen_output(
+            mv, enr.kitchen, save=False, allow_resume=True,
+        )
+        # The reason goes with the pause. Leaving it set on a serving member reads as
+        # a current problem, and the Paused tab filters on it.
+        mv.pause_reason = None
+        mv.save(update_fields=[
+            "status", "pause_reason", "kitchen_meal_type", "kitchen_food_notes",
+        ])
+
+        # Lift the household hold this member's pause caused -- but ONLY that one.
+        # Note-scoped, so a hold placed by a different rule, or by hand, survives.
+        resumed = False
+        if enr.stage == EnrollmentStage.ON_HOLD:
+            still_paused = enr.member_profiles.filter(
+                status__in=MEMBER_PAUSED_STATUSES,
+            ).exists()
+            if not still_paused:
+                try:
+                    advance_enrollment(
+                        enr, EnrollmentStage.SERVICE_ACTIVE,
+                        actor_label=agent.name or "Nutritionist",
+                        note="Nutritionist resumed the last paused member.",
+                    )
+                    resumed = True
+                except Exception:  # noqa: BLE001 - the member resume already stuck
+                    logger.warning(
+                        "could not resume enrollment %s after a nutritionist "
+                        "resume", enr.pk,
+                    )
+
+        member_name = (mv.member_name or "").strip()
+        if mv.client_id:
+            Note.objects.create(
+                client=mv.client, source=NoteSource.AGENT,
+                author_name=agent.name or "",
+                body=(
+                    f"Member resumed by Nutritionist."
+                    + (f" Note: {note_text}" if note_text else "")
+                ),
+            )
+            emit_timeline_event(
+                client=mv.client,
+                event_type=TimelineEventType.NUTRITIONIST_PAUSED,
+                occurred_at=timezone.now(),
+                title="Nutritionist Resumed",
+                subtitle=(
+                    f"{member_name} \u00b7 {note_text}" if member_name and note_text
+                    else member_name or note_text
+                ),
+            )
+        return Response({
+            "member_id": str(mv.client_id or ""),
+            "status": mv.status,
+            "status_label": MemberStatus(mv.status).label,
+            "enrollment_resumed": resumed,
+        })
+
+
 class MeSignatureView(PortalAPIView):
     """GET/PUT the logged-in agent's SAVED signature image (a PNG data URL).
 
@@ -6279,13 +6865,50 @@ class MemberNutritionistApproveView(PortalAPIView):
         # One SEPARATE signed PDF per member (the signature is collected once and
         # embedded in each). Stored on S3 + keyed on each member's dietary profile.
         # Best-effort: when S3 isn't configured the approval still proceeds.
+        # THE SIGNATURE RESUMES A NUTRITIONIST-PAUSED MEMBER, when the caller asks.
+        #
+        # ⚠ GATED ON AN EXPLICIT FLAG, not applied to every approval. A Nutritionist
+        # working the main queue pauses one member of a household and approves the
+        # rest -- which is why the PDF loop below skips a paused member at all. If
+        # approval always resumed, that pause would be undone by the very next click
+        # and the Pause action would be meaningless.
+        #
+        # So the Paused tab sends resume_paused=true: there, the signature IS the
+        # approval that returns the member to service. Anywhere else, a pause stands.
+        resumed_members = []
+        if str(request.data.get("resume_paused") or "").lower() in ("1", "true", "yes"):
+            from ..services.meal_rules import reconcile_member_kitchen_output
+
+            for mv in enr.member_profiles.select_related("client").all():
+                if mv.status != MemberStatus.NUTRITIONIST_PAUSED:
+                    continue
+                # The meal rule decides where they land -- Active, or Out of Orbit
+                # when the assigned kitchen cannot fulfil them. Forcing Active would
+                # put an unfulfillable member on the next Purchase Order.
+                reconcile_member_kitchen_output(
+                    mv, enr.kitchen, save=False, allow_resume=True,
+                )
+                mv.pause_reason = None
+                mv.save(update_fields=[
+                    "status", "pause_reason", "kitchen_meal_type",
+                    "kitchen_food_notes",
+                ])
+                resumed_members.append({
+                    "member_id": str(mv.client_id or ""),
+                    "name": mv.member_name or "",
+                    "status": mv.status,
+                    "status_label": MemberStatus(mv.status).label,
+                })
+
         from ..services import import_storage
         from ..services.nutrition_pdf import render_member_nutrition_pdf
         from django.utils import timezone as _tz
         if import_storage.s3_enabled():
             signed_at = _tz.now()
             for mv in enr.member_profiles.select_related("client").all():
-                # Never generate a PDF for a Nutritionist-Paused member.
+                # Never generate a PDF for a member who is STILL paused. A member
+                # resumed just above is no longer paused, so they DO get one -- which
+                # is the point: the signature approved them.
                 if mv.status == MemberStatus.NUTRITIONIST_PAUSED:
                     continue
                 pdf_bytes = render_member_nutrition_pdf(
@@ -6319,7 +6942,14 @@ class MemberNutritionistApproveView(PortalAPIView):
         # An individual nutritionist review is now done -> drop the client off the
         # Pending Review queue.
         set_pending_nutritionist(client, False)
-        return Response({"ok": True, "client_id": str(client.client_id)})
+        # The resumed members are REPORTED, because the meal rule may have landed
+        # them Out of Orbit rather than Active -- the drawer says which rather than
+        # claiming they are back in service.
+        return Response({
+            "ok": True,
+            "client_id": str(client.client_id),
+            "resumed": resumed_members,
+        })
 
 
 class MemberNutritionistClearPendingView(PortalAPIView):
@@ -6440,7 +7070,26 @@ class MemberNutritionistReviewView(PortalAPIView):
         if not allowed:
             return Response({"detail": "Nutritionist access required."}, status=http.HTTP_403_FORBIDDEN)
         client = get_object_or_404(Client, pk=client_id)
-        enr = (
+        # ⚠ THE ENROLLMENT IN FORCE FIRST. This used to take the newest VERIFIED
+        # enrollment, falling back to the newest by verified_at -- which picks a
+        # DISREGARDED, CLOSED or SCHEDULED_EXTENSION row whenever one sorts higher
+        # than the live one. On the Nutritionist Paused tab that hid the paused
+        # member from the drawer entirely for 12 of 25 members: the drawer showed a
+        # different household's profiles, so there was nothing to resume.
+        #
+        # Measured before changing it. For the main queue -- clients with a VERIFIED
+        # enrollment -- active_enrollment returns the SAME row in 45 of 45 cases, so
+        # the sign-off flow is untouched. Everywhere the two differ, the old logic
+        # chose a terminal enrollment and the active one is right:
+        #
+        #   Pending Review      4 of 7   review=closed/scheduled_extension
+        #                                active=kitchen_assignment/service_active
+        #   Nutritionist-paused 14 of 25 review=disregarded/closed
+        #                                active=on_hold
+        #
+        # The old chain is kept as the fallback: a client with no live enrollment
+        # still has review data worth showing.
+        enr = s.active_enrollment(client) or (
             EnrollmentVerification.objects
             .filter(client=client, stage=EnrollmentStage.VERIFIED, superseded_by__isnull=True)
             .order_by("-verified_at")
@@ -6450,8 +7099,48 @@ class MemberNutritionistReviewView(PortalAPIView):
             return Response({"error": "No enrollment for this member."}, status=http.HTTP_404_NOT_FOUND)
         from ..services.nutrition_pdf import nutrition_review_context
         ctx = nutrition_review_context(enr)
+
+        # WHY a paused member was paused, for the drawer.
+        #
+        # ⚠ ADDED HERE, NOT IN nutrition_review_context -- that context is shared
+        # with render_member_nutrition_pdf (nutrition_pdf.py:217), so a field added
+        # there would end up on the signed clinical document. This is informational
+        # for the Nutritionist deciding whether to resume; it is not part of the
+        # nutrition review, and the PDF never reads it.
+        pause_info = {}
+        for profile in enr.member_profiles.select_related("pause_reason").all():
+            if profile.status not in MEMBER_PAUSE_TIMESTAMP_STATUSES:
+                continue
+            note = ""
+            if profile.client_id:
+                # The free text whoever paused them wrote -- the detail the category
+                # cannot carry. Either prefix: the Nutritionist writes a different
+                # one, and missing it would blank the reason for exactly the members
+                # this drawer is about.
+                for body in (
+                    Note.objects.filter(client_id=profile.client_id)
+                    .order_by("created_at").values_list("body", flat=True)
+                ):
+                    if body.startswith((
+                        "Member paused. Reason:",
+                        "Member paused by Nutritionist. Reason:",
+                    )):
+                        note = body.split("Reason:", 1)[1].strip()
+            pause_info[str(profile.client_id or "")] = {
+                "status": profile.status,
+                "status_label": MemberStatus(profile.status).label,
+                "reason_label": (
+                    profile.pause_reason.label if profile.pause_reason_id else ""
+                ),
+                "note": note,
+                "paused_at": (
+                    profile.paused_at.isoformat() if profile.paused_at else None
+                ),
+            }
+
         return Response({
             **ctx,
+            "pause_info": pause_info,
             "already_approved": bool(enr.nutritionist_approved_at),
             "has_pdf": bool(enr.nutritionist_approval_pdf_key),
             # Auto-fill for the signature form from the acting agent.
@@ -6565,9 +7254,15 @@ class MemberNutritionistDenyMemberView(PortalAPIView):
         if mv.status == MemberStatus.NUTRITIONIST_PAUSED:
             return Response({"error": "Member is already Nutritionist Paused."}, status=http.HTTP_400_BAD_REQUEST)
         mv.status = MemberStatus.NUTRITIONIST_PAUSED
+        mv.pause_reason = pause_reason_obj(pr.NUTRITIONIST_PAUSED)
         mv.kitchen_meal_type = ""
         mv.kitchen_food_notes = ""
-        mv.save(update_fields=["status", "kitchen_meal_type", "kitchen_food_notes"])
+        mv.save(update_fields=[
+            # pause_reason IS in this list. It was assigned two lines above and
+            # omitted here, so every Nutritionist pause silently discarded its
+            # reason -- the exact failure the eligibility path was fixed for.
+            "status", "pause_reason", "kitchen_meal_type", "kitchen_food_notes",
+        ])
         from ..services.timeline import emit_timeline_event
         if mv.client_id:
             member_name = (mv.member_name or "").strip()
@@ -7601,10 +8296,12 @@ def assign_kitchen_to_household(
             # what the meal rule would decide.
             note = exclude_notes[profile.pk]
             profile.status = MemberStatus.OUT_OF_ORBIT
+            profile.pause_reason = pause_reason_obj(pr.OUT_OF_ORBIT)
             profile.kitchen_meal_type = ""
             profile.kitchen_food_notes = ""
             profile.save(update_fields=[
-                "status", "kitchen_meal_type", "kitchen_food_notes", "updated_at",
+                "status", "pause_reason", "kitchen_meal_type",
+                "kitchen_food_notes", "updated_at",
             ])
             out_of_orbit += 1
             reason = note or "Excluded from kitchen assignment by agent."

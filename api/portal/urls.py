@@ -101,6 +101,8 @@ from .views_members import (
     MemberVerificationCreateView,
     MemberVerificationDisregardView,
     NutritionistPendingListView,
+    MemberNutritionistResumeMemberView,
+    NutritionistPausedListView,
     NutritionistPendingSplitListView,
     CareManagementTabCountsView,
     MembersListView,
@@ -116,6 +118,8 @@ from .views_members import (
     NeedAttestationMembersListView,
     NoNavigationMembersListView,
     NeedReviewMembersListView,
+    OnHoldMembersListView,
+    PausedMembersListView,
     UnlinkedMembersListView,
     MenuTypesListView,
     TeamsListView,
@@ -196,6 +200,9 @@ from .views_imports import (
 from .views_dispatch import (
     MemberAssessmentFormView,
     MemberCaseRecommendationsView,
+    MemberDispatchDocumentsView,
+    MemberDispatchPhotosView,
+    MemberServiceTrackerView,
     MemberAssessmentOrderCreateView,
     MemberAssessmentOrderUpdateView,
     MemberWorkOrderCreateView,
@@ -203,6 +210,8 @@ from .views_dispatch import (
     MemberDispatchOrdersView,
 )
 from .views_settings import (
+    HoldReasonListView,
+    PauseReasonListView,
     BillableItemViewSet,
     ActiveProgramViewSet,
     CadenceViewSet,
@@ -279,6 +288,8 @@ urlpatterns = [
     path("members/no-navigation/", NoNavigationMembersListView.as_view(), name="portal-members-no-navigation"),
     path("members/need-attestation/", NeedAttestationMembersListView.as_view(), name="portal-members-need-attestation"),
     path("members/need-review/", NeedReviewMembersListView.as_view(), name="portal-members-need-review"),
+    path("members/paused/", PausedMembersListView.as_view(), name="portal-members-paused"),
+    path("members/on-hold/", OnHoldMembersListView.as_view(), name="portal-members-on-hold"),
     path("menu-types/", MenuTypesListView.as_view(), name="portal-menu-types"),
     path("food-allergies/", FoodAllergiesListView.as_view(), name="portal-food-allergies"),
     path(
@@ -301,6 +312,21 @@ urlpatterns = [
         "members/<uuid:client_id>/assessment-order/",
         MemberAssessmentOrderCreateView.as_view(),
         name="portal-member-assessment-order",
+    ),
+    path(
+        "members/<uuid:client_id>/dispatch-documents/",
+        MemberDispatchDocumentsView.as_view(),
+        name="portal-member-dispatch-documents",
+    ),
+    path(
+        "members/<uuid:client_id>/service-tracker/",
+        MemberServiceTrackerView.as_view(),
+        name="portal-member-service-tracker",
+    ),
+    path(
+        "members/<uuid:client_id>/dispatch-photos/",
+        MemberDispatchPhotosView.as_view(),
+        name="portal-member-dispatch-photos",
     ),
     path(
         "members/<uuid:client_id>/case-recommendations/",
@@ -408,6 +434,12 @@ urlpatterns = [
     path("me/signature/", MeSignatureView.as_view(), name="portal-me-signature"),
     path("nutritionist/pending/", NutritionistPendingListView.as_view(), name="portal-nutritionist-pending"),
     path("nutritionist/pending-split/", NutritionistPendingSplitListView.as_view(), name="portal-nutritionist-pending-split"),
+    path("nutritionist/paused/", NutritionistPausedListView.as_view(), name="portal-nutritionist-paused"),
+    path(
+        "members/<uuid:client_id>/nutritionist/resume-member/",
+        MemberNutritionistResumeMemberView.as_view(),
+        name="portal-member-nutritionist-resume",
+    ),
     path("members/<uuid:client_id>/nutritionist-review/", MemberNutritionistReviewView.as_view(), name="portal-nutritionist-review"),
     path("members/<uuid:client_id>/nutritionist-approve/", MemberNutritionistApproveView.as_view(), name="portal-nutritionist-approve"),
     path("members/<uuid:client_id>/nutritionist-clear-pending/", MemberNutritionistClearPendingView.as_view(), name="portal-nutritionist-clear-pending"),
@@ -480,7 +512,16 @@ urlpatterns = [
     path("po-blockers/fix/", POBlockersFixView.as_view(), name="portal-po-blockers-fix"),
 
     # Settings > Import: manual Unite Us CSV upload + run history
-    path("settings/imports/", ImportRunsView.as_view(), name="portal-import-runs"),
+    path(
+        "settings/pause-reasons/",
+        PauseReasonListView.as_view(), name="portal-pause-reasons",
+    ),
+    path(
+        "settings/hold-reasons/",
+        HoldReasonListView.as_view(), name="portal-hold-reasons",
+    ),
+    path(
+        "settings/imports/", ImportRunsView.as_view(), name="portal-import-runs"),
     path("settings/imports/upload/", ImportUploadView.as_view(), name="portal-import-upload"),
     # Async S3 flow: presign -> browser PUTs to S3 -> start (enqueue) -> poll detail
     path("settings/imports/presign/", ImportPresignView.as_view(), name="portal-import-presign"),

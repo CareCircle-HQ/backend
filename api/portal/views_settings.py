@@ -26,10 +26,22 @@ from ..models import (
     MenuTypeTag,
     ProductType,
     ProgramMainCategory,
+    ProgramParentKind,
 )
 from .base import PortalAPIView, current_agent
 
 logger = logging.getLogger(__name__)
+
+# Service types that still exist on the model but must not be offered to an agent.
+# See the note where service_types is built.
+RETIRED_SERVICE_TYPES = {
+    # Our own name for what Unite Us calls "Produce Prescription/Voucher".
+    "food_prescriptions",
+    # A distinction the case data does not make: every case on a Clinically
+    # Appropriate Meals programme is filed as "Medically Tailored Meals". The
+    # programmes keep their names; migration 0297 moved their service type.
+    "clinically_appropriate_meals",
+}
 from .permissions import IsPortalAgent
 from . import serializers as s
 
@@ -372,7 +384,8 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
     and ``case_type`` (Food/Transportation). ``is_for_household`` is auto-derived
     from the name on save. Full list (no pagination for client-side search) with
     optional ``?search=`` (program name), ``?category=`` (case_category),
-    ``?case_type=food|transportation`` and ``?service_type=<code>|none``.
+    ``?case_type=food|transportation``, ``?service_type=<code>|none`` and
+    ``?parent_program=meals|boxes|none`` and ``?is_active=true|false``.
     """
 
     permission_classes = [IsPortalAgent]
@@ -399,6 +412,22 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
             qs = qs.filter(service_type="")
         elif service_type in ActiveProgram.ServiceType.values:
             qs = qs.filter(service_type=service_type)
+        # Parent program: meals, boxes, or "none" for the ones with no product --
+        # which is the filter that matters most here, since "which programmes have
+        # I not classified yet?" is the question the column was added to answer.
+        parent = (params.get("parent_program") or "").strip().lower()
+        if parent == "none":
+            qs = qs.filter(parent_program="")
+        elif parent in ProgramParentKind.values:
+            qs = qs.filter(parent_program=parent)
+        # Active: the programmes we offer. NOT applied by default -- 209 of the 324
+        # are inactive, and silently hiding two thirds of the table would leave an
+        # agent unable to find a programme they know exists.
+        active = (params.get("is_active") or "").strip().lower()
+        if active in ("1", "true", "yes"):
+            qs = qs.filter(is_active=True)
+        elif active in ("0", "false", "no"):
+            qs = qs.filter(is_active=False)
         return qs
 
     def list(self, request, *args, **kwargs):
@@ -422,9 +451,18 @@ class ActiveProgramViewSet(viewsets.ModelViewSet):
                 ],
                 # Service the program delivers; blank ("—") is a valid choice for
                 # programs that aren't one of the services we deliver.
+                #
+                # RETIRED values are hidden from the dropdown but remain valid on
+                # the model: "Food Prescriptions (Voucher / Boxes)" was our own
+                # name for what Unite Us calls "Produce Prescription/Voucher", no
+                # case has ever used it, and migration 0292 moved every programme
+                # off it. Deleting the choice would break historical migrations
+                # and orphan any row another environment still holds -- so it
+                # simply stops being offerable.
                 "service_types": [
                     {"value": v, "label": label}
                     for v, label in ActiveProgram.ServiceType.choices
+                    if v not in RETIRED_SERVICE_TYPES
                 ],
                 "results": data,
             }
@@ -528,7 +566,18 @@ class VendorViewSet(viewsets.ModelViewSet):
         # person); otherwise one is generated. Either way it is stored hashed and
         # returned ONCE -- there is no path that reads it back, and a lost password
         # is replaced by a reset rather than looked up.
-        supplied = (request.data.get("password") or "").strip()
+        # A password is OPAQUE: whatever the agent typed or pasted is what the
+        # vendor will type back. Stripping it here while the login endpoint does not
+        # made a password with a leading or trailing space impossible to use -- it
+        # was stored without the space and rejected with it, which is why the first
+        # real vendor admin could not log in.
+        #
+        # But a WHITESPACE-ONLY value still means "generate one for me", which is
+        # the documented behaviour and has its own test. So the value is used
+        # verbatim unless it is blank once trimmed -- trimming DECIDES, it never
+        # alters what gets stored.
+        _raw = request.data.get("password") or ""
+        supplied = _raw if _raw.strip() else ""
         if supplied and len(supplied) < 8:
             return Response(
                 {"error": "Password must be at least 8 characters."},
@@ -669,7 +718,18 @@ class VendorViewSet(viewsets.ModelViewSet):
         from django.contrib.auth.hashers import make_password
         from django.utils.crypto import get_random_string
 
-        supplied = (request.data.get("password") or "").strip()
+        # A password is OPAQUE: whatever the agent typed or pasted is what the
+        # vendor will type back. Stripping it here while the login endpoint does not
+        # made a password with a leading or trailing space impossible to use -- it
+        # was stored without the space and rejected with it, which is why the first
+        # real vendor admin could not log in.
+        #
+        # But a WHITESPACE-ONLY value still means "generate one for me", which is
+        # the documented behaviour and has its own test. So the value is used
+        # verbatim unless it is blank once trimmed -- trimming DECIDES, it never
+        # alters what gets stored.
+        _raw = request.data.get("password") or ""
+        supplied = _raw if _raw.strip() else ""
         if supplied and len(supplied) < 8:
             return Response(
                 {"error": "Password must be at least 8 characters."},
@@ -792,3 +852,62 @@ class BillableItemViewSet(viewsets.ModelViewSet):
             "admin_fee_percent": str(settings_row.admin_fee_percent),
             "updated_at": settings_row.updated_at,
         })
+
+
+class PauseReasonListView(PortalAPIView):
+    """GET: the pause reasons an agent may choose.
+
+    ``?all=1`` includes the SYSTEM-owned ones (Out of Orbit, Out of Range,
+    Nutritionist Paused, Case Type Switch, Insurance expired or invalid) for a
+    filter dropdown, which must be able to name a reason it cannot set. The default
+    excludes them: an agent choosing "Out of Range" by hand would assert something
+    the ZIP check has not found, and each has its own specific remedy.
+
+    Inactive reasons are always excluded -- retiring one stops it being offered
+    without disturbing the pauses that already cite it.
+    """
+
+    def get(self, request):
+        from ..models import PauseReason
+
+        qs = PauseReason.objects.filter(is_active=True)
+        if (request.query_params.get("all") or "").lower() not in ("1", "true", "yes"):
+            qs = qs.filter(is_system=False)
+        return Response([
+            {
+                "code": r.code,
+                "label": r.label,
+                "is_system": r.is_system,
+            }
+            for r in qs
+        ])
+
+
+class HoldReasonListView(PortalAPIView):
+    """GET: the on-hold reasons an agent may choose.
+
+    ``?all=1`` includes the SYSTEM-owned ones for a filter dropdown, which must be
+    able to name a reason it cannot set. The default excludes them: choosing
+    "Governing Case Denied" by hand would assert something the case data has not
+    said, and each has its own remedy.
+
+    ``resume_policy`` and ``resume_detail`` ride along so the UI can tell an agent
+    what will lift the hold -- or that nothing will.
+    """
+
+    def get(self, request):
+        from ..models import HoldReason
+
+        qs = HoldReason.objects.filter(is_active=True)
+        if (request.query_params.get("all") or "").lower() not in ("1", "true", "yes"):
+            qs = qs.filter(is_system=False)
+        return Response([
+            {
+                "code": r.code,
+                "label": r.label,
+                "resume_policy": r.resume_policy,
+                "resume_detail": r.resume_detail,
+                "is_system": r.is_system,
+            }
+            for r in qs
+        ])

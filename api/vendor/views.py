@@ -238,6 +238,7 @@ class VendorWorkListView(VendorAPIView):
             .prefetch_related("availability_windows", "visits", "line_items")
         )
 
+
         # ?status=confirmed&status=submitted -- repeatable, so the app's filter
         # chips are multi-select without inventing a comma syntax. An unknown
         # value is IGNORED rather than 400: a stale app version sending a status
@@ -263,7 +264,25 @@ class VendorWorkListView(VendorAPIView):
         # that justified it -- then oldest first, because the longest-waiting
         # member should be visited soonest.
         qs = qs.order_by("kind", "created_at")
-        return Response([_order_block(o) for o in qs])
+
+        # WITHHELD, LAST: an order whose dwelling is outside our service area is not
+        # sent, however it got created. A vendor cannot service an address we do not
+        # cover, and the trip is billable whether or not the visit was possible.
+        #
+        # Applied here rather than at creation, because the address can be CORRECTED
+        # afterwards -- a withheld order appears the moment an agent fixes the ZIP,
+        # with no second action needed. And applied after the queryset is complete,
+        # because it returns a list: doing it earlier broke the status filters that
+        # follow.
+        #
+        # In Python, not SQL: the answer depends on the ServiceZipCode whitelist and,
+        # for a work order, on its PARENT's address. An open list is a handful of
+        # rows, which is cheaper than making the rule expressible twice.
+        from ..services import dispatch as dispatch_svc
+
+        return Response([
+            _order_block(o) for o in qs if dispatch_svc.is_dispatchable(o)
+        ])
 
 
 class VendorWorkDetailView(VendorAPIView):
@@ -282,6 +301,20 @@ class VendorWorkDetailView(VendorAPIView):
             .first()
         )
         if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+
+        # A WITHHELD order answers 404 as well, for the same reason the list omits
+        # it: it was never sent. 404 rather than an explanation, because the vendor
+        # is not the person who can fix a service-area problem and the dwelling's
+        # ZIP is not theirs to know. Logged so WE can see what was withheld.
+        from ..services import dispatch as dispatch_svc
+
+        if not dispatch_svc.is_dispatchable(order):
+            logger.info(
+                "withheld order %s from vendor %s: %s",
+                order.pk, request.user.vendor_id,
+                dispatch_svc.not_dispatchable_reason(order),
+            )
             return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
 
         payload = _order_block(order)
@@ -500,7 +533,10 @@ class VendorTeamListView(VendorAdminAPIView):
                 http.HTTP_409_CONFLICT,
             )
 
-        supplied = (data.get("password") or "").strip()
+        # Opaque, but blank-after-trim still means "generate one" -- see the note
+        # in portal/views_settings.py admin_user.
+        _raw = data.get("password") or ""
+        supplied = _raw if _raw.strip() else ""
         if supplied and len(supplied) < 8:
             return error(
                 "password_too_short", "Password must be at least 8 characters.",
@@ -573,7 +609,10 @@ class VendorTeamDetailView(VendorAdminAPIView):
         if "password" in data:
             from django.contrib.auth.hashers import make_password
 
-            supplied = (data.get("password") or "").strip()
+            # Opaque, but blank-after-trim still means "generate one" -- see the
+            # note in portal/views_settings.py admin_user.
+            _raw = data.get("password") or ""
+            supplied = _raw if _raw.strip() else ""
             if len(supplied) < 8:
                 return error(
                     "password_too_short",
@@ -1270,11 +1309,202 @@ class VendorSubmitAssessmentView(VendorAPIView):
         # vendor_user, not a bare call: the record has to say WHO submitted, and
         # "the assessor who signed it" is the answer.
         dispatch_svc.submit(order, vendor_user=request.user.vendor_user)
+
+        # The three documents, generated AFTER the submission succeeds and wrapped
+        # so a rendering fault cannot undo it. The assessment is the record; the
+        # PDFs are derived from it, and losing a submission because a photograph
+        # would not decode would be the wrong way round.
+        from ..services import dispatch_pdf
+
+        documents = []
+        try:
+            documents = dispatch_pdf.generate_submission_documents(
+                order, vendor_user=request.user.vendor_user,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("submission documents failed for order %s", order.pk)
+
         order.refresh_from_db()
         return Response({
             "state": form.state,
             "submitted_at": form.submitted_at,
             "order_status": order.status,
             "order_status_label": order.get_status_display(),
+            "documents": [
+                {"doc_type": d.doc_type, "filename": d.filename} for d in documents
+            ],
             "already": False,
         }, status=http.HTTP_201_CREATED)
+
+
+# ── the company's own profile ────────────────────────────────────────────────
+
+def _company_payload(vendor):
+    """The company as its administrator sees it.
+
+    Deliberately omits admin_fee_percent and anything else about what we pay them:
+    those are OUR commercial terms, editable in the CRM, and a vendor reading their
+    own profile has no business seeing the mark-up we add.
+    """
+    from ..services import import_storage
+
+    logo_url = ""
+    if vendor.logo_s3_key:
+        try:
+            # Presigned on read, never stored. A stored URL expires and leaves a
+            # dead link in every PDF generated with it.
+            logo_url = import_storage.presign_get(
+                vendor.logo_s3_key, expires=3600, inline=True,
+            )
+        except Exception:  # noqa: BLE001 - a missing logo must not break the page
+            logger.warning("vendor logo presign failed: %s", vendor.logo_s3_key)
+    return {
+        "name": vendor.name,
+        "address": vendor.address,
+        "contact_phone": vendor.contact_phone,
+        "contact_name": vendor.contact_name,
+        "contact_email": vendor.contact_email,
+        "website": vendor.website,
+        "logo_url": logo_url,
+        "logo_updated_at": vendor.logo_updated_at,
+        "logo_width": vendor.logo_width,
+        "logo_height": vendor.logo_height,
+    }
+
+
+class VendorCompanyView(VendorAdminAPIView):
+    """GET / PATCH /v1/company/ -- the company's address, phone and contact.
+
+    ADMIN ONLY, via VendorAdminAPIView. A staff user can read their assignments but
+    must not be able to change where the company says it is.
+
+    The NAME is read-only here. It is how CareCircle and Unite Us identify the
+    company, it appears on authorizations and invoices already issued, and letting a
+    vendor rename themselves would silently break the match. Renaming stays a CRM
+    action.
+    """
+
+    EDITABLE = ("address", "contact_phone", "contact_name", "contact_email", "website")
+
+    def get(self, request):
+        return Response(_company_payload(request.user.vendor))
+
+    def patch(self, request):
+        vendor = request.user.vendor
+        data = request.data or {}
+        changed = []
+        for field in self.EDITABLE:
+            if field not in data:
+                continue
+            value = (data.get(field) or "").strip()[:255]
+            if getattr(vendor, field) != value:
+                setattr(vendor, field, value)
+                changed.append(field)
+
+        if "name" in data and (data.get("name") or "").strip() != vendor.name:
+            # Reported rather than ignored: silently dropping an edit someone typed
+            # is how they conclude the save is broken.
+            return error(
+                "name_read_only",
+                "The company name is set by CareCircle. Ask us to change it.",
+            )
+
+        if changed:
+            vendor.save(update_fields=[*changed, "updated_at"])
+            logger.info(
+                "vendor company updated: %s fields=%s by=%s",
+                vendor.name, changed, request.user.vendor_user.email,
+            )
+        return Response({**_company_payload(vendor), "changed_fields": changed})
+
+
+class VendorLogoView(VendorAdminAPIView):
+    """POST /v1/company/logo/ -- upload the company logo. DELETE removes it.
+
+    Admin only, same reasoning as the profile.
+    """
+
+    parser_classes = [MultiPartParser, FormParser]
+    # A ceiling on the UPLOAD, low on purpose -- what gets stored is normalised to
+    # about 600px regardless, so a 12 MP original is bytes nobody will ever see.
+    MAX_BYTES = 4 * 1024 * 1024
+    # Accepted as INPUT. All three are converted to PNG before storage, because
+    # that is what embeds reliably in a PDF -- see services/logo_image.py.
+    ALLOWED = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+
+    def post(self, request):
+        import hashlib
+
+        from ..services import import_storage
+
+        upload = request.FILES.get("file") or request.FILES.get("logo")
+        if upload is None:
+            return error("no_file", "Attach an image as 'file'.")
+        if upload.size > self.MAX_BYTES:
+            return error("too_large", "The logo must be under 4 MB.")
+        content_type = (upload.content_type or "").lower()
+        if content_type not in self.ALLOWED:
+            # Named explicitly: "invalid file" leaves someone guessing whether the
+            # problem is the size, the format or the name.
+            return error(
+                "bad_type", "The logo must be a PNG, JPEG or WebP image.",
+            )
+
+        from ..services import logo_image
+
+        vendor = request.user.vendor
+        raw = upload.read()
+
+        # NORMALISED BEFORE STORING, not on the way out. A logo is embedded in
+        # invoices and quotes, so it is processed once here rather than on every
+        # document -- and what is stored is then exactly what prints, which makes
+        # "why does it look wrong on the PDF?" answerable by looking at one file.
+        try:
+            png, info = logo_image.optimise(raw)
+        except logo_image.LogoError as exc:
+            return error("bad_image", str(exc))
+
+        digest = hashlib.sha256(png).hexdigest()
+        # The key names the PROCESSED bytes, so re-uploading the same artwork is
+        # idempotent even if it arrived as a JPEG one time and a PNG the next.
+        key = import_storage.build_key(f"vendor-logos/{vendor.pk}/{digest[:16]}.png")
+        import_storage.upload_bytes(key, png, content_type="image/png")
+
+        vendor.logo_s3_key = key
+        vendor.logo_updated_at = timezone.now()
+        vendor.logo_width = info["width"]
+        vendor.logo_height = info["height"]
+        vendor.save(update_fields=[
+            "logo_s3_key", "logo_updated_at", "logo_width", "logo_height",
+            "updated_at",
+        ])
+        logger.info(
+            "vendor logo uploaded: %s %sx%s by=%s", vendor.name,
+            info["width"], info["height"], request.user.vendor_user.email,
+        )
+        return Response(
+            {
+                **_company_payload(vendor),
+                # Surfaced rather than logged: only the admin can fix a logo that
+                # is too small to print well, and they will never read our logs.
+                "warning": info["warning"],
+            },
+            status=http.HTTP_201_CREATED,
+        )
+
+    def delete(self, request):
+        vendor = request.user.vendor
+        if not vendor.logo_s3_key:
+            return Response(_company_payload(vendor))
+        # The KEY is cleared; the object is left in S3. A logo that appears on
+        # already-issued documents must not vanish from them because someone
+        # changed the current one.
+        vendor.logo_s3_key = ""
+        vendor.logo_updated_at = None
+        vendor.logo_width = None
+        vendor.logo_height = None
+        vendor.save(update_fields=[
+            "logo_s3_key", "logo_updated_at", "logo_width", "logo_height",
+            "updated_at",
+        ])
+        return Response(_company_payload(vendor))

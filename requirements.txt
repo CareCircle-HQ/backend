@@ -43,3 +43,7 @@ redis>=5.0,<6.0
 
 # PDF generation (Nutritionist signed review documents).
 reportlab>=4.0,<5.0
+# Used directly by services/logo_image.py to normalise vendor logos for PDFs.
+# It arrives with reportlab anyway, but an undeclared dependency is one that
+# disappears the day reportlab stops needing it.
+Pillow>=10.0,<14.0

@@ -122,6 +122,12 @@ def _serialize_order(order):
         # table means we no longer serve there, and an order holding its old answer
         # would send a vendor somewhere we cannot bill for.
         "service_area": service_area.order_service_area(order),
+        # WHY THE VENDOR CANNOT SEE THIS ORDER, when they cannot. The vendor API
+        # withholds an out-of-area order, so without this the CRM would show it
+        # sitting in Pending Schedule with no hint that nothing was ever sent --
+        # which is exactly how an out-of-range assessment reached a vendor
+        # unnoticed in the first place.
+        "withheld_reason": dispatch_svc.not_dispatchable_reason(order),
         # The ITEMS. On an assessment these are every item found; on a work order,
         # the ones that work order covers. An item is not a status -- it is a thing
         # to install -- so it carries its case's AUTHORIZATION rather than a
@@ -135,6 +141,17 @@ def _serialize_order(order):
         ],
         "service_address": order.service_address,
         "address_notes": order.address_notes,
+        # The address in PARTS as well as formatted, so the Details tab can EDIT it.
+        # service_address is a display string; you cannot put it back into an
+        # autocomplete field and get the same components out.
+        "address": {
+            "street": order.address_line1,
+            "unit": order.address_line2,
+            "city": order.address_city,
+            "state": order.address_state,
+            "zip": order.address_zip,
+            "notes": order.address_notes,
+        },
         "contact_phone": order.contact_phone,
         "contact_phone_type": order.contact_phone_type,
         "contact_email": order.contact_email,
@@ -974,3 +991,169 @@ def pricing_admin_fee(amount, percent):
     from ..services import pricing
 
     return pricing.admin_fee(amount, percent)
+
+
+def _view_and_download_urls(key, filename, *, content_type=""):
+    """``(view_url, download_url)`` for a stored object, or ``("", "")``.
+
+    Two urls because the intent differs: View opens it in the browser to look at,
+    Download saves it under a readable filename rather than the hash the S3 key
+    uses.
+
+    ``download_name`` is passed for BOTH -- presign_get only sets a
+    Content-Disposition when it has a filename, so ``inline=True`` on its own is
+    silently a no-op.
+    """
+    from ..services import import_storage
+
+    try:
+        return (
+            import_storage.presign_get(
+                key, expires=900, inline=True, download_name=filename,
+                content_type=content_type,
+            ),
+            import_storage.presign_get(key, expires=900, download_name=filename),
+        )
+    except Exception:  # noqa: BLE001 - one bad key must not hide the whole list
+        logger.warning("presign failed: %s", key)
+        return "", ""
+
+
+class MemberDispatchDocumentsView(PortalAPIView):
+    """GET: the documents on a member's housing orders, newest first.
+
+    Each carries a PRESIGNED url for viewing and a separate one for download. Two
+    urls rather than one because the Content-Disposition differs: a PDF an agent
+    wants to read should open in the browser, and one they want to keep should
+    save with a sensible filename rather than a hash.
+    """
+
+    def get(self, request, client_id):
+        from ..models import DispatchDocument
+        from ..services import import_storage
+        from ..services.dispatch_pdf import DOC_LABELS
+
+        client = get_object_or_404(Client, pk=client_id)
+        docs = (
+            DispatchDocument.objects
+            .filter(dispatch_order__client=client)
+            .select_related("dispatch_order", "uploaded_by_vendor_user")
+            .order_by("-created_at")
+        )
+
+        out = []
+        for doc in docs:
+            view_url = download_url = ""
+            try:
+                # download_name is required for `inline` to do anything:
+                # presign_get only sets a Content-Disposition when it has a
+                # filename, so inline=True alone was silently a no-op.
+                view_url = import_storage.presign_get(
+                    doc.s3_key, expires=900, inline=True,
+                    download_name=doc.filename, content_type="application/pdf",
+                )
+                download_url = import_storage.presign_get(
+                    doc.s3_key, expires=900, download_name=doc.filename,
+                )
+            except Exception:  # noqa: BLE001 - one bad key must not hide the list
+                logger.warning("document presign failed: %s", doc.s3_key)
+            out.append({
+                "id": doc.pk,
+                "doc_type": doc.doc_type,
+                # The stored doc_type is a stable key, not a display string, so the
+                # label is resolved here rather than in the UI.
+                "label": DOC_LABELS.get(doc.doc_type) or doc.doc_type or "Document",
+                "filename": doc.filename,
+                "created_at": doc.created_at,
+                "order_id": str(doc.dispatch_order_id),
+                "order_kind": doc.dispatch_order.kind,
+                "uploaded_by": (
+                    doc.uploaded_by_vendor_user.name
+                    if doc.uploaded_by_vendor_user_id else ""
+                ),
+                "view_url": view_url,
+                "download_url": download_url,
+            })
+        return Response({"documents": out})
+
+
+class MemberDispatchPhotosView(PortalAPIView):
+    """GET: the photographs a vendor took on a member's housing orders.
+
+    Same shape and same two urls as the documents list, so the Evidence tab can
+    present them identically -- an agent should not have to learn two idioms for
+    "look at the thing the vendor sent us".
+
+    Each photo is labelled with the QUESTION GROUP it evidences ("Bathroom",
+    "Temperature Control"), resolved from the form's frozen snapshot rather than
+    the live template: the label should say what the assessor was answering when
+    they took it.
+    """
+
+    def get(self, request, client_id):
+        from ..models import DispatchProof
+        from ..services.assessment_forms import CATEGORY_LABELS
+
+        client = get_object_or_404(Client, pk=client_id)
+        proofs = (
+            DispatchProof.objects
+            .filter(dispatch_order__client=client)
+            .select_related("dispatch_order", "dispatch_order__questionnaire")
+            .order_by("-received_at")
+        )
+
+        out = []
+        for proof in proofs:
+            filename = (proof.s3_key or "").rsplit("/", 1)[-1] or "photo"
+            view_url, download_url = _view_and_download_urls(proof.s3_key, filename)
+            form = getattr(proof.dispatch_order, "questionnaire", None)
+            labels = _photo_group_labels(form)
+            out.append({
+                "id": proof.pk,
+                "group": proof.intervention_group,
+                # Falls back to the product-category label, then to "Dwelling":
+                # a general photo has no group, and "" would render as a blank row
+                # that looks like a fault.
+                "label": (
+                    labels.get(proof.intervention_group)
+                    or CATEGORY_LABELS.get(proof.intervention_group)
+                    or "Dwelling"
+                ),
+                "caption": proof.caption,
+                "filename": filename,
+                "captured_at": proof.captured_at,
+                "received_at": proof.received_at,
+                "order_id": str(proof.dispatch_order_id),
+                "view_url": view_url,
+                "download_url": download_url,
+            })
+        return Response({"photos": out})
+
+
+def _photo_group_labels(form):
+    """Question-group code -> its heading, from the form's FROZEN snapshot."""
+    if form is None:
+        return {}
+    out = {}
+    for section in (form.schema() or {}).get("sections", []):
+        for group in section["groups"]:
+            out[group["code"]] = group.get("label") or section["title"]
+    return out
+
+
+class MemberServiceTrackerView(PortalAPIView):
+    """GET: what has been done for this member and what still needs doing.
+
+    A read-only view of the business rules -- see services/service_tracker.py.
+    Nothing here opens a case: a To-Do names the programme and the agent opens it
+    in Unite Us, exactly as the Cases to Open tab works.
+    """
+
+    def get(self, request, client_id):
+        from ..services.service_tracker import tracker_for
+
+        client = get_object_or_404(
+            Client.objects.prefetch_related("screenings", "assessments", "cases"),
+            pk=client_id,
+        )
+        return Response(tracker_for(client))

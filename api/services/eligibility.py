@@ -33,6 +33,10 @@ from dataclasses import dataclass, field
 
 from django.utils import timezone
 
+import logging
+
+_log = logging.getLogger(__name__)
+
 from api.models import AddressType, ClientStage, InsurancePlanType
 
 # Coverage end-date sentinel: year 9999 means "never expires".
@@ -240,6 +244,22 @@ def _stop_future_deliveries(client, *, to_hold=True, note=_INELIGIBLE_HOLD_NOTE,
     else:
         trigger = "eligibility.hold"
 
+    # THE HOLD CATEGORY.
+    #
+    # ⚠ The ineligible note covers FOUR different gates -- expired insurance, missing
+    # insurance, an unserved Medicaid plan type and an out-of-coverage ZIP -- so the
+    # note cannot tell them apart and the client's STORED reasons have to.
+    # reason_for_ineligibility does that split; on the clone it separates 16,898
+    # Medicaid-type from 3,622 insurance and 3,122 ZIP.
+    from api.services import hold_reasons as _hr
+
+    if note.startswith(_COVERAGE_HOLD_NOTE):
+        hold_reason = _hr.SOCIAL_COVERAGE_INVALID
+    elif note.startswith(_INELIGIBLE_HOLD_NOTE):
+        hold_reason = _hr.reason_for_ineligibility(client)
+    else:
+        hold_reason = _hr.UNCATEGORIZED
+
     paused = []
     for enr in _governing_enrollments(client):
         try:
@@ -254,6 +274,7 @@ def _stop_future_deliveries(client, *, to_hold=True, note=_INELIGIBLE_HOLD_NOTE,
             try:
                 advance_enrollment(
                     enr, EnrollmentStage.ON_HOLD, actor=actor, note=note,
+                    hold_reason=hold_reason,
                     trigger=trigger,
                 )
                 paused.append(enr)
@@ -389,11 +410,35 @@ def _pause_members_for_eligibility(client, reasons, *, kind, actor, author, toda
         if newly:
             mv.status = MemberStatus.PAUSED
             mv.eligibility_paused = True
+            # WHICH gate failed. Insurance is the only one of the four that maps to a
+            # catalogue reason: an out-of-range ZIP has its own (set on the
+            # verification and address paths), and a Medicaid-type or missing-coverage
+            # failure has none yet -- so those fall back to Uncategorized rather than
+            # being mislabelled as an insurance problem.
+            #
+            # overwrite=False because this reconcile runs on EVERY import: a
+            # re-import must not relabel a pause an agent has already explained.
+            from api.services.pause_reasons import (
+                INSURANCE_INVALID, UNCATEGORIZED, set_pause_reason,
+            )
+
+            set_pause_reason(
+                mv,
+                INSURANCE_INVALID
+                if any("insurance" in r.lower() for r in (reasons or []))
+                else UNCATEGORIZED,
+                save=False, overwrite=False,
+            )
             mv.kitchen_meal_type = ""
             mv.kitchen_food_notes = ""
             mv.save(update_fields=[
+                # pause_reason is in this list because set_pause_reason above is
+                # called with save=False -- omit it and the reason is silently
+                # dropped, which is the quietest possible way for this feature to
+                # not work.
                 "status", "eligibility_paused", "kitchen_meal_type",
-                "kitchen_food_notes", "status_changed_at", "updated_at",
+                "kitchen_food_notes", "pause_reason", "status_changed_at",
+                "updated_at",
             ])
         # Paused members are excluded from the schedule; resync drops their future
         # (non-batched) occurrences so they leave the next Purchase Order.
@@ -476,8 +521,12 @@ def _unpause_members_for_eligibility(client, *, actor, author, today_str):
         enr = mv.enrollment
         mv.status = MemberStatus.ACTIVE
         mv.eligibility_paused = False
+        # Cleared on the way back in: a reason left on an ACTIVE member reads as a
+        # current problem, and the Members page filters on this field.
+        mv.pause_reason = None
         mv.save(update_fields=[
-            "status", "eligibility_paused", "status_changed_at", "updated_at",
+            "status", "eligibility_paused", "pause_reason", "status_changed_at",
+            "updated_at",
         ])
         # Resume the program first (if it was held because everyone was paused),
         # then rebuild this member's plan + calendar so they rejoin the next PO.
@@ -602,6 +651,27 @@ def reconcile_client_eligibility(client, *, actor=None, actor_label="", source=N
         _unpause_members_for_eligibility(
             client, actor=actor, author=author, today_str=today_str,
         )
+
+    # INTERNAL-SERVICE RULES: hold the programme when the GOVERNING case is not
+    # supported by the member's LATEST eligibility assessment -- no ECM at all, or
+    # a meals case where only a produce prescription is allowed.
+    #
+    # Last, and only after the hard gates have had their say: an already-ineligible
+    # member is off-ramped above and does not need a second, quieter hold for the
+    # same underlying problem.
+    #
+    # It only ever HOLDS. No auto-resume yet, by decision -- a held programme waits
+    # for an agent.
+    try:
+        from api.services.internal_service_rules import (
+            apply_internal_service_rules,
+        )
+
+        apply_internal_service_rules(
+            client, actor=actor, actor_label=actor_label, source=src,
+        )
+    except Exception:  # pragma: no cover - never break an import over this
+        _log.exception('internal-service rules failed for client %s', client.pk)
 
     return client.lifecycle_stage
 

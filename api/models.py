@@ -1037,6 +1037,25 @@ class ProductTypeKind(models.TextChoices):
     BOXES = "boxes", "Boxes"
 
 
+class ProgramParentKind(models.TextChoices):
+    """The parent program a service belongs to -- what it ultimately delivers.
+
+    SEPARATE FROM ProductTypeKind, which this field originally reused. That was
+    right while the only answers were meals and boxes, but ProductTypeKind drives
+    FOOD DELIVERY: reports, the logistics dashboard and order handling all branch
+    on ``== ProductTypeKind.BOXES``. Adding "Home Remediation" there would push a
+    housing concept into code that packs and delivers food.
+
+    The meals and boxes VALUES are deliberately identical to ProductTypeKind's, so
+    existing rows needed no data migration and anything comparing the two strings
+    still agrees.
+    """
+
+    MEALS = "meals", "Meals"
+    BOXES = "boxes", "Boxes"
+    HOME_REMEDIATION = "home_remediation", "Home Remediation"
+
+
 class DeliveryCadence(models.TextChoices):
     """How often a product type is delivered each week."""
 
@@ -2094,6 +2113,19 @@ SERVICE_EXCLUDED_MEMBER_STATUSES = (
 # genuine pause / off-ramp (NOT the pre-kitchen PENDING, which is still active in
 # the pipeline). Used to decide when the LAST real member has been paused so the
 # whole household should be held.
+# The statuses that count as a PAUSE for paused_at / resumed_at.
+#
+# ⚠ NARROWER than MEMBER_PAUSED_STATUSES, which also contains INACTIVE. Inactive is a
+# terminal end state -- "their service ended" -- not a pause anybody resumes from, and
+# including it would stamp paused_at on 1,353 members the Paused tab does not even
+# list. Same call the tab and the backfill make.
+MEMBER_PAUSE_TIMESTAMP_STATUSES = (
+    MemberStatus.OUT_OF_ORBIT,
+    MemberStatus.OUT_OF_RANGE,
+    MemberStatus.PAUSED,
+    MemberStatus.NUTRITIONIST_PAUSED,
+)
+
 MEMBER_PAUSED_STATUSES = (
     MemberStatus.OUT_OF_ORBIT,
     MemberStatus.OUT_OF_RANGE,
@@ -2327,6 +2359,26 @@ class EnrollmentVerification(models.Model):
     # tracks which cycle the enrollment is on (1 = initial, 2 = first renewal…).
     renewal_number = models.PositiveSmallIntegerField(default=1)
     stage_at = models.DateTimeField(null=True, blank=True)
+    # WHY this programme is On Hold, when it is. Set by whichever check or agent
+    # placed the hold, and CLEARED on resume -- a reason left on a serving
+    # enrollment reads as a current problem.
+    #
+    # Only meaningful while stage == ON_HOLD. Kept on the enrollment rather than
+    # derived from the latest StageEvent note because the Program tab, the Members
+    # page and any future hold queue all need to FILTER on it, and parsing 443
+    # distinct note strings is how this was unanswerable in the first place.
+    hold_reason = models.ForeignKey(
+        "HoldReason", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enrollments",
+    )
+    # WHEN the programme was held, and when it came back. Stamped in
+    # advance_enrollment, the single place a stage transition is written.
+    #
+    # held_at survives the resume, so "held on the 3rd, resumed on the 11th" is
+    # answerable. Current cycle only -- the full history is in the StageEvents,
+    # which each carry their own hold_reason.
+    held_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    hold_resumed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     opened_at = models.DateTimeField(auto_now_add=True)
     # The agent who REQUESTED the verification -- i.e. submitted the E-Form that
     # created this enrollment (opened_at is the request time). Set on creation
@@ -2448,6 +2500,97 @@ def default_member_conditions():
     return ["No Restriction"]
 
 
+class HoldResumePolicy(models.TextChoices):
+    """What it takes to come OFF a hold. Descriptive, not behaviour.
+
+    Recorded on the reason so the catalogue carries the decision -- an agent looking
+    at a held household can see whether to wait, act, or that nothing will clear it.
+    No code acts on this yet; the auto-resume rules are a separate piece.
+    """
+
+    NONE = "none", "No resume — an agent must close or re-open the case"
+    AUTO = "auto", "Resumes automatically when the situation changes"
+    MANUAL = "manual", "An agent resumes when ready"
+
+
+class HoldReason(models.Model):
+    """WHY a household's programme is On Hold -- a catalogue, not free text.
+
+    The same problem PauseReason solved for members, one level up: 7,379 holds across
+    443 distinct notes, of which 1,961 are agent free text with 1,556 distinct
+    reasons. "How many households are held pending case closure?" could not be asked.
+
+    ``is_system`` marks the reasons a CHECK sets -- a denied case, a closed case, an
+    expired insurance, an out-of-coverage ZIP. They are hidden from the agent's
+    picker: choosing "Governing Case Denied" by hand would assert something the case
+    data has not said.
+    """
+
+    hold_reason_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False,
+    )
+    code = models.CharField(max_length=40, unique=True)
+    label = models.CharField(max_length=80)
+    # What clears it. See HoldResumePolicy -- descriptive only.
+    resume_policy = models.CharField(
+        max_length=10, choices=HoldResumePolicy.choices,
+        default=HoldResumePolicy.NONE,
+    )
+    # What clears it, in words an agent reads. The policy says "auto"; this says
+    # "when a new governing case is saved", which is the useful half.
+    resume_detail = models.CharField(max_length=200, blank=True)
+    is_system = models.BooleanField(default=False)
+    # Retired reasons stop being offered but still render on the holds citing them.
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sort_order", "label"]
+
+    def __str__(self):
+        return self.label
+
+
+class PauseReason(models.Model):
+    """WHY a member is not being served -- a catalogue, not free text.
+
+    Replaces a free-text box that produced 200 DISTINCT STRINGS across 1,341
+    pauses, of which one bulk campaign ("9/1 HH Close") was 937 and one entry was a
+    pasted UUID. Nothing could be counted, filtered or acted on.
+
+    A TABLE rather than TextChoices because agents add and retire reasons without a
+    deploy -- the same call Settings > Tags makes. ``code`` is the stable key the
+    code refers to; ``label`` is what an agent sees and may be renamed freely.
+
+    ``is_system`` marks the reasons only the SYSTEM sets (Out of Orbit, Out of
+    Range, Nutritionist Paused, Case Type Switch, Insurance expired or invalid).
+    They are hidden from the agent's picker: an agent choosing "Out of Range" by
+    hand would assert something the ZIP check has not found, and the remedy for
+    each is specific.
+    """
+
+    pause_reason_id = models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False,
+    )
+    code = models.CharField(max_length=40, unique=True)
+    label = models.CharField(max_length=80)
+    # Reasons the SYSTEM owns -- not offered in the agent picker.
+    is_system = models.BooleanField(default=False)
+    # Hidden from selection but kept on historical rows, the same treatment
+    # ActiveProgram.is_active gives a retired programme: a pause that cites a
+    # retired reason must still render rather than go blank.
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sort_order", "label"]
+
+    def __str__(self):
+        return self.label
+
+
 class MemberDietaryProfile(models.Model):
     """Per-household-member dietary profile captured during the household
     verification (wizard Step 2).
@@ -2539,12 +2682,35 @@ class MemberDietaryProfile(models.Model):
     # Distinct from ``updated_at`` (any edit); stamped in ``save()`` only when the
     # status value actually flips, so the UI can show "Paused/Out of Orbit since".
     status_changed_at = models.DateTimeField(null=True, blank=True)
+    # WHEN the member was paused, and when they came back. Stamped by save() off the
+    # status transition, so every pause path gets them without eleven call sites
+    # having to remember -- which is exactly how pause_reason was silently dropped
+    # in two places earlier.
+    #
+    # Both are kept after the fact: paused_at survives the resume, so "paused on the
+    # 3rd, resumed on the 11th" is answerable. They are the CURRENT cycle only -- the
+    # full history lives in the notes and the status timeline.
+    paused_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    resumed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Set True when a governing-case Household->Individual switch auto-pauses this
     # (additional) member: the member is PINNED so an agent cannot un-pause them
     # from the Program tab. Cleared ONLY when Customer Service dismisses the
     # matching CaseMismatchFlag (never auto-cleared on a switch back to
     # household). See api.services.lifecycle governing-case switch handling.
     pause_locked = models.BooleanField(default=False)
+    # WHY this member is not being served. Set for every pause, whoever caused it:
+    # an agent picking from the Program tab, the import eligibility gate, a
+    # case-type switch, the Nutritionist, or an Out of Orbit / Out of Range check.
+    #
+    # NOT redundant with `status`. Out of Orbit and Out of Range are statuses AND
+    # reasons, but PAUSED is 1,513 members with a dozen different causes -- and one
+    # field that always answers "why is this member not being served?" is worth more
+    # than a status an agent has to interpret. SET_NULL so retiring a reason cannot
+    # delete a member's profile.
+    pause_reason = models.ForeignKey(
+        "PauseReason", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="member_profiles",
+    )
     # The status this member held BEFORE an agent paused them, so an unpause puts
     # them back where they were. Without it, unpause re-runs the meal rule and
     # lands everyone on ACTIVE -- which would make pause+unpause a way to
@@ -2593,10 +2759,26 @@ class MemberDietaryProfile(models.Model):
         loaded = getattr(self, "_loaded_status", None)
         changed = self._state.adding or loaded is None or loaded != self.status
         if changed:
-            self.status_changed_at = timezone.now()
+            now = timezone.now()
+            self.status_changed_at = now
+            extra = ["status_changed_at"]
+            # INTO a pause, or OUT of one. Read from the loaded status, so a save
+            # that does not move the member in or out of a pause leaves both alone.
+            was_paused = loaded in MEMBER_PAUSE_TIMESTAMP_STATUSES
+            now_paused = self.status in MEMBER_PAUSE_TIMESTAMP_STATUSES
+            if now_paused and not was_paused:
+                self.paused_at = now
+                # Cleared, so a member paused again does not look resumed.
+                self.resumed_at = None
+                extra += ["paused_at", "resumed_at"]
+            elif was_paused and not now_paused:
+                self.resumed_at = now
+                extra += ["resumed_at"]
             update_fields = kwargs.get("update_fields")
-            if update_fields is not None and "status_changed_at" not in update_fields:
-                kwargs["update_fields"] = list(update_fields) + ["status_changed_at"]
+            if update_fields is not None:
+                missing = [f for f in extra if f not in update_fields]
+                if missing:
+                    kwargs["update_fields"] = list(update_fields) + missing
         super().save(*args, **kwargs)
         self._loaded_status = self.status
 
@@ -2932,6 +3114,15 @@ class StageEvent(models.Model):
         related_name="stage_events",
     )
     note = models.TextField(blank=True)
+    # The hold CATEGORY for a "to On Hold" event. Stamped here as well as on the
+    # enrollment because the enrollment only carries the CURRENT reason -- a
+    # household held in July, resumed, and held again in September would otherwise
+    # lose why July happened, and 443 distinct note strings is what made that
+    # unanswerable. NULL on every other kind of transition.
+    hold_reason = models.ForeignKey(
+        "HoldReason", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="stage_events",
+    )
     metadata = models.JSONField(default=dict, blank=True)
     entered_at = models.DateTimeField(auto_now_add=True)
 
@@ -3280,6 +3471,13 @@ class ActiveProgram(models.Model):
         FOOD_PRESCRIPTIONS = (
             "food_prescriptions", "Food Prescriptions (Voucher / Boxes)",
         )
+        # Replaces FOOD_PRESCRIPTIONS for the INTERNAL programmes we deliver
+        # ourselves. Both values remain because only the internal rows moved: the
+        # external ones are other providers' programmes, named by Unite Us, and
+        # renaming those would stop them matching what Unite Us sends us.
+        PRODUCE_PRESCRIPTION = (
+            "produce_prescription", "Produce Prescription/Voucher",
+        )
         SOCIAL_SERVICE_CASE_MANAGEMENT = (
             "social_service_case_management", "Social Service Case Management",
         )
@@ -3329,6 +3527,44 @@ class ActiveProgram(models.Model):
         max_length=64, choices=ServiceType.choices, blank=True,
         default="", db_default="",
     )
+
+    # THE PARENT PROGRAM: what this service ultimately delivers -- meals, boxes or
+    # home remediation. See ProgramParentKind for why this is NOT ProductTypeKind,
+    # which it originally reused.
+    #
+    # It exists so a programme can be matched to the eligibility assessment's
+    # result: the assessment says a member is eligible for Medically Tailored Meals
+    # or a Produce Prescription, and this is what connects that answer to the
+    # programmes that can serve it.
+    #
+    # BLANK IS MEANINGFUL and common. Only the programmes we deliver a product for
+    # carry a value: navigation, case management, housing and every external
+    # programme have no parent product, and guessing one would file a housing
+    # assessment under "meals".
+    # 32, not 16: "home_remediation" is exactly 16 and Django refuses a
+    # max_length that cannot hold its own longest choice. Headroom so the next
+    # parent program does not need a schema migration.
+    parent_program = models.CharField(
+        max_length=32, choices=ProgramParentKind.choices, blank=True,
+        default="", db_default="", db_index=True,
+    )
+
+    # IS THIS A PROGRAMME WE ACTUALLY USE?
+    #
+    # The table holds every programme Unite Us knows about -- 324 of them, of which
+    # 162 are other providers'. That is a lot of noise in a dropdown when only
+    # about a third are ours, which is what this flag exists to cut.
+    #
+    # It is a CLASSIFICATION, not a usage statistic. An inactive programme can
+    # still have live cases: External Services took 144 in the last six months, and
+    # SCREENING 357. Inactive means "not one of ours to offer", never "nothing is
+    # happening here" -- so nothing should use this flag to decide whether a case
+    # is real.
+    #
+    # Defaults TRUE: a programme somebody adds by hand is one they intend to use.
+    # Migration 0293 sets it False for the categories outside our three.
+    is_active = models.BooleanField(default=True, db_default=True, db_index=True)
+
     # Opt-in flag (managed from Settings > Programs): this program should be
     # treated as an extension/reauthorization of an existing service. Seeded True
     # for internal-service "Reauthorization: ..." programs by data migration.
@@ -5430,6 +5666,17 @@ class Vendor(models.Model):
     admin_fee_percent = models.DecimalField(
         max_digits=5, decimal_places=2, null=True, blank=True,
     )
+
+    # The company's logo, for their own portal and for the assessment PDFs they
+    # produce. An S3 KEY, not a URL: URLs are presigned and expire, so storing one
+    # would leave a dead link in every document that had been generated with it.
+    logo_s3_key = models.CharField(max_length=500, blank=True)
+    logo_updated_at = models.DateTimeField(null=True, blank=True)
+    # The NORMALISED logo's pixel dimensions, so document layout can reserve the
+    # right box from its aspect ratio without fetching and decoding the image for
+    # every invoice.
+    logo_width = models.PositiveIntegerField(null=True, blank=True)
+    logo_height = models.PositiveIntegerField(null=True, blank=True)
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)

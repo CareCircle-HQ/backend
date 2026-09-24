@@ -34,6 +34,25 @@ def service_zips():
     return {z.zip for z in ServiceZipCode.objects.filter(is_active=True)}
 
 
+def service_boroughs():
+    """Every borough name the ZIP table knows, plus the three the housing
+    programmes use.
+
+    The fallback matters on a fresh database: with no ZIP rows this would otherwise
+    be empty, and a borough decoder that knows no boroughs silently answers "" for
+    everything rather than failing. Mirrors migration 0282, which decoded
+    ActiveProgram.borough against the same list -- so a name parsed here and a
+    borough stored there cannot disagree.
+    """
+    from api.models import ServiceZipCode
+
+    known = {
+        b.strip() for b in
+        ServiceZipCode.objects.values_list("borough", flat=True) if b and b.strip()
+    }
+    return known | {"Brooklyn", "Manhattan", "Queens"}
+
+
 def is_zip_out_of_range(zip_value, *, service=None):
     """True when ``zip_value`` is NOT in the active service-area whitelist.
 

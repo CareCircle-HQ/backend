@@ -466,3 +466,54 @@ def reconcile_dispatch_orders(client):
     except Exception:  # noqa: BLE001 - never fail the import
         logger.exception("reconcile_dispatch_orders failed for client %s", client.pk)
         return []
+
+
+# ── the service-area gate ────────────────────────────────────────────────────
+
+def not_dispatchable_reason(order):
+    """Why this order must NOT be sent to the vendor yet, or "" when it may be.
+
+    Currently one rule, and it is the one that bit: an assessment whose dwelling
+    ZIP is outside the service area was reaching a vendor's work list. A vendor
+    cannot service an address we do not cover, and the trip is billable whether or
+    not the visit was ever possible.
+
+    IT IS NOT A CREATION ERROR. The order has to exist so an agent can CORRECT the
+    address -- editing is allowed while an order is PENDING_SCHEDULE, and refusing
+    to create it would mean re-entering the whole wizard to fix one field. So the
+    order is created and simply withheld until the ZIP is in range.
+
+    Returns a REASON rather than a bool so the CRM can say which address is wrong
+    and the vendor API can log what it withheld.
+    """
+    from . import service_area
+
+    area = service_area.order_service_area(order)
+
+    # WITHHELD ONLY WHEN WE KNOW IT IS OUT OF AREA -- reason "out_of_area". The two
+    # near misses are deliberately NOT withheld:
+    #
+    #   no_zip           we do not know where the dwelling is, which is not the same
+    #                    as knowing we do not cover it. An order can carry a full
+    #                    street address with the ZIP left blank and still be a
+    #                    perfectly serviceable visit. Withholding these broke 14
+    #                    existing vendor tests whose fixtures are ordinary orders
+    #                    with no address -- the rest of the system treats those as
+    #                    valid, and it is right.
+    #   not configured   an empty ServiceZipCode table is inert everywhere else (see
+    #                    is_zip_out_of_range), and a gate that withheld every order
+    #                    on a fresh database would be this bug's twin. Handled
+    #                    upstream: housing_area_check answers in_service_area=True.
+    #
+    # So this says "we cover somewhere, and it is not there".
+    if (area.get("reason") or "") != "out_of_area":
+        return ""
+    zip_code = area.get("zip") or ""
+    return (
+        f"{zip_code} is outside our service area"
+        if zip_code else "the dwelling address is outside our service area"
+    )
+
+
+def is_dispatchable(order):
+    return not not_dispatchable_reason(order)
