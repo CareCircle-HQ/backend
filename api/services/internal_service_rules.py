@@ -94,7 +94,7 @@ def evaluate_governing_case(client):
     so it can back a dry-run command and the tests without side effects.
     """
     from api.portal.serializers import internal_service_case
-    from api.services.service_tracker import _latest_with_services
+    from api.services.service_tracker import latest_eligible_services
     from api.services import hold_reasons as hr
 
     if client is None:
@@ -104,13 +104,20 @@ def evaluate_governing_case(client):
     if governing is None:
         return None
 
-    # Rule 1: the MOST RECENT assessment that lists services, and only that one.
-    latest = _latest_with_services(list(client.assessments.all()))
-    if latest is None:
-        return None                      # no assessment -> no verdict
-    eligible = set(latest.eligible_services or [])
+    # Rule 1: the MOST RECENT assessment date, and only that date. Earlier
+    # assessments remain invalid.
+    #
+    # ⚠ THE UNION ACROSS EVERY ASSESSMENT SHARING THAT DATE, not one row of it.
+    # screen_created_at is date-only for 77% of assessments (the source supplies a
+    # date, stored at local midnight), so two records from the same day cannot be
+    # ordered -- and taking "the last" took whatever order Postgres returned.
+    #
+    # It held 21 members on a coin flip: 13 as Wrong Case Type, 8 as Not an Enhanced
+    # Member. BRYSON BRENTTURNER had two assessments dated 2026-09-14, one naming
+    # meals and one naming boxes; row order decided whether his food stopped.
+    eligible = latest_eligible_services(list(client.assessments.all()))
     if not eligible:
-        return None
+        return None                      # no assessment -> no verdict
 
     # Rule 2 first: the gateway. There is no point judging WHICH food case is right
     # for a member who is not entitled to internal services at all.

@@ -39355,3 +39355,157 @@ class NutritionistPauseInfoTest(TestCase):
         for member in ctx.get("members", []):
             for key in member:
                 self.assertNotIn("pause", key.lower(), f"{key} leaks into the PDF")
+
+
+class TiedAssessmentDateTest(TestCase):
+    """⚠ The tie bug that held 20 members on a coin flip.
+
+    ``screen_created_at`` is a DATE for 77% of assessments -- the source supplies a
+    date, stored at local midnight -- so two records from the same day cannot be
+    ordered. Taking "the latest row" took whatever order Postgres returned.
+
+    BRYSON BRENTTURNER had two assessments dated 2026-09-14, one naming meals and one
+    naming boxes. Row order decided whether his food stopped.
+    """
+
+    ECM = "Enhanced Care Management (Level 2)"
+    MTM = "Medically Tailored Meals (MTM) (Food)"
+    CAM = "Clinically Appropriate Meals (Food)"
+    BOXES = "Food Prescriptions (Voucher / Boxes) (Food)"
+
+    def setUp(self):
+        from .models import HoldReason
+
+        for code, label in (
+            ("not_enhanced_member", "Not an Enhanced Member"),
+            ("wrong_case_type", "Wrong Case Type Opened"),
+            ("uncategorized", "Uncategorized"),
+        ):
+            HoldReason.objects.create(code=code, label=label)
+
+    def _member(self, assessments, case_service="Medically Tailored Meals"):
+        """``assessments`` is a list of (days_ago, services)."""
+        from datetime import timedelta
+
+        from .models import (
+            Assessment, Case, CaseType, Client, EnrollmentStage,
+            EnrollmentVerification, Household, HouseholdMember,
+            Insurance, InsurancePlanType, MemberDietaryProfile, RecordStatus,
+            SocialCareCoverage, SocialCareCoverageStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tie", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        Insurance.objects.create(
+            client=client, plan_type=InsurancePlanType.MEDICAID,
+            status=RecordStatus.ACTIVE, plan_name="NY Medicaid",
+        )
+        SocialCareCoverage.objects.create(
+            client=client, coverage_id=uuid.uuid4(),
+            status=SocialCareCoverageStatus.ENROLLED, plan_name="Social Care",
+        )
+        # ⚠ ONE base timestamp for the whole fixture. Calling timezone.now() per row
+        # puts them MICROSECONDS apart, so "same day" rows are not actually tied and
+        # the test passes for the wrong reason -- which is exactly what happened on
+        # the first run. Production ties because screen_created_at is date-only.
+        base = timezone.now().replace(hour=4, minute=0, second=0, microsecond=0)
+        for days_ago, services in assessments:
+            Assessment.objects.create(
+                assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+                eligible_services=services,
+                screen_created_at=base - timedelta(days=days_ago),
+            )
+        hh = Household.objects.create(name="Tie HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+            service_type=case_service, program_name=f"{case_service} - Brooklyn",
+            case_created_at=timezone.now(),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.SERVICE_ACTIVE,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Tie Member",
+        )
+        return client, enr
+
+    def _verdict(self, client):
+        from .services.internal_service_rules import evaluate_governing_case
+
+        return evaluate_governing_case(client)
+
+    # ── the union ───────────────────────────────────────────────────────────
+    def test_tied_assessments_are_UNIONED(self):
+        from .services.service_tracker import latest_eligible_services
+
+        client, _enr = self._member([
+            (10, [self.ECM, self.CAM, self.MTM]),
+            (10, [self.ECM, self.BOXES]),
+        ])
+        services = latest_eligible_services(list(client.assessments.all()))
+        self.assertIn(self.MTM, services)
+        self.assertIn(self.BOXES, services)
+
+    def test_BRYSONS_shape_is_NOT_held(self):
+        """Meals on one same-day record, boxes on the other, a meals case open."""
+        client, _enr = self._member([
+            (10, [self.ECM, self.CAM, self.MTM]),
+            (10, [self.ECM, self.BOXES]),
+        ])
+        self.assertIsNone(self._verdict(client))
+
+    def test_the_verdict_does_NOT_depend_on_ROW_ORDER(self):
+        """⚠ The actual bug. Both orderings must agree, or the same member is held
+        or not depending on what Postgres returned."""
+        for order in ([(10, ["a"]), (10, ["b"])], [(10, ["b"]), (10, ["a"])]):
+            mapped = [
+                (d, [self.ECM] + ([self.MTM] if s == ["a"] else [self.BOXES]))
+                for d, s in order
+            ]
+            with self.subTest(order=[s for _d, s in order]):
+                client, _enr = self._member(mapped)
+                self.assertIsNone(self._verdict(client))
+
+    def test_a_tie_does_NOT_declare_a_member_NOT_ENHANCED(self):
+        """⚠ 8 members were held as "Not an Enhanced Member" while a tied record on
+        the same day said they HAVE ECM. The stronger of the two claims."""
+        client, _enr = self._member([
+            (5, [self.MTM]),                    # no ECM on this record
+            (5, [self.ECM, self.MTM]),          # ECM on the other
+        ])
+        self.assertIsNone(self._verdict(client))
+
+    # ── rule 1 is unchanged ─────────────────────────────────────────────────
+    def test_an_EARLIER_date_is_still_INVALID(self):
+        """Only the tie is resolved differently. A genuinely older assessment must
+        not be unioned in, or "the latest assessment governs" is gone."""
+        client, _enr = self._member([
+            (90, [self.ECM, self.MTM]),         # older: meals
+            (5, [self.ECM, self.BOXES]),        # newest: boxes only
+        ])
+        verdict = self._verdict(client)
+        self.assertIsNotNone(verdict)
+        self.assertEqual(verdict[0], "wrong_case_type")
+
+    def test_a_SINGLE_latest_assessment_still_holds_a_wrong_case(self):
+        """JADAH KEITH and LINASIA MCINTOSH STERLIN -- genuinely boxes-only with a
+        meals case. The fix must not stop catching those."""
+        client, _enr = self._member([(5, [self.ECM, self.BOXES])])
+        verdict = self._verdict(client)
+        self.assertEqual(verdict[0], "wrong_case_type")
+
+    def test_undated_assessments_are_unioned_rather_than_ordered(self):
+        client, _enr = self._member([])
+        from .models import Assessment
+
+        for services in ([self.ECM, self.MTM], [self.ECM, self.BOXES]):
+            Assessment.objects.create(
+                assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+                eligible_services=services, screen_created_at=None,
+            )
+        self.assertIsNone(self._verdict(client))

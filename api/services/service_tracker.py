@@ -76,6 +76,46 @@ def domains_of(services):
 
 # ── the records the rules read ───────────────────────────────────────────────
 
+def latest_eligible_services(rows):
+    """The UNION of eligible_services across every record sharing the latest date.
+
+    ⚠ NOT the services of one "latest" row, and this is the important part.
+    ``screen_created_at`` is a DATE for most assessments -- 6,148 of 8,000 sampled sit
+    at local midnight, because the source supplies a date and it is stored as a
+    datetime. So the only ordering field cannot separate two records from the same
+    day, and picking "the last one" picks whatever order Postgres returned.
+
+    That was not theoretical. 581 members have several assessments tied on the latest
+    date, 345 of them DISAGREEING about the food service, and it held 21 members
+    arbitrarily -- 13 as "Wrong Case Type", 8 as "Not an Enhanced Member". BRYSON
+    BRENTTURNER had two assessments dated 2026-09-14, one naming meals and one naming
+    boxes; row order decided whether his food stopped.
+
+    A tie is not a re-determination. Two assessments recorded on the same day are two
+    records of that day's assessment, so the honest reading is BOTH: union them. It is
+    also the only resolution that cannot stop a member's food on a coin flip.
+
+    Records from EARLIER dates are still invalid -- rule 1 is unchanged. Only the tie
+    is resolved differently.
+    """
+    dated = [r for r in rows if r.eligible_services]
+    if not dated:
+        return set()
+    latest = max(
+        (r.screen_created_at for r in dated if r.screen_created_at is not None),
+        default=None,
+    )
+    if latest is None:
+        # Nothing is dated: union them all rather than trusting row order.
+        tied = dated
+    else:
+        tied = [r for r in dated if r.screen_created_at == latest]
+    services = set()
+    for row in tied:
+        services |= set(row.eligible_services or [])
+    return services
+
+
 def _latest_with_services(rows):
     """The most recent record that actually lists services, or None.
 
@@ -97,7 +137,11 @@ def gather(client):
     screening = _latest_with_services(list(client.screenings.all()))
     assessment = _latest_with_services(list(client.assessments.all()))
     screened = list((screening.eligible_services if screening else []) or [])
-    eligible = list((assessment.eligible_services if assessment else []) or [])
+    # The UNION across every assessment tied on the latest DATE -- see
+    # latest_eligible_services. Reading one arbitrarily-chosen row made the food rule
+    # and the rule-4 warning depend on Postgres row order, because screen_created_at
+    # is date-only for 77% of assessments.
+    eligible = sorted(latest_eligible_services(list(client.assessments.all())))
 
     cases = [
         c for c in client.cases.all()
