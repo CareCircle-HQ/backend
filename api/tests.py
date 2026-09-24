@@ -38293,6 +38293,12 @@ class OnHoldTabTest(TestCase):
         primary = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name=name, last_name="Held",
             client_added_at=timezone.now(),
+            # ⚠ The tab now filters on this denormalised field, so a fixture that
+            # leaves it blank is hidden by default. Every held household on real data
+            # has it populated (2,768 open + 1,455 closed + 3 stale = all 4,226), but
+            # the filter DEPENDS on that staying true -- a client whose governing
+            # status is never written would silently vanish from the queue.
+            governing_internal_case_status="open",
         )
         hh = Household.objects.create(name=f"{name} HH")
         HouseholdMember.objects.create(household=hh, client=primary, is_primary=True)
@@ -38407,6 +38413,44 @@ class OnHoldTabTest(TestCase):
 
         self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
         self.assertEqual(self._get("?reason=nonsense")["count"], 0)
+
+    # ── only holds with an OPEN governing case ──────────────────────────────
+    def test_a_CLOSED_governing_case_is_hidden_by_default(self):
+        """⚠ Such a household cannot be resumed at all -- the Resume preview's first
+        check is "open governing case" and it fails outright. 1,455 of 4,226 held
+        households on real data. They are history, not a backlog."""
+        from .models import Client, EnrollmentStage
+
+        primary, _enr = self._household(
+            "Clo", EnrollmentStage.ON_HOLD, "pending_case_closure",
+        )
+        Client.objects.filter(pk=primary.pk).update(
+            governing_internal_case_status="closed",
+        )
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_governing_all_restores_them(self):
+        """Hidden by default, but never silently -- ?governing=all shows the lot."""
+        from .models import Client, EnrollmentStage
+
+        primary, _enr = self._household(
+            "Clo", EnrollmentStage.ON_HOLD, "pending_case_closure",
+        )
+        Client.objects.filter(pk=primary.pk).update(
+            governing_internal_case_status="closed",
+        )
+        self.assertEqual(self._get("?governing=all")["count"], 1)
+
+    def test_an_OPEN_governing_case_is_shown(self):
+        from .models import Client, EnrollmentStage
+
+        primary, _enr = self._household(
+            "Opn", EnrollmentStage.ON_HOLD, "pending_case_closure",
+        )
+        Client.objects.filter(pk=primary.pk).update(
+            governing_internal_case_status="open",
+        )
+        self.assertEqual(self._get()["count"], 1)
 
     def test_searching_by_name(self):
         from .models import EnrollmentStage
@@ -38932,6 +38976,9 @@ class HoldPauseDatesTest(TestCase):
         client = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name="Dt", last_name="Member",
             client_added_at=timezone.now(),
+            # The On Hold tab filters on this by default, so a blank value hides the
+            # row. Second fixture to need it -- the dependency is worth knowing.
+            governing_internal_case_status="open",
         )
         hh = Household.objects.create(name="Dt HH")
         HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
