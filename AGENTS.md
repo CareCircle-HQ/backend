@@ -264,6 +264,75 @@ ticket-type work it was 25 rows with duplicate codes, which only the undeployed
 git -C ~/backend log --oneline -1     # what is actually running
 ```
 
+## ⚠️ VERIFICATION IS A HUMAN PROCESS — never infer or auto-stamp it
+
+A verification is **an agent calling the member and completing the verification
+pop-up**. Its data can legitimately be *copied* in some scenarios (the bulk file
+imports below), but a member can **never be auto-verified** by a rule, a reconcile or
+an import inferring it from other data.
+
+**Authorization is not verification.** They are independent facts:
+
+```
+authorization   the payer agreed to fund the service       from Unite Us
+verification    an agent confirmed the member by phone     our process
+```
+
+`reconcile_member_stages` treated an APPROVED authorization as proof of verification
+and stamped `verified_at` itself, advancing members past the pop-up **and** the
+nutritionist step. Two runs did the damage:
+
+```
+06 Jul 2026 02:47-02:48   1,383 events    the day after the command shipped
+21 Aug 2026 18:27-18:28     211 events
+                          ─────
+                          1,594 events · 1,553 enrollments · 1,548 clients
+```
+
+Note on every one: `Reconcile: approved but delivery data incomplete.` The symptom an
+agent sees is **"verified" with no delivery address** — because nobody was ever asked
+for one.
+
+Fixed in `0a61650` (25 Aug, four days *after* the second run) with the guard:
+
+```python
+already_verified = enr.verified_at is not None
+if not already_verified:
+    → PENDING_VERIFICATION      # waits for a REAL verification
+```
+
+⚠️ `d03d168` the next day fixed the **opposite** damage: the first correction regressed
+genuinely verified households and wiped real agent verifications. So this area has
+produced two rounds of harm in opposite directions. The rule that reconciles them:
+
+> A real verification (`verified_by` set) must never be destroyed, and a verification
+> must never be created.
+
+### The signature of a FALSE verification
+
+```
+verified_at              IS SET
+verified_by              IS NULL     ← no human did it
+nutritionist_approved_at IS NULL     ← the nutritionist step never happened
+stage                    past verification
+```
+
+`revert_falsely_verified_enrollments` reverts these. **Always scope with `--since`** —
+unscoped it also matches the 29 Jun Meal Inputs bulk import, which may have been
+intentional. Serving rows are report-only unless `--include-serving`.
+
+### Paths that write `verified_at` today
+
+```
+views_members.py:7894          the pop-up -- sets verified_by TOO. The only real one.
+reconcile_member_stages:331    guarded; will still PROPAGATE an existing stray stamp
+activate_members_from_file     bulk import -- stamps with NO verifier
+mark_verified_from_file        bulk import -- stamps with NO verifier
+```
+
+The last two are the "copy the verification data" case and are deliberate. Anything
+else that stamps `verified_at` without `verified_by` is a bug.
+
 ## Case timestamps: most are SOURCE data, not ours
 
 `Case.case_created_at` and `Case.updated_at` are **Unite Us fields** --
