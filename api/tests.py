@@ -35982,6 +35982,74 @@ class ServiceTrackerTest(TestCase):
         self.assertTrue(status["in_service"])
         self.assertFalse(status["has_open_case"])
 
+    # ── "did it happen" vs "did it name anything" ───────────────────────────
+    def test_an_EMPTY_screening_still_counts_as_SCREENED(self):
+        """⚠ 64.9% of screening records carry an empty eligible_services, and `done`
+        used to mean "a screening WITH services exists" -- so 12,518 members, 19% of
+        everyone screened, showed an unticked "Screening Intake" gate. TERA HOOD was
+        screened that same morning and the panel denied it."""
+        from .models import Screening
+        from .services.service_tracker import tracker_for
+
+        Screening.objects.create(
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=[],
+            screen_created_at=timezone.now(),
+        )
+        phase1 = tracker_for(self.member)["phase1"]
+        self.assertTrue(phase1["screening"]["done"])
+        self.assertFalse(phase1["screening"]["has_result"])
+        self.assertIsNotNone(phase1["screening"]["at"])
+
+    def test_NO_screening_at_all_is_still_NOT_done(self):
+        from .services.service_tracker import tracker_for
+
+        phase1 = tracker_for(self.member)["phase1"]
+        self.assertFalse(phase1["screening"]["done"])
+        self.assertFalse(phase1["screening"]["has_result"])
+
+    def test_an_EMPTY_assessment_does_NOT_read_as_a_REFUSAL(self):
+        """⚠ 18.2% of assessments name no services. An assessment that determined
+        nothing has not ruled the member out, so the Core Eligibility gate must not
+        go red -- which it would if the UI keyed off `done`."""
+        from .models import Assessment
+        from .services.service_tracker import tracker_for
+
+        Assessment.objects.create(
+            assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=self.member,
+            eligible_services=[], screen_created_at=timezone.now(),
+        )
+        phase1 = tracker_for(self.member)["phase1"]
+        self.assertTrue(phase1["assessment"]["done"])
+        self.assertFalse(phase1["assessment"]["has_result"])
+        self.assertEqual(phase1["determination"]["label"], "No determination yet")
+
+    def test_a_REAL_refusal_still_says_NOT_QUALIFIED(self):
+        from .services.service_tracker import tracker_for
+
+        self._assess(["Navigation Services (Level 1)"])
+        phase1 = tracker_for(self.member)["phase1"]
+        self.assertTrue(phase1["assessment"]["has_result"])
+        self.assertEqual(
+            phase1["determination"]["label"], "Not qualified for ECM Level 2",
+        )
+
+    def test_the_DOMAINS_still_come_from_the_record_WITH_services(self):
+        """The fix must not change which tracks appear -- only what the gate says."""
+        from .models import Screening
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        Screening.objects.create(            # a LATER, empty screening
+            enhanced_screen_id=uuid.uuid4(), subject_id=uuid.uuid4(),
+            client=self.member, eligible_services=[],
+            screen_created_at=timezone.now(),
+        )
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        data = tracker_for(self.member)
+        self.assertEqual(data["phase1"]["screening"]["domains"], ["Food"])
+        self.assertIn("food", [t["code"] for t in data["tracks"]])
+
     def test_RULE_3_raises_an_alert(self):
         """⚠ It HOLDS 96 households and the panel said nothing: the Food Program row
         read "[done] Food service case" with no alert, while their deliveries were

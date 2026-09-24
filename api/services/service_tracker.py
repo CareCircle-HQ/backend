@@ -116,6 +116,21 @@ def latest_eligible_services(rows):
     return services
 
 
+def _latest_record(rows):
+    """The most recent record, whether or not it lists any service.
+
+    Separate from :func:`_latest_with_services` because "the member was screened" and
+    "the screening named something we serve" are different facts, and 64.9% of
+    screening records carry an empty eligible_services.
+    """
+    if not rows:
+        return None
+    dated = sorted(
+        rows, key=lambda r: (r.screen_created_at is None, r.screen_created_at),
+    )
+    return dated[-1]
+
+
 def _latest_with_services(rows):
     """The most recent record that actually lists services, or None.
 
@@ -136,6 +151,9 @@ def gather(client):
     """Everything the rules need, read once."""
     screening = _latest_with_services(list(client.screenings.all()))
     assessment = _latest_with_services(list(client.assessments.all()))
+    # The most recent record of ANY kind, empty or not -- "did this happen".
+    any_screening = _latest_record(list(client.screenings.all()))
+    any_assessment = _latest_record(list(client.assessments.all()))
     screened = list((screening.eligible_services if screening else []) or [])
     # The UNION across every assessment tied on the latest DATE -- see
     # latest_eligible_services. Reading one arbitrarily-chosen row made the food rule
@@ -150,6 +168,10 @@ def gather(client):
     return {
         "screening": screening,
         "assessment": assessment,
+        # The most recent record of ANY kind, empty or not: "did this happen", as
+        # opposed to "did it name anything we serve".
+        "any_screening": any_screening,
+        "any_assessment": any_assessment,
         "screened": screened,
         "eligible": eligible,
         "screened_domains": domains_of(screened),
@@ -558,6 +580,8 @@ def tracker_for(client):
 
     screening = ctx["screening"]
     assessment = ctx["assessment"]
+    any_screening = ctx["any_screening"]
+    any_assessment = ctx["any_assessment"]
     tracks = [
         t for t in (
             rule_0_care_management(ctx),
@@ -568,8 +592,21 @@ def tracker_for(client):
     return {
         "phase1": {
             "screening": {
-                "done": screening is not None,
-                "at": screening.screen_created_at if screening else None,
+                # ⚠ "DID IT HAPPEN" AND "DID IT NAME ANYTHING" ARE TWO FACTS, and
+                # `done` used to be both. 64.9% of screening records carry an EMPTY
+                # eligible_services, so 12,518 members -- 19% of everyone screened --
+                # showed an unticked "Screening Intake" gate reading "No food or
+                # housing need screened", which an agent reads as NOT DONE. TERA
+                # HOOD was screened the same morning and the panel denied it.
+                #
+                # `done` is now "a screening record exists". `has_result` is "it
+                # named at least one service". The domains still come from the
+                # latest record WITH services, so which tracks appear is unchanged.
+                "done": any_screening is not None,
+                "has_result": screening is not None,
+                "at": (
+                    any_screening.screen_created_at if any_screening else None
+                ),
                 # The domains we act on, in the order an agent reads them. Only
                 # Food and Housing: we screen for four and take two, and listing
                 # the other two as though we might act on them would mislead.
@@ -581,14 +618,24 @@ def tracker_for(client):
                 ),
             },
             "assessment": {
-                "done": assessment is not None,
-                "at": assessment.screen_created_at if assessment else None,
+                "done": any_assessment is not None,
+                # ⚠ THE UI MUST NOT COLOUR "Core Eligibility" RED OFF `done`.
+                # 18.2% of assessments name no services, and an assessment that
+                # determined nothing has not ruled the member out -- it has not
+                # determined anything. Red belongs on has_result && not ecm.
+                "has_result": assessment is not None,
+                "at": (
+                    any_assessment.screen_created_at if any_assessment else None
+                ),
                 "services": ctx["eligible"],
             },
             "determination": {
                 "done": ctx["ecm"],
-                "label": "Qualified: ECM Level 2" if ctx["ecm"]
-                         else "Not qualified for ECM Level 2",
+                "label": (
+                    "Qualified: ECM Level 2" if ctx["ecm"]
+                    else "Not qualified for ECM Level 2" if assessment is not None
+                    else "No determination yet"
+                ),
             },
         },
         # So the UI can name the borough it is comparing against, rather than
