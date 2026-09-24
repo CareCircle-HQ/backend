@@ -596,6 +596,19 @@ def tracker_for(client):
         "home_borough": ctx["home_borough"],
         "alerts": detect_alerts(ctx),
         "tracks": tracks,
+        # WHETHER THERE IS A PROGRAMME TO RETIRE, for the empty state.
+        #
+        # "No track applies YET" is right for a member still coming through the
+        # funnel and wrong for one who does not qualify at all -- and wrong in
+        # opposite directions depending on whether they are being served. A member
+        # with an open case and a live enrollment needs the case CLOSED and the
+        # member retired; a member with neither needs nothing done.
+        "service_status": _service_status(ctx),
+        # Whether the member qualifies at all. The panel needs it for the empty
+        # state: "no track applies YET" is only true while they are still coming
+        # through the funnel, and it is the opposite of true for a member the
+        # assessment has ruled out.
+        "ecm": ctx["ecm"],
     }
 
 
@@ -708,6 +721,51 @@ def _scheduled_reauth_rows(ctx, service_type):
 # of members and already the first row of the housing track, in amber, saying which
 # half is missing. Repeating it as an alert would double-count the commonest state in
 # the tracker and teach an agent to ignore the banner.
+
+# Stages where a programme still EXISTS and therefore has to be retired. ON_HOLD is
+# in it: a hold stops deliveries but leaves the case open and the enrollment live, so
+# somebody still has to close it. That is the member this empty state was most wrong
+# for -- JAIAIRE ADAMSBIRD, held as Not an Enhanced Member, case open, panel saying
+# "a track appears once the member qualifies".
+_LIVE_ENROLLMENT_STAGES = frozenset({
+    "pending_verification", "validated", "verified", "kitchen_assignment",
+    "service_active", "on_hold", "scheduled_extension",
+})
+
+
+def _service_status(ctx):
+    """Is there a live programme, and what is it doing?"""
+    client = ctx.get("client")
+    if client is None:
+        return {"in_service": False, "stage": "", "stage_label": "", "has_open_case": False}
+    from api.models import CaseStatus, CaseType, EnrollmentStage
+
+    live = [
+        e for e in client.enrollments.all()
+        if (e.stage or "") in _LIVE_ENROLLMENT_STAGES
+    ]
+    # The one furthest along, since a member can carry a dead-ish extension beside a
+    # serving enrollment and the serving one is what has to be retired.
+    order = {
+        EnrollmentStage.SERVICE_ACTIVE: 6, EnrollmentStage.ON_HOLD: 5,
+        EnrollmentStage.KITCHEN_ASSIGNMENT: 4, EnrollmentStage.VERIFIED: 3,
+        EnrollmentStage.VALIDATED: 2, EnrollmentStage.PENDING_VERIFICATION: 1,
+    }
+    enrollment = max(live, key=lambda e: order.get(e.stage, 0)) if live else None
+    has_open_case = any(
+        c.case_type == CaseType.INTERNAL_SERVICE
+        and (c.case_status or "") not in (CaseStatus.CLOSED, CaseStatus.CANCELLED)
+        for c in ctx["all_cases"]
+    )
+    return {
+        "in_service": enrollment is not None,
+        "stage": enrollment.stage if enrollment else "",
+        "stage_label": (
+            EnrollmentStage(enrollment.stage).label if enrollment else ""
+        ),
+        "has_open_case": has_open_case,
+    }
+
 
 def _alert(code, title, detail, *, severity="error", program=""):
     return {

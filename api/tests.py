@@ -35909,6 +35909,79 @@ class ServiceTrackerTest(TestCase):
         )
         return enrollment
 
+    # ── the empty state tells the truth ─────────────────────────────────────
+    def _status(self):
+        from .services.service_tracker import tracker_for
+
+        return tracker_for(self.member)["service_status"]
+
+    def test_a_NON_QUALIFYING_member_IN_SERVICE_reports_a_programme_to_retire(self):
+        """⚠ JAIAIRE ADAMSBIRD: held as Not an Enhanced Member, meals case still
+        OPEN, and the panel said "a track appears once the member qualifies for ECM
+        Level 2". He never will. Somebody has to close the case and retire him, and
+        the page was describing a wait instead."""
+        from .models import EnrollmentStage
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess(["Navigation Services (Level 1)"])       # no ECM
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.ON_HOLD)
+        data = tracker_for(self.member)
+        self.assertFalse(data["ecm"])
+        self.assertEqual(data["tracks"], [])
+        self.assertTrue(data["service_status"]["in_service"])
+        self.assertEqual(data["service_status"]["stage_label"], "On Hold")
+        self.assertTrue(data["service_status"]["has_open_case"])
+
+    def test_ON_HOLD_counts_as_in_service_because_the_case_is_still_open(self):
+        """A hold stops deliveries but leaves the case open and the enrollment live,
+        so there is still something to retire. That is the member this empty state
+        was most wrong for."""
+        from .models import EnrollmentStage
+
+        self._assess(["Navigation Services (Level 1)"])
+        self._enroll(EnrollmentStage.ON_HOLD)
+        self.assertTrue(self._status()["in_service"])
+
+    def test_a_member_with_NO_enrollment_is_NOT_in_service(self):
+        self._assess(["Navigation Services (Level 1)"])
+        status = self._status()
+        self.assertFalse(status["in_service"])
+        self.assertEqual(status["stage_label"], "")
+
+    def test_a_TERMINAL_enrollment_is_NOT_in_service(self):
+        from .models import EnrollmentStage
+
+        self._assess(["Navigation Services (Level 1)"])
+        for stage in (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+                      EnrollmentStage.DISREGARDED):
+            with self.subTest(stage=stage):
+                self.member.enrollments.all().delete()
+                self._enroll(stage)
+                self.assertFalse(self._status()["in_service"])
+
+    def test_the_FURTHEST_ALONG_enrollment_is_the_one_reported(self):
+        """A member can carry a pre-verification row beside a serving one, and it is
+        the SERVING one that has to be retired."""
+        from .models import EnrollmentStage
+
+        self._assess(["Navigation Services (Level 1)"])
+        self._enroll(EnrollmentStage.PENDING_VERIFICATION)
+        self._enroll(EnrollmentStage.SERVICE_ACTIVE)
+        self.assertEqual(self._status()["stage_label"], "Service Active")
+
+    def test_has_open_case_is_FALSE_once_the_case_closes(self):
+        from .models import Case, EnrollmentStage
+
+        self._assess(["Navigation Services (Level 1)"])
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.ON_HOLD)
+        Case.objects.filter(client=self.member).update(case_status="closed")
+        status = self._status()
+        self.assertTrue(status["in_service"])
+        self.assertFalse(status["has_open_case"])
+
     def test_RULE_3_raises_an_alert(self):
         """⚠ It HOLDS 96 households and the panel said nothing: the Food Program row
         read "[done] Food service case" with no alert, while their deliveries were
