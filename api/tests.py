@@ -39509,3 +39509,103 @@ class TiedAssessmentDateTest(TestCase):
                 eligible_services=services, screen_created_at=None,
             )
         self.assertIsNone(self._verdict(client))
+
+
+class ResumeAuthorizationWindowTest(TestCase):
+    """The Resume preview's authorization check.
+
+    ⚠ A FUTURE START used to block the resume. It duplicated a guarantee made one
+    step later -- the resume recomputes the plan from the governing case and derives
+    the delivery window from its authorization, so a member whose window opens next
+    week gets no deliveries until then, and nothing is served until a Purchase Order
+    takes them. Blocking it stopped an agent preparing a member the day before their
+    authorization opened.
+    """
+
+    def _held(self, *, status="approved", starts_days=None, ends_days=None):
+        from datetime import timedelta
+
+        from .models import (
+            Case, CaseType, Client, EnrollmentStage, EnrollmentVerification,
+            Household, HouseholdMember, MemberDietaryProfile,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Rw", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        hh = Household.objects.create(name="Rw HH")
+        HouseholdMember.objects.create(household=hh, client=client, is_primary=True)
+        now = timezone.now()
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="managed",
+            service_type="Medically Tailored Meals",
+            program_name="MTM - Other - Brooklyn", case_created_at=now,
+            service_authorization_status=status,
+            service_authorization_approval_starts_at=(
+                now + timedelta(days=starts_days) if starts_days is not None else None
+            ),
+            service_authorization_approval_ends_at=(
+                now + timedelta(days=ends_days) if ends_days is not None else None
+            ),
+        )
+        enr = EnrollmentVerification.objects.create(
+            client=client, household=hh, case=case,
+            stage=EnrollmentStage.ON_HOLD, verified_at=now,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enr, client=client, member_name="Rw Member",
+        )
+        return enr
+
+    def _plan(self, enr):
+        from .portal.views_members import _resolve_resume
+
+        return _resolve_resume(enr)
+
+    def test_a_FUTURE_start_no_longer_blocks_the_resume(self):
+        """The member whose authorization opened TOMORROW. Nothing is served until a
+        PO takes them, so preparing them now is exactly right."""
+        enr = self._held(starts_days=1, ends_days=180)
+        plan = self._plan(enr)
+        self.assertTrue(plan["allowed"], plan["block_reason"])
+        self.assertTrue(plan["checks"]["authorization_not_started"])
+
+    def test_a_window_that_has_OPENED_is_allowed_and_not_flagged(self):
+        enr = self._held(starts_days=-30, ends_days=180)
+        plan = self._plan(enr)
+        self.assertTrue(plan["allowed"])
+        self.assertFalse(plan["checks"]["authorization_not_started"])
+
+    def test_an_EXPIRED_authorization_still_blocks(self):
+        enr = self._held(starts_days=-200, ends_days=-5)
+        plan = self._plan(enr)
+        self.assertFalse(plan["allowed"])
+        self.assertIn("expired", plan["block_reason"])
+
+    def test_an_UNAPPROVED_authorization_still_blocks(self):
+        for status in ("never_requested", "pending", "denied"):
+            with self.subTest(status=status):
+                enr = self._held(status=status, ends_days=180)
+                plan = self._plan(enr)
+                self.assertFalse(plan["allowed"])
+                self.assertIn("not approved", plan["block_reason"])
+                self.assertIn(status, plan["block_reason"])
+
+    def test_the_block_reason_NAMES_which_condition_failed(self):
+        """⚠ One sentence covered three conditions, so a member approved from
+        tomorrow read identically to one whose authorization expired last week."""
+        expired = self._plan(self._held(starts_days=-200, ends_days=-5))
+        unapproved = self._plan(self._held(status="pending", ends_days=180))
+        self.assertNotEqual(expired["block_reason"], unapproved["block_reason"])
+
+    def test_NOT_REQUIRED_is_treated_as_authorized(self):
+        enr = self._held(status="not_required", ends_days=180)
+        self.assertTrue(self._plan(enr)["allowed"])
+
+    def test_no_window_at_all_is_allowed_when_approved(self):
+        enr = self._held(starts_days=None, ends_days=None)
+        plan = self._plan(enr)
+        self.assertTrue(plan["allowed"])
+        self.assertFalse(plan["checks"]["authorization_not_started"])
