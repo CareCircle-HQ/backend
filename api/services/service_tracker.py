@@ -861,7 +861,20 @@ def detect_alerts(ctx):
         # "Not an Enhanced Member" who was never screened for Housing or Food got
         # neither an alert nor a single track -- an entirely EMPTY panel beside a
         # stopped programme. 50 held households read that way.
-        alerts.extend(_internal_service_rule_alerts(ctx))
+        rule_alerts = _internal_service_rule_alerts(ctx)
+        alerts.extend(rule_alerts)
+        # ⚠ AND NOT BOTH. When the rule alert fires, "Screened for Food, but not
+        # qualified for ECM Level 2" says the same thing one line lower and in
+        # weaker terms -- it offers "the assessment is missing or incomplete" as a
+        # possibility when the rule has already determined the member does not
+        # qualify and their programme is held. Two alerts for one fact is how a
+        # panel teaches an agent to skim it.
+        #
+        # The domain warnings still fire on their own, for a member with NO governing
+        # case: there the rule has no verdict and "you screened them for food and
+        # they did not qualify" is the only thing to say.
+        if rule_alerts:
+            return alerts
         for domain in ("Housing", "Food"):
             if domain in domains:
                 alerts.append(_alert(

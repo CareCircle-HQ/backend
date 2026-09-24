@@ -35992,6 +35992,28 @@ class ServiceTrackerTest(TestCase):
         self._case("Medically Tailored Meals")
         self.assertIn("wrong_case_type", self._alert_codes())
 
+    def test_the_RULE_2_alert_REPLACES_the_screened_domain_warning(self):
+        """⚠ Two alerts for one fact. "Screened for Food, but not qualified for ECM
+        Level 2" said the same thing one line below the rule alert and in weaker
+        terms -- offering "the assessment is missing or incomplete" as a possibility
+        when the rule had already determined the member does not qualify and their
+        programme is held."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess(["Navigation Services (Level 1)"])       # no ECM
+        self._case("Medically Tailored Meals")
+        codes = self._alert_codes()
+        self.assertIn("not_enhanced_member", codes)
+        self.assertNotIn("no_ecm_food", codes)
+
+    def test_the_domain_warning_SURVIVES_when_there_is_no_governing_case(self):
+        """With no case the rule has no verdict, so "you screened them for food and
+        they did not qualify" is the only thing there is to say."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess(["Navigation Services (Level 1)"])
+        codes = self._alert_codes()                            # no case created
+        self.assertIn("no_ecm_food", codes)
+        self.assertNotIn("not_enhanced_member", codes)
+
     def test_RULE_2_raises_an_alert_even_with_NO_screened_domain(self):
         """⚠ The no_ecm_* alerts fire only when the member was SCREENED for Food or
         Housing. A member held as "Not an Enhanced Member" who was not got neither an
