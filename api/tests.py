@@ -37897,6 +37897,7 @@ class HoldReasonTest(TestCase):
         ("zip_out_of_coverage", "Delivery ZIP outside coverage", "none", True),
         ("medicaid_type_not_served", "Medicaid plan type not served", "none", True),
         ("all_members_paused", "All household members paused", "auto", True),
+        ("derived_status", "Derived Status", "manual", True),
         ("uncategorized", "Uncategorized", "none", False),
     ]
 
@@ -38133,6 +38134,28 @@ class HoldReasonTest(TestCase):
             with self.subTest(note=note[:40]):
                 self.assertEqual(self._classify(note)[0], expected)
 
+    def test_a_CARRIED_OVER_hold_is_Derived_Status_not_Uncategorized(self):
+        """⚠ It has a precise reason: the hold was INHERITED from the household's
+        prior state so a new governing case could not silently resume a paused
+        member. Uncategorized means "nobody recorded why", which is a different and
+        wrong claim -- and it hid 607 events behind the largest bucket on the page."""
+        code, how = self._classify(
+            "Kept On Hold: the prior household was paused; a new governing case "
+            "must not auto-resume service. Flagged Need Review.",
+        )
+        self.assertEqual(code, "derived_status")
+        self.assertEqual(how, "machine-written note")
+
+    def test_Derived_Status_resumes_MANUALLY_not_never(self):
+        """Nothing clears it automatically -- that is the point of the mechanism --
+        but an agent CAN resume after reviewing, unlike the reasons where no resume
+        is possible at all."""
+        from .models import HoldReason
+
+        self.assertEqual(
+            HoldReason.objects.get(code="derived_status").resume_policy, "manual",
+        )
+
     def test_the_AGREED_uncategorized_ones_stay_uncategorized(self):
         """⚠ By DECISION, not failure. Over-interpreting a July spreadsheet's
         wording is how a category stops meaning anything."""
@@ -38141,8 +38164,6 @@ class HoldReasonTest(TestCase):
             "approved.",
             "Bulk hold 9/23: governing household case.",
             "Bulk pause: Services paused per Unite Us cases list.",
-            "Kept On Hold: the prior household was paused; a new governing case "
-            "must not auto-resume it.",
             "Roster import: placed on hold. Reason: Reason Unknown (Potentially "
             "Authorization Status)",
         ):
