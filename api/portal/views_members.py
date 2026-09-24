@@ -3972,6 +3972,24 @@ class OnHoldMembersListView(UnlinkedMembersListView):
         if (params.get("governing") or "").lower() != "all":
             qs = qs.filter(governing_internal_case_status="open")
 
+            # AND NOT ELIGIBLE-OFF-RAMPED. Neither stage can be resumed into
+            # service, so both are history rather than a queue:
+            #
+            #   INELIGIBLE    463  the import-time gate -- expired/missing medical
+            #                      insurance, an unserved Medicaid type, or an
+            #                      out-of-range address. STICKY until the underlying
+            #                      data recovers on a later import, so it will not
+            #                      clear by anything an agent does on this page.
+            #   NOT_ELIGIBLE  307  the terminal off-ramp: ineligible, or closed
+            #                      without service.
+            #
+            # ⚠ TWO SEPARATE STAGES, easy to miss -- excluding only one would leave
+            # 307 unworkable rows looking like a backlog. They differ in how they
+            # arrive, not in whether the row is actionable.
+            qs = qs.exclude(lifecycle_stage__in=(
+                ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE,
+            ))
+
         # WHEN it was held, and when it was resumed. Same join as the reason filter
         # above, so one enrollment must satisfy both rather than two different ones.
         qs = _date_range_filter(qs, params, "enrollments__held_at", "held")

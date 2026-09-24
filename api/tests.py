@@ -38441,6 +38441,54 @@ class OnHoldTabTest(TestCase):
         )
         self.assertEqual(self._get("?governing=all")["count"], 1)
 
+    def test_an_ELIGIBILITY_OFF_RAMPED_member_is_hidden(self):
+        """⚠ TWO separate stages, and excluding only one would leave 307 unworkable
+        rows looking like a backlog.
+
+        INELIGIBLE is the import-time gate -- expired insurance, unserved Medicaid
+        type, out-of-range address -- and is STICKY until the data recovers, so
+        nothing an agent does on this page clears it. NOT_ELIGIBLE is the terminal
+        off-ramp. Neither can be resumed into service.
+        """
+        from .models import Client, ClientStage, EnrollmentStage
+
+        for stage in (ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE):
+            with self.subTest(stage=stage):
+                primary, _enr = self._household(
+                    f"Off{stage[:3]}", EnrollmentStage.ON_HOLD,
+                    "pending_case_closure",
+                )
+                Client.objects.filter(pk=primary.pk).update(lifecycle_stage=stage)
+                self.assertEqual(
+                    self._get()["count"], 0, f"{stage} should be hidden",
+                )
+                Client.objects.filter(pk=primary.pk).delete()
+
+    def test_governing_all_also_shows_the_off_ramped(self):
+        """One escape hatch, not two -- ?governing=all lifts both gates, so the full
+        list is always one parameter away."""
+        from .models import Client, ClientStage, EnrollmentStage
+
+        primary, _enr = self._household(
+            "Ine", EnrollmentStage.ON_HOLD, "pending_case_closure",
+        )
+        Client.objects.filter(pk=primary.pk).update(
+            lifecycle_stage=ClientStage.INELIGIBLE,
+        )
+        self.assertEqual(self._get("?governing=all")["count"], 1)
+
+    def test_an_ACTIVE_member_on_hold_is_still_shown(self):
+        """The filters must not swallow the actual queue -- 2,000 of 4,226."""
+        from .models import Client, ClientStage, EnrollmentStage
+
+        primary, _enr = self._household(
+            "Act", EnrollmentStage.ON_HOLD, "pending_case_closure",
+        )
+        Client.objects.filter(pk=primary.pk).update(
+            lifecycle_stage=ClientStage.ACTIVE,
+        )
+        self.assertEqual(self._get()["count"], 1)
+
     def test_an_OPEN_governing_case_is_shown(self):
         from .models import Client, EnrollmentStage
 
