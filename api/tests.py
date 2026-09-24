@@ -38435,6 +38435,76 @@ class OnHoldTabTest(TestCase):
         self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
         self.assertEqual(self._get("?reason=nonsense")["count"], 0)
 
+    # ── who placed the hold ─────────────────────────────────────────────────
+    def _hold_event(self, enr, *, note="", source="manual", label=None):
+        from .models import EnrollmentStage, StageEvent
+
+        return StageEvent.objects.create(
+            entity_type="enrollment", enrollment=enr, client=enr.client,
+            to_stage=EnrollmentStage.ON_HOLD, note=note, source=source,
+            metadata={"actor_label": label} if label else {},
+        )
+
+    def test_the_AGENT_NAME_is_read_from_the_hold_note(self):
+        """⚠ StageEvent.actor -- the FK meant for exactly this -- is NULL on all
+        7,686 holds ever recorded, because the portal acts as an Agent rather than a
+        Django User and passes a label instead. The name lives in the note."""
+        from .models import EnrollmentStage
+
+        _p, enr = self._household("Nm", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self._hold_event(
+            enr, note="Placed on hold by Kathy Pearson Soto. Reason: 9/1 HH Close",
+        )
+        self.assertEqual(self._get()["results"][0]["held_by"], "Kathy Pearson Soto")
+
+    def test_a_SYSTEM_label_reports_System(self):
+        from .models import EnrollmentStage
+
+        for label in ("system:cancelled-reconcile", "cron:reauth-extensions",
+                      "System (bulk 9/23)"):
+            with self.subTest(label=label):
+                _p, enr = self._household(
+                    f"Sy{label[:4]}", EnrollmentStage.ON_HOLD, "uncategorized",
+                )
+                self._hold_event(enr, source="auto", label=label)
+                row = next(
+                    r for r in self._get()["results"]
+                    if r["name"].startswith(f"Sy{label[:4]}")
+                )
+                self.assertEqual(row["held_by"], "System")
+
+    def test_an_UNATTRIBUTED_manual_hold_says_Agent_not_System(self):
+        """⚠ 2,855 manual holds carry no attributable agent. Reporting them as
+        "System" would claim the system did something a person did -- worse than
+        admitting it was never recorded."""
+        from .models import EnrollmentStage
+
+        _p, enr = self._household("Un", EnrollmentStage.ON_HOLD, "uncategorized")
+        self._hold_event(enr, note="Some note with no name", source="manual")
+        self.assertEqual(self._get()["results"][0]["held_by"], "Agent")
+
+    def test_an_auto_hold_with_no_label_is_System(self):
+        from .models import EnrollmentStage
+
+        _p, enr = self._household("Au", EnrollmentStage.ON_HOLD, "uncategorized")
+        self._hold_event(enr, note="Auto-paused: sole case denied.", source="auto")
+        self.assertEqual(self._get()["results"][0]["held_by"], "System")
+
+    def test_the_MOST_RECENT_hold_event_names_the_actor(self):
+        from datetime import timedelta
+
+        from .models import EnrollmentStage, StageEvent
+
+        _p, enr = self._household("Rc", EnrollmentStage.ON_HOLD, "uncategorized")
+        old = self._hold_event(
+            enr, note="Placed on hold by Old Agent. Reason: first",
+        )
+        StageEvent.objects.filter(pk=old.pk).update(
+            entered_at=timezone.now() - timedelta(days=10),
+        )
+        self._hold_event(enr, note="Placed on hold by New Agent. Reason: second")
+        self.assertEqual(self._get()["results"][0]["held_by"], "New Agent")
+
     # ── only holds with an OPEN governing case ──────────────────────────────
     def test_a_CLOSED_governing_case_is_hidden_by_default(self):
         """⚠ Such a household cannot be resumed at all -- the Resume preview's first

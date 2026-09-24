@@ -74,6 +74,7 @@ from ..models import (
     PurchaseOrder,
     ServiceAuthorizationStatus,
     StageEvent,
+    StageEventSource,
     Ticket,
     TicketSeverity,
     TicketSource,
@@ -3708,6 +3709,38 @@ class UnlinkedMembersListView(PortalGenericAPIView):
         return self.get_paginated_response(rows)
 
 
+# "Placed on hold by <name>. Reason: ..." -- the agent's name lives in the NOTE,
+# not in a field. StageEvent.actor is the FK meant for this and is NULL on all 7,686
+# holds ever recorded: the portal acts as an Agent, not a Django User, so it passes
+# a label instead. Until there is a real held_by column this is where the name is.
+_HELD_BY_NOTE = re.compile(r"^Placed on hold by ([^.]+)\. Reason:")
+
+
+def _hold_actor(event):
+    """Who placed this hold: an agent's name, or "System".
+
+    Three sources in order of reliability -- the note prose (1,737 holds), the
+    metadata actor_label (30), then the auto/manual flag, which is the only one
+    populated on every row.
+
+    ⚠ 2,855 MANUAL holds carry no attributable agent at all. They report "Agent"
+    rather than a name, and NOT "System" -- claiming the system did something a
+    person did is worse than admitting we did not record who.
+    """
+    if event is None:
+        return ""
+    match = _HELD_BY_NOTE.match(event.note or "")
+    if match:
+        return match.group(1).strip()
+    label = ((event.metadata or {}).get("actor_label") or "").strip()
+    if label:
+        # system:cancelled-reconcile, cron:reauth-extensions, System (bulk 9/23)
+        if label.lower().startswith(("system", "cron")):
+            return "System"
+        return label
+    return "System" if event.source == StageEventSource.AUTO else "Agent"
+
+
 def _date_range_filter(qs, params, field, prefix):
     """Apply ``?<prefix>_from`` / ``?<prefix>_to`` as an inclusive date range.
 
@@ -4038,6 +4071,7 @@ class OnHoldMembersListView(UnlinkedMembersListView):
             reason = getattr(enr, "hold_reason", None) if enr else None
             # The note the hold was placed with -- the detail no catalogue carries.
             note = ""
+            held_by = ""
             if enr is not None:
                 event = (
                     StageEvent.objects.filter(
@@ -4049,6 +4083,7 @@ class OnHoldMembersListView(UnlinkedMembersListView):
                     body.split("Reason:", 1)[1].strip()
                     if "Reason:" in body else body
                 )
+                held_by = _hold_actor(event)
             rows.append({
                 "id": str(c.client_id),
                 "name": s._full_name(c),
@@ -4074,6 +4109,7 @@ class OnHoldMembersListView(UnlinkedMembersListView):
                 "resume_policy": reason.resume_policy if reason else "",
                 "resume_detail": reason.resume_detail if reason else "",
                 "hold_note": note,
+                "held_by": held_by,
             })
         return self.get_paginated_response(rows)
 
