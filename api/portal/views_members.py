@@ -4153,6 +4153,25 @@ class NoNavigationMembersListView(UnlinkedMembersListView):
             .prefetch_related("insurances", "cases", "assessments", "tags")
         )
 
+        # NOT the eligibility-off-ramped, by default. 109 of 258 rows -- 42% --
+        # were members nobody can act on here: opening a navigation case for a
+        # member who fails a hard eligibility gate is not the work, closing their
+        # internal-service case is.
+        #
+        # ⚠ TWO SEPARATE STAGES, the same pair the On Hold tab excludes:
+        #   INELIGIBLE    the import-time gate (expired/missing insurance, an
+        #                 unserved Medicaid type, an out-of-range address), STICKY
+        #                 until the data recovers -- so nothing an agent does on
+        #                 this page clears it.
+        #   NOT_ELIGIBLE  the terminal off-ramp.
+        # Excluding only one would leave the other looking like a backlog.
+        #
+        # ?eligible=all restores the full list rather than hiding rows silently.
+        if (params.get("eligible") or "").lower() != "all":
+            qs = qs.exclude(lifecycle_stage__in=(
+                ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE,
+            ))
+
         search = (params.get("search") or "").strip()
         if search:
             cond = (

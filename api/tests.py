@@ -40442,3 +40442,97 @@ class NotEnhancedMemberWarningTest(TestCase):
             (0, ["Enhanced Care Management (Level 2)"]),
         ])
         self.assertNotIn("not_enhanced_member", self._codes(client.pk))
+
+
+class NoCareManagementTabTest(TestCase):
+    """Urgent Care -> No Care Management: members holding an internal-service case
+    with NO navigation case at all.
+
+    ⚠ The eligibility-off-ramped are excluded by default. 109 of 258 rows -- 42% --
+    were members nobody can act on here: opening a navigation case for someone who
+    fails a hard eligibility gate is not the work, closing their internal-service
+    case is.
+    """
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Nav Agent", agent_code=str(uuid.uuid4())[:8], group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _member(self, *, stage=None, navigation=False):
+        from .models import Case, CaseType, Client, ClientStage
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Nav", last_name="Member",
+            client_added_at=timezone.now(),
+            lifecycle_stage=stage or ClientStage.ACTIVE,
+        )
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status="open",
+            service_type="Medically Tailored Meals",
+            program_name="MTM - Brooklyn", case_created_at=timezone.now(),
+            date_opened=timezone.now(),
+        )
+        if navigation:
+            Case.objects.create(
+                case_id=uuid.uuid4(), client=client,
+                case_type=CaseType.NAVIGATION, case_status="open",
+                service_type="Social Service Case Management",
+                program_name="Nav - Brooklyn", case_created_at=timezone.now(),
+                date_opened=timezone.now(),
+            )
+        return client
+
+    def _get(self, qs=""):
+        resp = self.api.get(f"/api/portal/members/no-navigation/{qs}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_a_member_with_no_navigation_case_is_listed(self):
+        self._member()
+        self.assertEqual(self._get()["count"], 1)
+
+    def test_a_member_WITH_a_navigation_case_is_not(self):
+        self._member(navigation=True)
+        self.assertEqual(self._get()["count"], 0)
+
+    def test_an_ELIGIBILITY_OFF_RAMPED_member_is_hidden(self):
+        """⚠ BOTH stages, asserted individually. INELIGIBLE is the sticky import-time
+        gate -- nothing an agent does on this page clears it -- and NOT_ELIGIBLE is
+        the terminal off-ramp. Excluding only one would leave the other looking like
+        a backlog."""
+        from .models import Client, ClientStage
+
+        for stage in (ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE):
+            with self.subTest(stage=stage):
+                member = self._member(stage=stage)
+                self.assertEqual(self._get()["count"], 0, f"{stage} should be hidden")
+                Client.objects.filter(pk=member.pk).delete()
+
+    def test_eligible_all_restores_them(self):
+        """Hidden by default, never silently."""
+        from .models import ClientStage
+
+        self._member(stage=ClientStage.INELIGIBLE)
+        self.assertEqual(self._get()["count"], 0)
+        self.assertEqual(self._get("?eligible=all")["count"], 1)
+
+    def test_a_SERVICE_INACTIVE_member_is_still_listed(self):
+        """The largest group on this tab -- 128 of 258 -- and they ARE actionable:
+        no open internal-service case is not an eligibility failure."""
+        from .models import ClientStage
+
+        self._member(stage=ClientStage.SERVICE_INACTIVE)
+        self.assertEqual(self._get()["count"], 1)
