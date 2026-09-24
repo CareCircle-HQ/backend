@@ -35883,6 +35883,110 @@ class ServiceTrackerTest(TestCase):
         self._assess([self.ECM])
         self.assertIsNone(self._track("food"))
 
+    # ── the rules are visible on the panel ──────────────────────────────────
+    def _alert_codes(self):
+        from .services.service_tracker import tracker_for
+
+        return [a["code"] for a in tracker_for(self.member)["alerts"]]
+
+    def _enroll(self, stage):
+        """This class builds only a Client, so the rule-outcome tests that need a
+        stage make their own enrollment."""
+        from .models import (
+            EnrollmentVerification, Household, HouseholdMember,
+            MemberDietaryProfile,
+        )
+
+        household, _ = Household.objects.get_or_create(name="Track HH")
+        HouseholdMember.objects.get_or_create(
+            household=household, client=self.member, defaults={"is_primary": True},
+        )
+        enrollment = EnrollmentVerification.objects.create(
+            client=self.member, household=household, stage=stage,
+        )
+        MemberDietaryProfile.objects.create(
+            enrollment=enrollment, client=self.member, member_name="Track Member",
+        )
+        return enrollment
+
+    def test_RULE_3_raises_an_alert(self):
+        """⚠ It HOLDS 96 households and the panel said nothing: the Food Program row
+        read "[done] Food service case" with no alert, while their deliveries were
+        stopped. The tracker claiming a member is fine when they are held is the worst
+        failure available here."""
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._case("Medically Tailored Meals")
+        self.assertIn("wrong_case_type", self._alert_codes())
+
+    def test_RULE_2_raises_an_alert_even_with_NO_screened_domain(self):
+        """⚠ The no_ecm_* alerts fire only when the member was SCREENED for Food or
+        Housing. A member held as "Not an Enhanced Member" who was not got neither an
+        alert nor a single track -- an entirely empty panel beside a stopped
+        programme."""
+        self._screen([])                      # nothing screened
+        self._assess(["Clinically Appropriate Meals (Food)"])   # no ECM
+        self._case("Medically Tailored Meals")
+        self.assertIn("not_enhanced_member", self._alert_codes())
+
+    def test_the_alert_says_the_programme_is_ON_HOLD(self):
+        from .models import EnrollmentStage
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.ON_HOLD)
+        alert = next(
+            a for a in tracker_for(self.member)["alerts"]
+            if a["code"] == "wrong_case_type"
+        )
+        self.assertIn("On Hold", alert["detail"])
+
+    def test_a_HELD_member_with_a_CLOSED_enrollment_still_reads_as_held(self):
+        """⚠ Reading only the NON-held enrollments made this member look terminal, so
+        the alert dropped the outcome entirely while their deliveries were stopped."""
+        from .models import (
+            EnrollmentStage, EnrollmentVerification, MemberDietaryProfile,
+        )
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.ON_HOLD)
+        self._enroll(EnrollmentStage.CLOSED)
+        alert = next(
+            a for a in tracker_for(self.member)["alerts"]
+            if a["code"] == "wrong_case_type"
+        )
+        self.assertIn("On Hold", alert["detail"])
+
+    def test_a_PRE_SERVICE_member_is_told_a_TICKET_was_raised(self):
+        """Saying "the programme is On Hold" to someone whose programme is not held
+        would be its own wrong answer."""
+        from .models import EnrollmentStage
+        from .services.service_tracker import tracker_for
+
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Food Prescriptions (Voucher / Boxes) (Food)"])
+        self._case("Medically Tailored Meals")
+        self._enroll(EnrollmentStage.KITCHEN_ASSIGNMENT)
+        alert = next(
+            a for a in tracker_for(self.member)["alerts"]
+            if a["code"] == "wrong_case_type"
+        )
+        self.assertIn("ticket", alert["detail"].lower())
+        self.assertNotIn("On Hold", alert["detail"])
+
+    def test_a_member_who_PASSES_gets_no_rule_alert(self):
+        self._screen(["Clinically Appropriate Meals (Food)"])
+        self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
+        self._case("Medically Tailored Meals")
+        codes = self._alert_codes()
+        self.assertNotIn("wrong_case_type", codes)
+        self.assertNotIn("not_enhanced_member", codes)
+
     def test_NO_food_case_is_still_outstanding(self):
         self._screen(["Clinically Appropriate Meals (Food)"])
         self._assess([self.ECM, "Medically Tailored Meals (MTM) (Food)"])
@@ -36752,7 +36856,7 @@ class ServiceTrackerAlertsTest(TestCase):
         self.assertNotIn("no_ecm_housing", codes)
 
     # ── 4: the wrong kind of food case -- REMOVED ─────────────────────────
-    def test_a_food_case_on_EITHER_service_raises_NOTHING(self):
+    def test_boxes_eligible_with_a_MEALS_case_now_raises_RULE_3(self):
         """⚠ THE ALERTS WERE REMOVED, and this asserts their absence.
 
         They fired when a member held a meals case with voucher eligibility, or the
@@ -36769,16 +36873,24 @@ class ServiceTrackerAlertsTest(TestCase):
         I built them from the eligibility strings without asking whether the payer
         agreed. That was one query away.
         """
-        # ⚠ ONLY the boxes-eligible + MEALS case direction is silent here. The
-        # reverse -- meals-only eligibility holding a BOXES case -- became a WARNING
-        # (rule 4), and is asserted in its own test below. The programme is still not
-        # HELD for it, which is the part that matters.
+        # ⚠ THIS TEST NOW ASSERTS THE OPPOSITE, and the requirement is what changed.
+        #
+        # It was written when BOTH directions were removed as noise, which was right
+        # at the time. Then boxes-eligible + a MEALS case became RULE 3 and started
+        # HOLDING the programme -- 96 households -- and a hold the panel does not
+        # mention is worse than the noise this test was protecting against: the
+        # tracker showed "[done] Food service case" beside stopped deliveries.
+        #
+        # The other direction (meals-only + a BOXES case) is still not held: it is
+        # rule 4, a warning, asserted in the test below. That asymmetry is the whole
+        # finding -- stepping DOWN to boxes is normal and payer-approved, stepping UP
+        # to meals without eligibility is not.
         self.member.cases.all().delete()
         self.member.assessments.all().delete()
         self._screen([self.MTM])
         self._assess([self.ECM, self.VOUCHER])
         self._case("Medically Tailored Meals")
-        self.assertEqual(self._codes(), [])
+        self.assertEqual(self._codes(), ["wrong_case_type"])
 
     def test_rule4_meals_only_with_a_BOXES_case_WARNS_but_does_not_hold(self):
         """⚠ A warning, never a hold: 218 of 219 such cases are APPROVED by the

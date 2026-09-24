@@ -160,6 +160,9 @@ def gather(client):
         "ecm": ECM in eligible,
         # Where the member LIVES, for the borough check on every row.
         "home_borough": member_home_borough(client),
+        # The member, so detect_alerts can call evaluate_governing_case rather than
+        # restating its conditions -- see _internal_service_rule_alerts.
+        "client": client,
     }
 
 
@@ -716,6 +719,75 @@ def _alert(code, title, detail, *, severity="error", program=""):
     }
 
 
+# What the internal-service rules decide, restated for the panel.
+#
+# ⚠ DRIVEN BY evaluate_governing_case ITSELF, not by a second copy of its
+# conditions. If the panel restated them it could drift from the rule, and the
+# failure mode is the worst one available here: the tracker saying a member is fine
+# while their deliveries are stopped. That is exactly the state 96 held households
+# were in.
+_RULE_ALERTS = {
+    "not_enhanced_member": (
+        "Not qualified for Enhanced Care Management (Level 2)",
+        "The latest eligibility assessment does not include ECM Level 2, so the "
+        "member is not entitled to internal services.",
+    ),
+    "wrong_case_type": (
+        "The open case is not the service the assessment permits",
+        "The latest eligibility assessment names a produce prescription and not "
+        "medically tailored meals, so a meals case cannot be served.",
+    ),
+}
+
+
+def _internal_service_rule_alerts(ctx):
+    """Rules 2 and 3, as panel alerts."""
+    client = ctx.get("client")
+    if client is None:
+        return []
+    # Imported here, not at module scope: internal_service_rules imports
+    # latest_eligible_services from THIS module.
+    from api.services.internal_service_rules import evaluate_governing_case
+
+    try:
+        verdict = evaluate_governing_case(client)
+    except Exception:  # noqa: BLE001 - the panel must render even if a rule fails
+        logger.exception("internal-service rule alert failed for %s", client.pk)
+        return []
+    if verdict is None:
+        return []
+    code, _reason = verdict
+    titles = _RULE_ALERTS.get(code)
+    if titles is None:
+        return []
+    title, detail = titles
+
+    # WHAT ACTUALLY HAPPENED to this member, because the rule's verdict alone no
+    # longer says: a member in service is HELD, one earlier in the funnel gets a
+    # TICKET, and a terminal enrollment gets neither. Saying "the programme is On
+    # Hold" to someone whose programme is not held would be its own wrong answer.
+    from api.models import EnrollmentStage
+    from api.services.internal_service_rules import TICKETABLE_STAGES
+
+    # ⚠ ASK "IS IT HELD?" FIRST, before looking at anything else. Reading only the
+    # non-held enrollments made a member with one ON_HOLD and one CLOSED enrollment
+    # look terminal, so the alert dropped the outcome sentence entirely while their
+    # deliveries were stopped. Which enrollments exist BESIDES the hold says nothing
+    # about whether the hold is there.
+    stages = {e.stage for e in client.enrollments.all()}
+    if EnrollmentStage.ON_HOLD in stages:
+        outcome = " The programme is On Hold."
+    elif EnrollmentStage.SERVICE_ACTIVE in stages:
+        # Found by the rule but not yet applied -- the next case write holds it.
+        outcome = " The programme will be held on the next case save."
+    elif stages & TICKETABLE_STAGES:
+        outcome = " A ticket has been raised; the programme is not held."
+    else:
+        # Closed, cancelled, disregarded or superseded: neither held nor ticketed.
+        outcome = " No programme is in service, so nothing was held."
+    return [_alert(code, title, detail + outcome, severity="error")]
+
+
 def detect_alerts(ctx):
     """What does not add up about this member's screening, eligibility and cases."""
     alerts = []
@@ -727,6 +799,11 @@ def detect_alerts(ctx):
     # can be opened at all, and every track is absent. Without this the tracker
     # would simply show nothing, which reads as "nothing to do here".
     if not ctx["ecm"]:
+        # ⚠ RULE 2 FIRST, and NOT gated on the screened domains. A member held as
+        # "Not an Enhanced Member" who was never screened for Housing or Food got
+        # neither an alert nor a single track -- an entirely EMPTY panel beside a
+        # stopped programme. 50 held households read that way.
+        alerts.extend(_internal_service_rule_alerts(ctx))
         for domain in ("Housing", "Food"):
             if domain in domains:
                 alerts.append(_alert(
@@ -767,6 +844,12 @@ def detect_alerts(ctx):
                 program=boxes_case.program_name or "",
                 severity="warning",
             ))
+
+    # RULE 3 -- boxes-only eligibility holding a MEALS case. This one DOES hold, and
+    # until now the panel said nothing about it: a member whose deliveries were
+    # stopped showed "[done] Food service case" and no alert at all. 96 held
+    # households.
+    alerts.extend(_internal_service_rule_alerts(ctx))
 
     # ⚠ THE OPPOSITE ALERT WAS REMOVED, and deliberately so.
     #

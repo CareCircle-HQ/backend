@@ -237,6 +237,37 @@ is wrong. The remedy is to correct the case, not off-ramp the member.
 **No ticket when we DO hold.** A service-active hold stops deliveries and is visible
 on its own.
 
+### The panel shows both holds
+
+| Rule | Panel alert | Severity |
+|---|---|---|
+| 2 — no ECM | `not_enhanced_member` | error |
+| 3 — boxes-only + a meals case | `wrong_case_type` | error |
+| 4 — meals-only + a boxes case | `boxes_case_meals_only` | warning |
+
+⚠️ **Both were invisible until 2026-09-24.** Rule 3 holds 96 households and the panel
+said nothing at all — the Food Program row read `[done] Food service case` beside
+stopped deliveries. Rule 2 was worse: the `no_ecm_*` alerts fire only when the member
+was *screened* for Food or Housing, so a member held as "Not an Enhanced Member" who
+was not screened for either got **no alert and no tracks** — a completely empty panel.
+
+Both alerts are driven by `evaluate_governing_case` itself, not by a second copy of
+its conditions. If the panel restated them it could drift from the rule, and the
+failure mode is the worst one available: the tracker saying a member is fine while
+their deliveries are stopped.
+
+Each alert names **what actually happened**, since the verdict alone no longer says:
+
+```
+in service        "The programme is On Hold."
+pre-service       "A ticket has been raised; the programme is not held."
+terminal          "No programme is in service, so nothing was held."
+```
+
+⚠️ Ask "is it held?" **first**. Reading only the non-held enrollments made a member
+with one `ON_HOLD` and one `CLOSED` enrollment look terminal, so the alert dropped
+the outcome entirely while their deliveries were stopped.
+
 The reasons written onto the hold:
 
 ```
