@@ -23,6 +23,7 @@ MEMBER_REQUESTED = "member_requested"
 ZIP_OUT_OF_COVERAGE = "zip_out_of_coverage"
 MEDICAID_TYPE_NOT_SERVED = "medicaid_type_not_served"
 ALL_MEMBERS_PAUSED = "all_members_paused"
+DERIVED_STATUS = "derived_status"
 UNCATEGORIZED = "uncategorized"
 
 

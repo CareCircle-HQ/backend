@@ -55,8 +55,13 @@ NOTE_RULES = [
     ("zip_out_of_coverage", (r"^Automatically placed on hold.*outside coverage area",)),
     ("social_coverage_invalid", (r"social care coverage",)),
     # Decided, not guessed. See the module docstring.
+    # ⚠ "Kept On Hold" moved OUT of the decided-uncategorized set. It has a precise
+    # reason -- the hold was INHERITED from the household's prior state so a new
+    # governing case could not silently resume a paused member -- and Uncategorized
+    # means "nobody recorded why", which is a different and wrong claim.
+    ("derived_status", (r"^Kept On Hold",)),
     ("uncategorized", (r"^Cancelled reconcile", r"^Bulk hold", r"^Bulk pause",
-                       r"^Kept On Hold", r"Reason Unknown")),
+                       r"Reason Unknown")),
     ("pending_case_closure", (r"Roster import.*Pending Closure",)),
 ]
 
@@ -94,7 +99,7 @@ class Command(BaseCommand):
         apply_it, overwrite = options["apply"], options["overwrite"]
         reasons = {r.code: r for r in HoldReason.objects.all()}
         needed = {c for c, _p in NOTE_RULES} | {c for c, _p in AGENT_RULES} | {
-            "medicaid_type_not_served", "uncategorized",
+            "medicaid_type_not_served", "uncategorized", "derived_status",
         }
         missing = needed - set(reasons)
         if missing:

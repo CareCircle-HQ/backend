@@ -4170,6 +4170,7 @@ def _carry_service_and_activate(
                 advance_enrollment(
                     new_enr, EnrollmentStage.ON_HOLD, actor=actor,
                     actor_label=actor_label, force=True, trigger="case_replaced",
+                    hold_reason=_hr.DERIVED_STATUS,
                     note=("Kept On Hold: the prior household was paused; a new "
                           "governing case must not auto-resume service. Flagged "
                           "Need Review."),
@@ -4274,6 +4275,7 @@ def _carry_service_and_activate(
             advance_enrollment(
                 new_enr, EnrollmentStage.ON_HOLD, actor=actor,
                 actor_label=actor_label, force=True, trigger="case_replaced",
+                hold_reason=_hr.DERIVED_STATUS,
                 note=("Kept On Hold: the prior household was paused; a new "
                       "governing case must not auto-resume service. Flagged "
                       "Need Review."),

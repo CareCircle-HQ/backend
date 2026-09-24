@@ -37024,19 +37024,106 @@ class PauseReasonTest(TestCase):
         self.assertEqual(code, "out_of_range")
         self.assertIn("ZIP", how)
 
-    def test_a_MEDICAID_TYPE_failure_stays_uncategorised(self):
-        """⚠ 497 members. It is the largest ineligibility gate in the system and the
-        catalogue has no reason for it -- calling it "insurance" would be a guess that
-        reads as a fact."""
+    # ⚠ REPLACED. This used to assert that a Medicaid plan-type failure stayed
+    # Uncategorized, on my argument that calling it "insurance" would be a guess.
+    # It was the wrong call -- the member's Medicaid plan IS their insurance -- and
+    # it left 493 members in the largest bucket on the page. See
+    # test_MEDICAID_plan_type_is_an_INSURANCE_failure below.
+
+    def test_MEDICAID_plan_type_is_an_INSURANCE_failure(self):
+        """⚠ I originally left these Uncategorized, arguing that calling an unserved
+        plan type "insurance" would be a guess. It is not: the member's Medicaid plan
+        IS the insurance, and an unserved type makes it invalid for our purposes.
+        493 of the 577 Uncategorized pauses were this one string."""
+        from .models import MemberStatus
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.client.ineligible_reasons = [
+            "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MLTC",
+        ]
+        profile.client.save(update_fields=["ineligible_reasons"])
+        code, how = self._classify(profile)
+        self.assertEqual(code, "insurance_invalid")
+        self.assertIn("Medicaid", how)
+
+    def test_the_coverage_area_wording_VARIANTS_all_map_to_out_of_range(self):
+        """⚠ "outside THE coverage area" was too tight -- the delivery-address
+        variant has no "the" and slipped into Uncategorized."""
+        from .models import MemberStatus
+
+        for stored in (
+            "home ZIP 33314 is outside the coverage area",
+            "delivery address outside coverage area",
+            "current ZIP 10301 is outside the coverage area",
+            "home state NJ is not served",
+        ):
+            with self.subTest(stored=stored):
+                profile = self._profile(
+                    status=MemberStatus.PAUSED, eligibility_paused=True,
+                )
+                profile.client.ineligible_reasons = [stored]
+                profile.client.save(update_fields=["ineligible_reasons"])
+                self.assertEqual(self._classify(profile)[0], "out_of_range")
+
+    def test_MEDICAID_is_checked_before_the_generic_insurance_match(self):
+        """The Medicaid string contains "FFS" and sits beside insurance wording, so
+        the order decides which reason 493 members get -- both land on
+        insurance_invalid, but only the Medicaid branch says so in `how`."""
         from .models import MemberStatus
 
         profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
         profile.client.ineligible_reasons = [
             "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MAP",
+            "all medical insurance plans are expired",
         ]
         profile.client.save(update_fields=["ineligible_reasons"])
-        code, _how = self._classify(profile)
-        self.assertEqual(code, "uncategorized")
+        self.assertIn("Medicaid", self._classify(profile)[1])
+
+    def test_reclassify_uncategorized_leaves_a_REAL_reason_alone(self):
+        """⚠ NOT --overwrite. Re-running a classifier over a category an agent chose
+        by hand is the whole risk of touching live data twice."""
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus, PauseReason
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.pause_reason = PauseReason.objects.get(code="member_cancelled")
+        profile.save(update_fields=["pause_reason"])
+        profile.client.ineligible_reasons = [
+            "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MLTC",
+        ]
+        profile.client.save(update_fields=["ineligible_reasons"])
+
+        out = StringIO()
+        call_command(
+            "backfill_pause_reasons", "--reclassify-uncategorized", "--apply",
+            stdout=out, stderr=out,
+        )
+        profile.refresh_from_db()
+        self.assertEqual(profile.pause_reason.code, "member_cancelled")
+
+    def test_reclassify_uncategorized_DOES_revisit_an_uncategorized_one(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from .models import MemberStatus, PauseReason
+
+        profile = self._profile(status=MemberStatus.PAUSED, eligibility_paused=True)
+        profile.pause_reason = PauseReason.objects.get(code="uncategorized")
+        profile.save(update_fields=["pause_reason"])
+        profile.client.ineligible_reasons = [
+            "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS): MLTC",
+        ]
+        profile.client.save(update_fields=["ineligible_reasons"])
+
+        out = StringIO()
+        call_command(
+            "backfill_pause_reasons", "--reclassify-uncategorized", "--apply",
+            stdout=out, stderr=out,
+        )
+        profile.refresh_from_db()
+        self.assertEqual(profile.pause_reason.code, "insurance_invalid")
 
     def test_pause_locked_means_a_CASE_TYPE_SWITCH(self):
         from .models import MemberStatus
@@ -37897,6 +37984,7 @@ class HoldReasonTest(TestCase):
         ("zip_out_of_coverage", "Delivery ZIP outside coverage", "none", True),
         ("medicaid_type_not_served", "Medicaid plan type not served", "none", True),
         ("all_members_paused", "All household members paused", "auto", True),
+        ("derived_status", "Derived Status", "manual", True),
         ("uncategorized", "Uncategorized", "none", False),
     ]
 
@@ -38133,6 +38221,28 @@ class HoldReasonTest(TestCase):
             with self.subTest(note=note[:40]):
                 self.assertEqual(self._classify(note)[0], expected)
 
+    def test_a_CARRIED_OVER_hold_is_Derived_Status_not_Uncategorized(self):
+        """⚠ It has a precise reason: the hold was INHERITED from the household's
+        prior state so a new governing case could not silently resume a paused
+        member. Uncategorized means "nobody recorded why", which is a different and
+        wrong claim -- and it hid 607 events behind the largest bucket on the page."""
+        code, how = self._classify(
+            "Kept On Hold: the prior household was paused; a new governing case "
+            "must not auto-resume service. Flagged Need Review.",
+        )
+        self.assertEqual(code, "derived_status")
+        self.assertEqual(how, "machine-written note")
+
+    def test_Derived_Status_resumes_MANUALLY_not_never(self):
+        """Nothing clears it automatically -- that is the point of the mechanism --
+        but an agent CAN resume after reviewing, unlike the reasons where no resume
+        is possible at all."""
+        from .models import HoldReason
+
+        self.assertEqual(
+            HoldReason.objects.get(code="derived_status").resume_policy, "manual",
+        )
+
     def test_the_AGREED_uncategorized_ones_stay_uncategorized(self):
         """⚠ By DECISION, not failure. Over-interpreting a July spreadsheet's
         wording is how a category stops meaning anything."""
@@ -38141,8 +38251,6 @@ class HoldReasonTest(TestCase):
             "approved.",
             "Bulk hold 9/23: governing household case.",
             "Bulk pause: Services paused per Unite Us cases list.",
-            "Kept On Hold: the prior household was paused; a new governing case "
-            "must not auto-resume it.",
             "Roster import: placed on hold. Reason: Reason Unknown (Potentially "
             "Authorization Status)",
         ):
@@ -38414,6 +38522,76 @@ class OnHoldTabTest(TestCase):
         self._household("Ada", EnrollmentStage.ON_HOLD, "pending_case_closure")
         self.assertEqual(self._get("?reason=nonsense")["count"], 0)
 
+    # ── who placed the hold ─────────────────────────────────────────────────
+    def _hold_event(self, enr, *, note="", source="manual", label=None):
+        from .models import EnrollmentStage, StageEvent
+
+        return StageEvent.objects.create(
+            entity_type="enrollment", enrollment=enr, client=enr.client,
+            to_stage=EnrollmentStage.ON_HOLD, note=note, source=source,
+            metadata={"actor_label": label} if label else {},
+        )
+
+    def test_the_AGENT_NAME_is_read_from_the_hold_note(self):
+        """⚠ StageEvent.actor -- the FK meant for exactly this -- is NULL on all
+        7,686 holds ever recorded, because the portal acts as an Agent rather than a
+        Django User and passes a label instead. The name lives in the note."""
+        from .models import EnrollmentStage
+
+        _p, enr = self._household("Nm", EnrollmentStage.ON_HOLD, "pending_case_closure")
+        self._hold_event(
+            enr, note="Placed on hold by Kathy Pearson Soto. Reason: 9/1 HH Close",
+        )
+        self.assertEqual(self._get()["results"][0]["held_by"], "Kathy Pearson Soto")
+
+    def test_a_SYSTEM_label_reports_System(self):
+        from .models import EnrollmentStage
+
+        for label in ("system:cancelled-reconcile", "cron:reauth-extensions",
+                      "System (bulk 9/23)"):
+            with self.subTest(label=label):
+                _p, enr = self._household(
+                    f"Sy{label[:4]}", EnrollmentStage.ON_HOLD, "uncategorized",
+                )
+                self._hold_event(enr, source="auto", label=label)
+                row = next(
+                    r for r in self._get()["results"]
+                    if r["name"].startswith(f"Sy{label[:4]}")
+                )
+                self.assertEqual(row["held_by"], "System")
+
+    def test_an_UNATTRIBUTED_manual_hold_says_Agent_not_System(self):
+        """⚠ 2,855 manual holds carry no attributable agent. Reporting them as
+        "System" would claim the system did something a person did -- worse than
+        admitting it was never recorded."""
+        from .models import EnrollmentStage
+
+        _p, enr = self._household("Un", EnrollmentStage.ON_HOLD, "uncategorized")
+        self._hold_event(enr, note="Some note with no name", source="manual")
+        self.assertEqual(self._get()["results"][0]["held_by"], "Agent")
+
+    def test_an_auto_hold_with_no_label_is_System(self):
+        from .models import EnrollmentStage
+
+        _p, enr = self._household("Au", EnrollmentStage.ON_HOLD, "uncategorized")
+        self._hold_event(enr, note="Auto-paused: sole case denied.", source="auto")
+        self.assertEqual(self._get()["results"][0]["held_by"], "System")
+
+    def test_the_MOST_RECENT_hold_event_names_the_actor(self):
+        from datetime import timedelta
+
+        from .models import EnrollmentStage, StageEvent
+
+        _p, enr = self._household("Rc", EnrollmentStage.ON_HOLD, "uncategorized")
+        old = self._hold_event(
+            enr, note="Placed on hold by Old Agent. Reason: first",
+        )
+        StageEvent.objects.filter(pk=old.pk).update(
+            entered_at=timezone.now() - timedelta(days=10),
+        )
+        self._hold_event(enr, note="Placed on hold by New Agent. Reason: second")
+        self.assertEqual(self._get()["results"][0]["held_by"], "New Agent")
+
     # ── only holds with an OPEN governing case ──────────────────────────────
     def test_a_CLOSED_governing_case_is_hidden_by_default(self):
         """⚠ Such a household cannot be resumed at all -- the Resume preview's first
@@ -38440,6 +38618,54 @@ class OnHoldTabTest(TestCase):
             governing_internal_case_status="closed",
         )
         self.assertEqual(self._get("?governing=all")["count"], 1)
+
+    def test_an_ELIGIBILITY_OFF_RAMPED_member_is_hidden(self):
+        """⚠ TWO separate stages, and excluding only one would leave 307 unworkable
+        rows looking like a backlog.
+
+        INELIGIBLE is the import-time gate -- expired insurance, unserved Medicaid
+        type, out-of-range address -- and is STICKY until the data recovers, so
+        nothing an agent does on this page clears it. NOT_ELIGIBLE is the terminal
+        off-ramp. Neither can be resumed into service.
+        """
+        from .models import Client, ClientStage, EnrollmentStage
+
+        for stage in (ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE):
+            with self.subTest(stage=stage):
+                primary, _enr = self._household(
+                    f"Off{stage[:3]}", EnrollmentStage.ON_HOLD,
+                    "pending_case_closure",
+                )
+                Client.objects.filter(pk=primary.pk).update(lifecycle_stage=stage)
+                self.assertEqual(
+                    self._get()["count"], 0, f"{stage} should be hidden",
+                )
+                Client.objects.filter(pk=primary.pk).delete()
+
+    def test_governing_all_also_shows_the_off_ramped(self):
+        """One escape hatch, not two -- ?governing=all lifts both gates, so the full
+        list is always one parameter away."""
+        from .models import Client, ClientStage, EnrollmentStage
+
+        primary, _enr = self._household(
+            "Ine", EnrollmentStage.ON_HOLD, "pending_case_closure",
+        )
+        Client.objects.filter(pk=primary.pk).update(
+            lifecycle_stage=ClientStage.INELIGIBLE,
+        )
+        self.assertEqual(self._get("?governing=all")["count"], 1)
+
+    def test_an_ACTIVE_member_on_hold_is_still_shown(self):
+        """The filters must not swallow the actual queue -- 2,000 of 4,226."""
+        from .models import Client, ClientStage, EnrollmentStage
+
+        primary, _enr = self._household(
+            "Act", EnrollmentStage.ON_HOLD, "pending_case_closure",
+        )
+        Client.objects.filter(pk=primary.pk).update(
+            lifecycle_stage=ClientStage.ACTIVE,
+        )
+        self.assertEqual(self._get()["count"], 1)
 
     def test_an_OPEN_governing_case_is_shown(self):
         from .models import Client, EnrollmentStage
@@ -38715,6 +38941,108 @@ class InternalServiceRulesTest(TestCase):
         self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
         self.assertEqual(enr.hold_reason.code, "not_enhanced_member")
 
+    # ── hold only in service; ticket otherwise ──────────────────────────────
+    def test_SERVICE_ACTIVE_is_HELD_and_raises_NO_ticket(self):
+        """A service-active hold stops real deliveries and is visible on its own."""
+        from .models import EnrollmentStage, Ticket
+
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+        )
+        self.assertEqual(len(self._apply(client)), 1)
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        self.assertEqual(Ticket.objects.filter(client=client).count(), 0)
+
+    def test_KITCHEN_ASSIGNMENT_is_TICKETED_not_held(self):
+        """⚠ The change. Resuming a household held at kitchen assignment returns it
+        to KITCHEN ASSIGNMENT, not to service -- so it must be re-assigned and
+        re-scheduled, and can lose SEVERAL delivery cycles. Before Service Active a
+        hold protects nothing and costs that."""
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        TicketType.objects.get_or_create(
+            code="not_enhanced_member", defaults={"label": "Not an Enhanced Member"},
+        )
+        client, enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+            stage=EnrollmentStage.KITCHEN_ASSIGNMENT,
+        )
+        self.assertEqual(self._apply(client), [])
+        enr.refresh_from_db()
+        self.assertEqual(enr.stage, EnrollmentStage.KITCHEN_ASSIGNMENT)
+        ticket = Ticket.objects.filter(client=client).first()
+        self.assertIsNotNone(ticket)
+        self.assertEqual(ticket.type.code, "not_enhanced_member")
+        self.assertIn("not yet in service", ticket.reason)
+
+    def test_every_PRE_SERVICE_stage_is_ticketed(self):
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        for code in ("not_enhanced_member", "wrong_case_type"):
+            TicketType.objects.get_or_create(code=code, defaults={"label": code})
+        for stage in (EnrollmentStage.PENDING_VERIFICATION, EnrollmentStage.VERIFIED,
+                      EnrollmentStage.KITCHEN_ASSIGNMENT):
+            with self.subTest(stage=stage):
+                client, enr = self._member(
+                    eligible=[self.MTM], case_service="Medically Tailored Meals",
+                    stage=stage,
+                )
+                self.assertEqual(self._apply(client), [])
+                self.assertEqual(Ticket.objects.filter(client=client).count(), 1)
+
+    def test_a_TERMINAL_enrollment_gets_NEITHER(self):
+        """⚠ Closed / cancelled / disregarded / superseded: nothing for anyone to
+        correct. Ticketing them would have raised ~65 tickets nobody can action --
+        which is how a new ticket type becomes noise on the day it ships."""
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        TicketType.objects.get_or_create(
+            code="not_enhanced_member", defaults={"label": "Not an Enhanced Member"},
+        )
+        for stage in (EnrollmentStage.CLOSED, EnrollmentStage.CANCELLED,
+                      EnrollmentStage.DISREGARDED):
+            with self.subTest(stage=stage):
+                client, _enr = self._member(
+                    eligible=[self.MTM], case_service="Medically Tailored Meals",
+                    stage=stage,
+                )
+                self.assertEqual(self._apply(client), [])
+                self.assertEqual(Ticket.objects.filter(client=client).count(), 0)
+
+    def test_the_ticket_is_IDEMPOTENT_across_re_imports(self):
+        """These rules run on every case write, so a duplicate per import would
+        bury the queue."""
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        TicketType.objects.get_or_create(
+            code="not_enhanced_member", defaults={"label": "Not an Enhanced Member"},
+        )
+        client, _enr = self._member(
+            eligible=[self.MTM], case_service="Medically Tailored Meals",
+            stage=EnrollmentStage.VERIFIED,
+        )
+        self._apply(client)
+        self._apply(client)
+        self._apply(client)
+        self.assertEqual(Ticket.objects.filter(client=client).count(), 1)
+
+    def test_the_ticket_type_matches_the_RULE(self):
+        from .models import EnrollmentStage, Ticket, TicketType
+
+        for code in ("not_enhanced_member", "wrong_case_type"):
+            TicketType.objects.get_or_create(code=code, defaults={"label": code})
+        client, _enr = self._member(
+            eligible=[self.ECM, self.BOXES],          # rule 3
+            case_service="Medically Tailored Meals",
+            stage=EnrollmentStage.VERIFIED,
+        )
+        self._apply(client)
+        self.assertEqual(
+            Ticket.objects.filter(client=client).first().type.code,
+            "wrong_case_type",
+        )
+
     def test_the_command_DRY_RUNS_by_default(self):
         """⚠ The command exists because these rules otherwise have no dry run: they
         fire on import, so without it the first sight of the blast radius is after
@@ -38821,6 +39149,16 @@ class InternalServiceRulesTriggerTest(TestCase):
             ("uncategorized", "Uncategorized"),
         ):
             HoldReason.objects.create(code=code, label=label)
+        # Migrations are disabled under the test runner, so the seeded ticket types
+        # do not exist -- a pre-service member is ticketed, and open_ticket needs
+        # the type to be there.
+        from .models import TicketType
+
+        for code, label in (
+            ("not_enhanced_member", "Not an Enhanced Member"),
+            ("wrong_case_type", "Wrong Case Type Opened"),
+        ):
+            TicketType.objects.get_or_create(code=code, defaults={"label": label})
         self.agent = Agent.objects.create(
             name="Trig Agent", agent_code="897", group="Management",
         )
@@ -38936,9 +39274,18 @@ class InternalServiceRulesTriggerTest(TestCase):
         importer.reconcile_client_ids = {client.pk}
         importer.reconcile_touched_cases()
 
+        # ⚠ A TICKET, not a hold. The authorization reconcile that runs first leaves
+        # this enrollment at VERIFIED, and a member who is not yet in service is
+        # ticketed rather than held -- resuming a pre-service hold costs delivery
+        # cycles and protects nothing. What this test pins is that the CSV cases
+        # import REACHES the rules at all, which is the gap it was written for.
+        from .models import Ticket, TicketType
+
         enr.refresh_from_db()
-        self.assertEqual(enr.stage, EnrollmentStage.ON_HOLD)
-        self.assertEqual(enr.hold_reason.code, "wrong_case_type")
+        self.assertNotEqual(enr.stage, EnrollmentStage.ON_HOLD)
+        ticket = Ticket.objects.filter(client=client).first()
+        self.assertIsNotNone(ticket, "the cases import did not reach the rules")
+        self.assertEqual(ticket.type.code, "wrong_case_type")
 
 
 class HoldPauseDatesTest(TestCase):

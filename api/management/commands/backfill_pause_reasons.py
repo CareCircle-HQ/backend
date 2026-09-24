@@ -80,6 +80,13 @@ class Command(BaseCommand):
             "--overwrite", action="store_true",
             help="Re-classify profiles that already have a reason.",
         )
+        parser.add_argument(
+            "--reclassify-uncategorized", action="store_true",
+            help=(
+                "Re-run ONLY over profiles currently on Uncategorized. Safer than "
+                "--overwrite, which would also revisit reasons an agent set by hand."
+            ),
+        )
 
     def handle(self, *args, **options):
         from collections import Counter
@@ -90,6 +97,11 @@ class Command(BaseCommand):
 
         apply_it = options["apply"]
         overwrite = options["overwrite"]
+        # ⚠ NOT the same as --overwrite. This revisits ONLY the Uncategorized ones,
+        # so a category an agent chose deliberately is never second-guessed by a
+        # classifier -- which is the whole risk of re-running a backfill over live
+        # data.
+        redo_uncategorized = options["reclassify_uncategorized"]
 
         reasons = {r.code: r for r in PauseReason.objects.all()}
         missing = {
@@ -125,7 +137,7 @@ class Command(BaseCommand):
         profiles = list(
             MemberDietaryProfile.objects
             .filter(status__in=targets)
-            .select_related("client")
+            .select_related("client", "pause_reason")
         )
 
         # The most recent pause note per client, read in ONE query rather than per
@@ -141,7 +153,14 @@ class Command(BaseCommand):
         examples = {}
         to_write = []
         for profile in profiles:
-            if profile.pause_reason_id and not overwrite:
+            already = profile.pause_reason_id is not None
+            is_uncategorized = (
+                already and profile.pause_reason
+                and profile.pause_reason.code == "uncategorized"
+            )
+            if already and not overwrite and not (
+                redo_uncategorized and is_uncategorized
+            ):
                 decided["(already set, skipped)"] += 1
                 continue
 
@@ -197,19 +216,31 @@ class Command(BaseCommand):
             stored = " ".join(
                 getattr(client, "ineligible_reasons", None) or []
             ).lower()
+            # ⚠ MEDICAID PLAN TYPE IS AN INSURANCE FAILURE. Checked FIRST, because
+            # the string contains "FFS" and sits beside insurance wording -- and
+            # because it is the largest ineligibility gate in the system, 493 of the
+            # 577 pauses that were sitting in Uncategorized.
+            #
+            # I originally left these Uncategorized on the grounds that calling an
+            # unserved plan type "insurance" would be a guess. It is not a guess: the
+            # member's Medicaid plan is the insurance, and an unserved plan type
+            # makes it invalid for our purposes. Confirmed as the intended
+            # categorisation.
+            if "medicaid plan type" in stored:
+                return "insurance_invalid", "eligibility gate, Medicaid plan type"
             if "insurance" in stored:
                 return "insurance_invalid", "eligibility gate + stored reason"
-            # A ZIP or state failure IS Out of Range, even though the member's STATUS
-            # is PAUSED rather than OUT_OF_RANGE -- the gate pauses them individually
-            # instead of setting the status. 396 members read as unclassifiable until
-            # this was added, for a reason the catalogue already had a name for.
-            if "outside the coverage area" in stored or "is not served" in stored:
-                return "out_of_range", "eligibility gate, ZIP/state"
-            # ⚠ WHAT IS LEFT IS MOSTLY ONE REASON THE CATALOGUE DOES NOT HAVE:
-            # "Medicaid plan type not served (PMLTC/MLTCP/MLTC/MAP/FFS)", 497
-            # members. It is the single largest ineligibility gate in the system
-            # (16,898 clients). Calling it "insurance" would be a guess that reads as
-            # a fact, so it stays Uncategorized until there is a reason for it.
+            # A ZIP, ADDRESS or state failure IS Out of Range, even though the
+            # member's STATUS is PAUSED rather than OUT_OF_RANGE -- the gate pauses
+            # them individually instead of setting the status.
+            #
+            # ⚠ "outside THE coverage area" was too tight: the delivery-address
+            # variant reads "delivery address outside coverage area", with no "the",
+            # and slipped into Uncategorized.
+            if "outside the coverage area" in stored or "outside coverage area" in stored:
+                return "out_of_range", "eligibility gate, ZIP/address"
+            if "is not served" in stored:
+                return "out_of_range", "eligibility gate, state"
             return "uncategorized", "eligibility gate, no catalogue reason"
 
         # 3. the note text -- weakest, and only for a manual pause
