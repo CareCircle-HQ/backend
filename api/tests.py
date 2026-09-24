@@ -40278,3 +40278,133 @@ class ResumeAuthorizationWindowTest(TestCase):
         plan = self._plan(enr)
         self.assertTrue(plan["allowed"])
         self.assertFalse(plan["checks"]["authorization_not_started"])
+
+
+class NotEnhancedMemberWarningTest(TestCase):
+    """The Profile-tab warning for a member whose latest assessment does not name
+    ECM Level 2.
+
+    Its own class rather than extra methods on ClientEligibilityWarningsViewTest:
+    every test here needs a client that passes the OTHER four gates, so only this
+    warning can fire, and that fixture does not belong to the existing class.
+    """
+
+    def _api(self):
+        from rest_framework.test import APIClient
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name="Ext", agent_code=str(uuid.uuid4())[:8], group="CS",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _codes(self, client_id):
+        resp = self._api().get(f"/api/clients/{client_id}/eligibility-warnings/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return {w["code"] for w in resp.data["warnings"]}
+
+    def _member(self, assessments):
+        """A client that passes every OTHER gate. ``assessments`` is (days_ago,
+        services) pairs."""
+        from datetime import timedelta
+
+        from .models import (
+            Address, AddressType, Assessment, Client, Insurance, ServiceZipCode,
+            SocialCareCoverage, SocialCareCoverageStatus,
+        )
+
+        ServiceZipCode.objects.get_or_create(
+            zip="10001", defaults={"is_active": True},
+        )
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ecm", last_name="Member",
+        )
+        Insurance.objects.create(
+            client=client, plan_name="Fidelis Medicaid", external_member_id="1",
+        )
+        Address.objects.create(client=client, type=AddressType.CURRENT, zip="10001")
+        SocialCareCoverage.objects.create(
+            client=client, coverage_id=uuid.uuid4(),
+            status=SocialCareCoverageStatus.ENROLLED, plan_name="Social Care",
+        )
+        # ⚠ ONE base timestamp for the whole fixture. timezone.now() per row puts
+        # "same day" records MICROSECONDS apart, so the tie test below would not
+        # actually tie -- which is exactly how the rule's tie test first passed for
+        # the wrong reason.
+        base = timezone.now().replace(hour=4, minute=0, second=0, microsecond=0)
+        for days_ago, services in assessments:
+            Assessment.objects.create(
+                assessment_id=uuid.uuid4(), subject_id=uuid.uuid4(), client=client,
+                eligible_services=services,
+                screen_created_at=base - timedelta(days=days_ago),
+            )
+        return client
+
+    def test_a_latest_assessment_without_ECM_warns(self):
+        client = self._member([(0, ["Navigation Services (Level 1)"])])
+        self.assertIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_the_wording_is_the_one_the_rule_uses(self):
+        """The same sentence the hold writes, so an agent reads one explanation
+        whether they are in the extension, the CRM or the hold history."""
+        client = self._member([(0, ["Navigation Services (Level 1)"])])
+        resp = self._api().get(f"/api/clients/{client.pk}/eligibility-warnings/")
+        warning = next(
+            w for w in resp.data["warnings"] if w["code"] == "not_enhanced_member"
+        )
+        self.assertEqual(warning["title"], "Not an Enhanced Member")
+        self.assertIn("does not include ECM Level 2", warning["detail"])
+        self.assertIn("not entitled to internal services", warning["detail"])
+
+    def test_an_assessment_WITH_ECM_does_not_warn(self):
+        client = self._member([(0, ["Enhanced Care Management (Level 2)"])])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_NO_assessment_does_not_warn(self):
+        """⚠ "No assessment" is not "not entitled". 6,002 of 17,028 members with a
+        live case have none; warning all of them would be the loudest thing on the
+        Profile tab and wrong every time."""
+        client = self._member([])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_an_EMPTY_assessment_does_not_warn(self):
+        """18.2% of assessment records name no services. One that determined nothing
+        has not ruled the member out."""
+        client = self._member([(0, [])])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_TIED_assessments_are_UNIONED_before_deciding(self):
+        """⚠ The same trap as the hold rule: screen_created_at is date-only for 77%
+        of assessments, so two records from one day cannot be ordered. Reading one
+        arbitrarily held 8 members as "Not an Enhanced Member" while a same-day
+        record said they have ECM."""
+        client = self._member([
+            (0, ["Navigation Services (Level 1)"]),
+            (0, ["Enhanced Care Management (Level 2)"]),
+        ])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_an_OLDER_assessment_with_ECM_does_not_rescue_the_member(self):
+        """Rule 1: only the latest DATE counts."""
+        client = self._member([
+            (120, ["Enhanced Care Management (Level 2)"]),
+            (0, ["Navigation Services (Level 1)"]),
+        ])
+        self.assertIn("not_enhanced_member", self._codes(client.pk))
+
+    def test_a_NEWER_assessment_with_ECM_clears_it(self):
+        """The mirror, and the case that actually happened: JAIAIRE ADAMSBIRD warned
+        on an April assessment naming Navigation Level 1 until the extension imported
+        his July one, which names ECM. The warning went away on its own."""
+        client = self._member([
+            (120, ["Navigation Services (Level 1)"]),
+            (0, ["Enhanced Care Management (Level 2)"]),
+        ])
+        self.assertNotIn("not_enhanced_member", self._codes(client.pk))
