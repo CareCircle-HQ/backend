@@ -4333,6 +4333,21 @@ class NeedReviewMembersListView(UnlinkedMembersListView):
             tags__name=self.NEED_REVIEW_TAG
         ).prefetch_related("insurances", "cases", "assessments", "tags")
 
+        # NOT the eligibility-off-ramped, by default -- 21 of 733 rows here, far
+        # smaller than the other tabs (65% on Paused, 42% on No Care Management) but
+        # the same argument: a review of a CareCircle-UNFIXABLE member can only
+        # conclude "close the case", which is not what this queue is for.
+        #
+        # Done for CONSISTENCY as much as volume. Four tabs on one page that each
+        # decide differently whether to show an ineligible member is its own cost:
+        # an agent cannot trust any count without knowing which tab they are on.
+        #
+        # ?eligible=all restores the full list rather than hiding rows silently.
+        if (params.get("eligible") or "").lower() != "all":
+            qs = qs.exclude(lifecycle_stage__in=(
+                ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE,
+            ))
+
         search = (params.get("search") or "").strip()
         if search:
             cond = (

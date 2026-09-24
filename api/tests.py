@@ -40536,3 +40536,79 @@ class NoCareManagementTabTest(TestCase):
 
         self._member(stage=ClientStage.SERVICE_INACTIVE)
         self.assertEqual(self._get()["count"], 1)
+
+
+class NeedReviewTabEligibilityTest(TestCase):
+    """Urgent Care -> Need Review excludes the eligibility-off-ramped, like the
+    other three tabs.
+
+    21 of 733 rows here -- far smaller than Paused (65%) or No Care Management (42%)
+    -- but the same argument: a review of a CareCircle-UNFIXABLE member can only
+    conclude "close the case". Done for consistency as much as volume; four tabs on
+    one page that each decide differently is its own cost.
+    """
+
+    TAG = "Need Review"
+
+    def setUp(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent, ClientTag
+
+        ClientTag.objects.get_or_create(name=self.TAG)
+        agent = Agent.objects.create(
+            name="Rv Agent", agent_code=str(uuid.uuid4())[:8], group="Management",
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+
+    def _tagged(self, stage=None):
+        from .models import Client, ClientStage, ClientTag
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Rv", last_name="Member",
+            client_added_at=timezone.now(),
+            lifecycle_stage=stage or ClientStage.ACTIVE,
+        )
+        client.tags.add(ClientTag.objects.get(name=self.TAG))
+        return client
+
+    def _get(self, qs=""):
+        resp = self.api.get(f"/api/portal/members/need-review/{qs}")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data
+
+    def test_a_tagged_eligible_member_is_listed(self):
+        self._tagged()
+        self.assertEqual(self._get()["count"], 1)
+
+    def test_an_ELIGIBILITY_OFF_RAMPED_member_is_hidden(self):
+        from .models import Client, ClientStage
+
+        for stage in (ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE):
+            with self.subTest(stage=stage):
+                client = self._tagged(stage=stage)
+                self.assertEqual(self._get()["count"], 0, f"{stage} should be hidden")
+                Client.objects.filter(pk=client.pk).delete()
+
+    def test_eligible_all_restores_them(self):
+        from .models import ClientStage
+
+        self._tagged(stage=ClientStage.INELIGIBLE)
+        self.assertEqual(self._get()["count"], 0)
+        self.assertEqual(self._get("?eligible=all")["count"], 1)
+
+    def test_an_UNTAGGED_member_is_never_listed(self):
+        """The tab IS the tag filter -- the eligibility exclusion must not widen it."""
+        from .models import Client, ClientStage
+
+        Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="No", last_name="Tag",
+            client_added_at=timezone.now(), lifecycle_stage=ClientStage.ACTIVE,
+        )
+        self.assertEqual(self._get()["count"], 0)
