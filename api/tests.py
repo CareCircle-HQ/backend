@@ -37521,6 +37521,10 @@ class PausedMembersTabTest(TestCase):
         client = Client.objects.create(
             client_id=str(uuid.uuid4()), first_name=name, last_name="Member",
             client_added_at=timezone.now(),
+            # ⚠ The tab filters on this, so a fixture that leaves it blank is
+            # hidden and every assertion on results[0] dies with an IndexError.
+            # Third fixture in this file to need it -- the dependency is real.
+            governing_internal_case_status="open",
         )
         household = Household.objects.create(name=f"{name} HH")
         HouseholdMember.objects.create(
@@ -38951,9 +38955,10 @@ class OnHoldTabTest(TestCase):
                 )
                 Client.objects.filter(pk=primary.pk).delete()
 
-    def test_governing_all_also_shows_the_off_ramped(self):
-        """One escape hatch, not two -- ?governing=all lifts both gates, so the full
-        list is always one parameter away."""
+    def test_BOTH_switches_are_needed_to_see_an_off_ramped_row(self):
+        """⚠ REWRITTEN. This used to assert ?governing=all lifted BOTH gates, which
+        was the bug: two filters sharing one switch means a caller cannot tell which
+        one is hiding a row. Each now has its own."""
         from .models import Client, ClientStage, EnrollmentStage
 
         primary, _enr = self._household(
@@ -38962,7 +38967,8 @@ class OnHoldTabTest(TestCase):
         Client.objects.filter(pk=primary.pk).update(
             lifecycle_stage=ClientStage.INELIGIBLE,
         )
-        self.assertEqual(self._get("?governing=all")["count"], 1)
+        self.assertEqual(self._get("?governing=all")["count"], 0)
+        self.assertEqual(self._get("?eligible=all")["count"], 1)
 
     def test_an_ACTIVE_member_on_hold_is_still_shown(self):
         """The filters must not swallow the actual queue -- 2,000 of 4,226."""
@@ -40574,6 +40580,8 @@ class NeedReviewTabEligibilityTest(TestCase):
             client_id=str(uuid.uuid4()), first_name="Rv", last_name="Member",
             client_added_at=timezone.now(),
             lifecycle_stage=stage or ClientStage.ACTIVE,
+            # The tab filters on this as well as on eligibility.
+            governing_internal_case_status="open",
         )
         client.tags.add(ClientTag.objects.get(name=self.TAG))
         return client
@@ -40602,6 +40610,17 @@ class NeedReviewTabEligibilityTest(TestCase):
         self._tagged(stage=ClientStage.INELIGIBLE)
         self.assertEqual(self._get()["count"], 0)
         self.assertEqual(self._get("?eligible=all")["count"], 1)
+
+    def test_a_CLOSED_governing_case_is_hidden(self):
+        """80 rows here. Same reason as the other tabs: nothing to return to."""
+        from .models import Client
+
+        client = self._tagged()
+        Client.objects.filter(pk=client.pk).update(
+            governing_internal_case_status="closed",
+        )
+        self.assertEqual(self._get()["count"], 0)
+        self.assertEqual(self._get("?governing=all")["count"], 1)
 
     def test_an_UNTAGGED_member_is_never_listed(self):
         """The tab IS the tag filter -- the eligibility exclusion must not widen it."""

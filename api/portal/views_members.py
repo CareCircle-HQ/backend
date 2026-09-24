@@ -3825,6 +3825,24 @@ class PausedMembersListView(UnlinkedMembersListView):
                 ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE,
             ))
 
+        # AND ONLY AN OPEN GOVERNING CASE. A member whose governing internal-service
+        # case is CLOSED cannot be returned to service at all -- the Resume preview's
+        # first check is "open governing case" and it fails outright -- so the answer
+        # to "can this be fixed?" is no, for a different reason than ineligibility.
+        #
+        # Verified before hiding anything: every row with a BLANK governing status has
+        # ZERO internal-service cases, so the blank is the truth and not an unwritten
+        # denormalised field. 8 such rows on Paused, 2 on Need Review.
+        #
+        # ⚠ ITS OWN opt-out, independent of ?eligible. Nesting it under the
+        # eligibility check made ?governing=all silently do nothing -- two filters
+        # sharing one switch is how a caller cannot tell which one is hiding a row.
+        #
+        # ⚠ The stored column is good enough for a LIST FILTER and no more: it
+        # disagreed with the computed governing case on 2 of 4,226 held rows.
+        if (params.get("governing") or "").lower() != "all":
+            qs = qs.filter(governing_internal_case_status="open")
+
         # ?reason=<code>, or ?reason=none for the ones nobody has classified --
         # which is the filter that actually gets used, because it IS the backlog.
         reason = (params.get("reason") or "").strip()
@@ -4032,20 +4050,26 @@ class OnHoldMembersListView(UnlinkedMembersListView):
         if (params.get("governing") or "").lower() != "all":
             qs = qs.filter(governing_internal_case_status="open")
 
-            # AND NOT ELIGIBLE-OFF-RAMPED. Neither stage can be resumed into
-            # service, so both are history rather than a queue:
-            #
-            #   INELIGIBLE    463  the import-time gate -- expired/missing medical
-            #                      insurance, an unserved Medicaid type, or an
-            #                      out-of-range address. STICKY until the underlying
-            #                      data recovers on a later import, so it will not
-            #                      clear by anything an agent does on this page.
-            #   NOT_ELIGIBLE  307  the terminal off-ramp: ineligible, or closed
-            #                      without service.
-            #
-            # ⚠ TWO SEPARATE STAGES, easy to miss -- excluding only one would leave
-            # 307 unworkable rows looking like a backlog. They differ in how they
-            # arrive, not in whether the row is actionable.
+        # ⚠ ITS OWN switch, ?eligible=all. This was NESTED under the governing
+        # check, so ?governing=all silently lifted BOTH gates and ?eligible=all
+        # did nothing. Two filters sharing one switch means a caller cannot tell
+        # which one is hiding a row -- all four Urgent Care tabs now read the
+        # same two params independently.
+        # AND NOT ELIGIBLE-OFF-RAMPED. Neither stage can be resumed into
+        # service, so both are history rather than a queue:
+        #
+        #   INELIGIBLE    463  the import-time gate -- expired/missing medical
+        #                      insurance, an unserved Medicaid type, or an
+        #                      out-of-range address. STICKY until the underlying
+        #                      data recovers on a later import, so it will not
+        #                      clear by anything an agent does on this page.
+        #   NOT_ELIGIBLE  307  the terminal off-ramp: ineligible, or closed
+        #                      without service.
+        #
+        # ⚠ TWO SEPARATE STAGES, easy to miss -- excluding only one would leave
+        # 307 unworkable rows looking like a backlog. They differ in how they
+        # arrive, not in whether the row is actionable.
+        if (params.get("eligible") or "").lower() != "all":
             qs = qs.exclude(lifecycle_stage__in=(
                 ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE,
             ))
@@ -4347,6 +4371,24 @@ class NeedReviewMembersListView(UnlinkedMembersListView):
             qs = qs.exclude(lifecycle_stage__in=(
                 ClientStage.INELIGIBLE, ClientStage.NOT_ELIGIBLE,
             ))
+
+        # AND ONLY AN OPEN GOVERNING CASE. A member whose governing internal-service
+        # case is CLOSED cannot be returned to service at all -- the Resume preview's
+        # first check is "open governing case" and it fails outright -- so the answer
+        # to "can this be fixed?" is no, for a different reason than ineligibility.
+        #
+        # Verified before hiding anything: every row with a BLANK governing status has
+        # ZERO internal-service cases, so the blank is the truth and not an unwritten
+        # denormalised field. 8 such rows on Paused, 2 on Need Review.
+        #
+        # ⚠ ITS OWN opt-out, independent of ?eligible. Nesting it under the
+        # eligibility check made ?governing=all silently do nothing -- two filters
+        # sharing one switch is how a caller cannot tell which one is hiding a row.
+        #
+        # ⚠ The stored column is good enough for a LIST FILTER and no more: it
+        # disagreed with the computed governing case on 2 of 4,226 held rows.
+        if (params.get("governing") or "").lower() != "all":
+            qs = qs.filter(governing_internal_case_status="open")
 
         search = (params.get("search") or "").strip()
         if search:
