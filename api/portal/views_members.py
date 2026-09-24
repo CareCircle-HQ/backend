@@ -3952,6 +3952,26 @@ class OnHoldMembersListView(UnlinkedMembersListView):
                 enrollments__hold_reason__code=reason,
             )
 
+        # ONLY HOLDS WITH AN OPEN GOVERNING CASE, by default.
+        #
+        # A held household whose governing case is closed cannot be resumed at all --
+        # the Resume preview's first check is "open governing case", and it fails
+        # outright. Those rows are not a backlog anybody can work; they are history.
+        # 1,455 of 4,226 held households on the clone.
+        #
+        # Filtered on the DENORMALISED Client.governing_internal_case_status, which is
+        # indexed. Verified against the computed governing case over every held
+        # household: 4,224 of 4,226 agree, the 2 exceptions being stale rows where the
+        # stored value says open and the client now has no food case at all. Computing
+        # it properly means pick_governing_case in Python per row -- and it cannot be
+        # approximated by "has a live case", because governing_case_key ranks
+        # AUTHORIZATION FAVOUR ABOVE OPENNESS, so an approved CLOSED case outranks an
+        # open pending one.
+        #
+        # ?governing=all restores the full list rather than hiding rows silently.
+        if (params.get("governing") or "").lower() != "all":
+            qs = qs.filter(governing_internal_case_status="open")
+
         # WHEN it was held, and when it was resumed. Same join as the reason filter
         # above, so one enrollment must satisfy both rather than two different ones.
         qs = _date_range_filter(qs, params, "enrollments__held_at", "held")
@@ -5833,18 +5853,50 @@ def _resolve_resume(enr):
     )
     started = starts is None or starts.date() <= today
     not_expired = ends is None or ends.date() >= today
-    auth_valid = authorized and started and not_expired
+
+    # ⚠ A FUTURE START NO LONGER BLOCKS THE RESUME.
+    #
+    # It used to, and it was a belt-and-braces check that duplicated a guarantee made
+    # one step later: the resume recomputes the plan from the governing case and
+    # re-derives the delivery window from its authorization window, so a member whose
+    # window opens next week gets NO deliveries until then (see step 3 in
+    # MemberServiceResumeView). Nothing is served by the resume itself -- the member
+    # is picked up when a Purchase Order takes them.
+    #
+    # Blocking it meant an agent could not prepare a member the day before their
+    # authorization opened, which is exactly when they need to. A member approved
+    # from tomorrow showed "✗ Authorization approved & in window (through
+    # 2027-03-25)" -- a red cross beside a future end date, with no mention of the
+    # start.
+    #
+    # An EXPIRED or UNAPPROVED authorization still blocks: those are real.
+    auth_valid = authorized and not_expired
     checks["authorization_status"] = status
     checks["authorization_window"] = {
         "starts_on": starts.date().isoformat() if starts else None,
         "ends_on": ends.date().isoformat() if ends else None,
     }
     checks["authorization_valid"] = auth_valid
+    # Reported separately so the UI can say "starts 25 Sep" rather than implying the
+    # authorization is bad.
+    checks["authorization_not_started"] = bool(authorized and not_expired and not started)
     if not auth_valid:
+        # Name WHICH condition failed. One sentence covering three conditions sent an
+        # agent looking for the wrong problem -- a member whose authorization expired
+        # on 19 Sep read exactly the same as one approved from tomorrow.
+        if not authorized:
+            reason = (
+                "The governing case's authorization is not approved "
+                f"(status: {status or 'none recorded'})."
+            )
+        else:
+            reason = (
+                "The governing case's authorization expired on "
+                f"{ends.date().isoformat()}."
+            )
         return {
             "allowed": False,
-            "block_reason": ("The governing case's authorization is not approved and "
-                             "within its active window."),
+            "block_reason": reason,
             "target": None, "checks": checks,
         }
 
