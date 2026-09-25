@@ -264,6 +264,42 @@ ticket-type work it was 25 rows with duplicate codes, which only the undeployed
 git -C ~/backend log --oneline -1     # what is actually running
 ```
 
+## Django admin: EVERY large FK needs `raw_id_fields` or `autocomplete_fields`
+
+A ForeignKey left out of both renders as a full `<select>` — **one `<option>` per row**,
+each calling the target's `__str__`. On this database that is not a slowdown, it is an
+outage:
+
+```
+EnrollmentVerification change form, before        after
+  render                12.73 s                  0.166 s
+  page                  24.5 MB                  94 KB
+  <option> tags         220,685                  796
+```
+
+`previous_case` (194,954 Cases) and `supersedes` (24,933 enrollments) were missing
+while `case` and `delivery_address` — pointing at the **same tables** — were already
+handled, which is exactly why it was easy to miss. Opening one member's enrollment
+tripped the slow-request alarm on its own.
+
+**Audit for it like this** (threshold 5,000 rows):
+
+```
+python manage.py shell -c "from django.contrib import admin; from django.db.models import ForeignKey, ManyToManyField, OneToOneField; c={}; [print(m.__name__, f.name, '->', f.related_model.__name__, c.setdefault(f.related_model, f.related_model.objects.count())) for m, ma in admin.site._registry.items() for f in m._meta.get_fields() if isinstance(f, (ForeignKey, OneToOneField, ManyToManyField)) and not f.auto_created and f.name not in (set(getattr(ma, 'raw_id_fields', ())) | set(getattr(ma, 'autocomplete_fields', ()))) and c.setdefault(f.related_model, f.related_model.objects.count()) >= 5000]"
+```
+
+It found five more: `TimelineEvent.case`, and `client` on `Address` / `Insurance` /
+`SocialCareCoverage`, plus `HouseholdMemberLoginCode.member`. All fixed; the audit now
+returns nothing. Re-run it after adding a model or an FK.
+
+⚠️ `autocomplete_fields` needs `search_fields` on the TARGET's admin; `raw_id_fields`
+has no such dependency, so prefer it when the target admin is not set up for search.
+
+⚠️ Inlines render their own copies of every unhandled FK, once per row — so a
+four-member household multiplies the cost. `MemberDietaryProfileInline` is fine
+(`enrollment` is the parent link, which Django excludes, and `client` is in
+`autocomplete_fields`).
+
 ## ⚠️ VERIFICATION IS A HUMAN PROCESS — never infer or auto-stamp it
 
 A verification is **an agent calling the member and completing the verification

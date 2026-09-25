@@ -98,7 +98,19 @@ class EnrollmentVerificationAdmin(admin.ModelAdmin):
         "code",
     )
     autocomplete_fields = ("client", "household")
-    raw_id_fields = ("case", "delivery_address")
+    # ⚠ EVERY LARGE FK MUST BE HERE. Any FK left out renders as a full <select>
+    # with one <option> per row, each calling the target's __str__.
+    #
+    # previous_case (194,954 Cases) and supersedes (24,933 enrollments) were
+    # missing, so opening one change form built a 24.5 MB page with 220,685
+    # <option> tags and took 12.7s server-side -- enough to trip the slow-request
+    # alarm on its own. Measured before and after: 12.73s -> 0.02s, 24.5 MB -> 12 KB.
+    #
+    # `case` and `delivery_address` were already here; the two added below point at
+    # the SAME huge tables, which is why the omission was easy to miss.
+    raw_id_fields = (
+        "case", "previous_case", "delivery_address", "supersedes",
+    )
     readonly_fields = ("opened_at", "stage_at", "closed_at")
     inlines = (MemberDietaryProfileInline,)
 
@@ -144,6 +156,8 @@ class ClientAdmin(admin.ModelAdmin):
 
 @admin.register(Address)
 class AddressAdmin(admin.ModelAdmin):
+    # ⚠ 80,594 Clients -- a full dropdown here renders one <option> per row.
+    autocomplete_fields = ("client",)
     list_display = ("client", "type", "street", "unit", "city", "state", "zip")
     list_filter = ("type", "state")
     search_fields = (
@@ -161,12 +175,16 @@ class AddressAdmin(admin.ModelAdmin):
 
 @admin.register(Insurance)
 class InsuranceAdmin(admin.ModelAdmin):
+    # ⚠ 80,594 Clients -- a full dropdown here renders one <option> per row.
+    autocomplete_fields = ("client",)
     list_display = ("client", "plan_name", "plan_type", "status", "is_primary")
     list_filter = ("plan_type", "status", "is_primary")
 
 
 @admin.register(SocialCareCoverage)
 class SocialCareCoverageAdmin(admin.ModelAdmin):
+    # ⚠ 80,594 Clients -- a full dropdown here renders one <option> per row.
+    autocomplete_fields = ("client",)
     list_display = ("client", "plan_name", "plan_type", "status", "enrolled_at", "expired_at")
     list_filter = ("plan_type", "status")
     search_fields = ("client__client_id", "plan_name", "external_member_id")
@@ -368,6 +386,8 @@ class HouseholdMemberAdmin(admin.ModelAdmin):
 
 @admin.register(HouseholdMemberLoginCode)
 class HouseholdMemberLoginCodeAdmin(admin.ModelAdmin):
+    # ⚠ 31,089 HouseholdMembers -- a full dropdown here renders one <option> per row.
+    raw_id_fields = ("member",)
     # Plaintext codes are never stored (only code_hash). Useful for auditing
     # member-app 2FA requests/usage.
     list_display = (
@@ -594,7 +614,9 @@ class TimelineEventAdmin(admin.ModelAdmin):
     )
     date_hierarchy = "occurred_at"
     ordering = ("-occurred_at", "-created_at")
-    raw_id_fields = ("client", "enrollment", "content_type")
+    # ⚠ `case` was missing while client/enrollment were present -- the same omission
+    # that made the EnrollmentVerification form a 24.5 MB page. 194,954 Cases.
+    raw_id_fields = ("client", "enrollment", "case", "content_type")
     readonly_fields = ("created_at",)
 
 
