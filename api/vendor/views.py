@@ -1252,6 +1252,16 @@ class VendorSubmitAssessmentView(VendorAPIView):
         return Response({
             "missing": dispatch_svc.missing_for_submission(order),
             "photo_count": order.proofs.count(),
+            # Prefilled so a vendor who saved windows, backgrounded the app and came
+            # back does not retype them. NOT part of `missing`: they are optional.
+            "install_windows": [
+                {
+                    "date": w.date.isoformat(),
+                    "start_time": w.start_time.strftime("%H:%M"),
+                    "end_time": w.end_time.strftime("%H:%M"),
+                }
+                for w in dispatch_svc.install_windows(order)
+            ],
         })
 
     def post(self, request, order_id):
@@ -1293,6 +1303,19 @@ class VendorSubmitAssessmentView(VendorAPIView):
         # FREEZE the schema. A signed form must render years later exactly as it was
         # signed rather than acquiring blank questions from a later template.
         form.schema_snapshot = build_schema(form.modules or [])
+        # ⚠ SAVED BEFORE THE SUBMISSION IS RECORDED, so a bad set of windows is a
+        # 400 the vendor can fix rather than a submitted assessment with no install
+        # dates and no way back -- the questionnaire becomes read-only at SUBMITTED.
+        # Optional: absent means the key was not sent, which is different from an
+        # empty list (a deliberate "none") and both are allowed.
+        if "install_windows" in (request.data or {}):
+            try:
+                dispatch_svc.set_install_windows(
+                    order, (request.data or {}).get("install_windows") or [],
+                )
+            except ValueError as exc:
+                return error("bad_windows", str(exc))
+
         form.state = DispatchQuestionnaireState.SUBMITTED
         form.submitted_at = tz.now()
         form.save(update_fields=[

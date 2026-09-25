@@ -41099,3 +41099,151 @@ class WorkOrderPickerScopeTest(TestCase):
 
         assessment, _ = self._build(recommended=(("window_ac", 0),))
         self.assertEqual(dispatch_svc.recommended_products(assessment), {})
+
+
+class InstallWindowTest(TestCase):
+    """The vendor's tentative INSTALL windows, offered while submitting the
+    assessment and copied onto each work order.
+
+    Captured on the ASSESSMENT because there is no work order yet -- the case may not
+    even be authorised -- and the vendor is standing in the dwelling, which is the
+    only moment anyone knows what the job needs.
+    """
+
+    def _assessment(self):
+        from django.utils import timezone
+
+        from .models import Client, DispatchKind, DispatchOrder, DispatchStatus
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Win", last_name="Dow",
+            client_added_at=timezone.now(),
+        )
+        return DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=client,
+            status=DispatchStatus.SUBMITTED,
+        )
+
+    def _rows(self, *days):
+        return [
+            {"date": f"2026-10-{d:02d}", "start_time": "09:00", "end_time": "12:00"}
+            for d in days
+        ]
+
+    def test_three_distinct_dates_are_stored(self):
+        from .services import dispatch as dispatch_svc
+
+        a = self._assessment()
+        dispatch_svc.set_install_windows(a, self._rows(1, 2, 3))
+        self.assertEqual(len(dispatch_svc.install_windows(a)), 3)
+
+    def test_THREE_TIMES_ON_ONE_DAY_is_not_three_options(self):
+        """⚠ Counted as DATES, not rows. Three windows on one Tuesday gives the
+        scheduler one choice, and offering a choice is the entire point."""
+        from .services import dispatch as dispatch_svc
+
+        a = self._assessment()
+        rows = [
+            {"date": "2026-10-01", "start_time": "09:00", "end_time": "10:00"},
+            {"date": "2026-10-01", "start_time": "11:00", "end_time": "12:00"},
+            {"date": "2026-10-01", "start_time": "14:00", "end_time": "15:00"},
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            dispatch_svc.set_install_windows(a, rows)
+        self.assertIn("three DIFFERENT dates", str(ctx.exception))
+
+    def test_NONE_is_allowed_because_they_are_optional(self):
+        """A vendor who cannot commit should not be made to invent dates."""
+        from .services import dispatch as dispatch_svc
+
+        a = self._assessment()
+        self.assertEqual(dispatch_svc.set_install_windows(a, []), [])
+        self.assertEqual(dispatch_svc.install_windows(a), [])
+
+    def test_an_end_before_the_start_is_refused(self):
+        from .services import dispatch as dispatch_svc
+
+        a = self._assessment()
+        rows = self._rows(1, 2, 3)
+        rows[0]["end_time"] = "08:00"
+        with self.assertRaises(ValueError) as ctx:
+            dispatch_svc.set_install_windows(a, rows)
+        self.assertIn("after the start", str(ctx.exception))
+
+    def test_a_vague_time_is_refused_rather_than_guessed(self):
+        """"9" could be 09:00 or 21:00, and a window the vendor cannot honour is
+        worse than one they were made to re-enter."""
+        from .services import dispatch as dispatch_svc
+
+        a = self._assessment()
+        rows = self._rows(1, 2, 3)
+        rows[0]["start_time"] = "9"
+        with self.assertRaises(ValueError):
+            dispatch_svc.set_install_windows(a, rows)
+
+    def test_saving_again_REPLACES_rather_than_appends(self):
+        from .services import dispatch as dispatch_svc
+
+        a = self._assessment()
+        dispatch_svc.set_install_windows(a, self._rows(1, 2, 3))
+        dispatch_svc.set_install_windows(a, self._rows(7, 8, 9))
+        days = [w.date.day for w in dispatch_svc.install_windows(a)]
+        self.assertEqual(days, [7, 8, 9])
+
+    def test_install_windows_do_NOT_mix_with_the_members_assessment_windows(self):
+        """⚠ Same model, different populations. Without the purpose filter the
+        member's assessment availability would read as install offers."""
+        from .models import DispatchAvailabilityWindow, WindowPurpose
+        from .services import dispatch as dispatch_svc
+
+        a = self._assessment()
+        DispatchAvailabilityWindow.objects.create(
+            dispatch_order=a, purpose=WindowPurpose.ASSESSMENT,
+            date="2026-09-01", start_time="09:00", end_time="10:00",
+        )
+        dispatch_svc.set_install_windows(a, self._rows(1, 2, 3))
+        self.assertEqual(len(dispatch_svc.install_windows(a)), 3)
+        self.assertEqual(a.availability_windows.count(), 4)
+
+    def test_an_existing_row_defaults_to_the_ASSESSMENT_purpose(self):
+        """The field was added to a populated table; every old row is a member
+        availability window, so that has to be the default."""
+        from .models import DispatchAvailabilityWindow, WindowPurpose
+
+        a = self._assessment()
+        w = DispatchAvailabilityWindow.objects.create(
+            dispatch_order=a, date="2026-09-01",
+            start_time="09:00", end_time="10:00",
+        )
+        self.assertEqual(w.purpose, WindowPurpose.ASSESSMENT)
+
+    # ── copying onto a work order ──────────────────────────────────────────
+    def test_a_work_order_gets_its_OWN_copy(self):
+        """⚠ COPIED, NOT SHARED. One assessment can produce several work orders, and
+        rescheduling the heater must not move the air conditioner."""
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+        from .services import dispatch as dispatch_svc
+
+        a = self._assessment()
+        dispatch_svc.set_install_windows(a, self._rows(1, 2, 3))
+        wo = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=a.client, parent=a,
+            status=DispatchStatus.PENDING_SCHEDULE,
+        )
+        dispatch_svc.copy_install_windows(a, wo)
+        self.assertEqual(len(dispatch_svc.install_windows(wo)), 3)
+        # Editing the copy leaves the assessment alone.
+        dispatch_svc.install_windows(wo)[0].delete()
+        self.assertEqual(len(dispatch_svc.install_windows(wo)), 2)
+        self.assertEqual(len(dispatch_svc.install_windows(a)), 3)
+
+    def test_copying_NOTHING_is_silent(self):
+        from .models import DispatchKind, DispatchOrder, DispatchStatus
+        from .services import dispatch as dispatch_svc
+
+        a = self._assessment()
+        wo = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=a.client, parent=a,
+            status=DispatchStatus.PENDING_SCHEDULE,
+        )
+        self.assertEqual(dispatch_svc.copy_install_windows(a, wo), [])

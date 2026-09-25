@@ -6132,17 +6132,43 @@ class DispatchItem(models.Model):
         )
 
 
+class WindowPurpose(models.TextChoices):
+    """What a :class:`DispatchAvailabilityWindow` is offering to do.
+
+    Both live on the same model because they are the same shape and obey the same
+    three-distinct-dates rule; only WHO offered them and WHAT FOR differ.
+    """
+
+    # The member's availability for the ASSESSMENT visit. The original meaning, so
+    # it is the default -- every existing row is one of these.
+    ASSESSMENT = "assessment", "Assessment visit"
+    # The VENDOR's tentative availability to INSTALL, offered while submitting the
+    # assessment. Captured months before there is a work order to attach it to,
+    # because the vendor is standing in the dwelling and knows what the job needs.
+    INSTALL = "install", "Installation"
+
+
 class DispatchAvailabilityWindow(models.Model):
-    """A window the MEMBER offered. Not the appointment.
+    """A window someone OFFERED. Not the appointment.
 
     The wizard requires at least THREE DISTINCT DATES, each with one or more time
     windows -- so validation counts dates, not rows: three windows on one Tuesday
     does not satisfy it. The vendor then picks from these and the agreed slot
     becomes a :class:`DispatchVisit`.
+
+    ``purpose`` distinguishes the member's availability for the ASSESSMENT from the
+    vendor's tentative availability to INSTALL. An install window is offered on the
+    ASSESSMENT order -- before any work order exists -- and is COPIED onto each work
+    order created from it, so a later order can be rescheduled without disturbing
+    the first. Filter by purpose or the two populations merge.
     """
 
     dispatch_order = models.ForeignKey(
         DispatchOrder, on_delete=models.CASCADE, related_name="availability_windows"
+    )
+    purpose = models.CharField(
+        max_length=20, choices=WindowPurpose.choices,
+        default=WindowPurpose.ASSESSMENT, db_index=True,
     )
     date = models.DateField()
     start_time = models.TimeField()

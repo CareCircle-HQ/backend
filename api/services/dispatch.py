@@ -453,6 +453,9 @@ def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""
     DispatchItem.objects.filter(
         dispatch_item_id__in=[i.dispatch_item_id for i in items],
     ).update(dispatch_order=order)
+    # The vendor's tentative install windows, copied so this order can be
+    # rescheduled without moving any other order from the same assessment.
+    copy_install_windows(assessment, order)
 
     record_transition(
         order, "", order.status,
@@ -646,3 +649,113 @@ def annotate_items_for_picker(assessment, items):
         for item in group[:max(1, wanted.get(category, 1))]:
             item.preferred = True
     return wanted
+
+
+def _parse_window_rows(rows):
+    """``[{date, start_time, end_time}]`` -> validated tuples. Raises ValueError.
+
+    Times are parsed strictly rather than coerced: a window the vendor cannot honour
+    is worse than one they were made to re-enter, and "9" could mean 09:00 or 21:00.
+    """
+    from datetime import date as date_cls, datetime, time as time_cls
+
+    out = []
+    for row in rows or []:
+        raw_date = (row or {}).get("date")
+        raw_start = (row or {}).get("start_time")
+        raw_end = (row or {}).get("end_time")
+        if not (raw_date and raw_start and raw_end):
+            raise ValueError("each window needs a date, a start time and an end time")
+        try:
+            day = (
+                raw_date if isinstance(raw_date, date_cls)
+                else datetime.strptime(str(raw_date), "%Y-%m-%d").date()
+            )
+            start = (
+                raw_start if isinstance(raw_start, time_cls)
+                else datetime.strptime(str(raw_start)[:5], "%H:%M").time()
+            )
+            end = (
+                raw_end if isinstance(raw_end, time_cls)
+                else datetime.strptime(str(raw_end)[:5], "%H:%M").time()
+            )
+        except (TypeError, ValueError):
+            raise ValueError(
+                "a window needs date YYYY-MM-DD and times HH:MM"
+            ) from None
+        if end <= start:
+            raise ValueError(f"{day}: the end time must be after the start time")
+        out.append((day, start, end))
+    return out
+
+
+@transaction.atomic
+def set_install_windows(assessment, rows):
+    """Replace the vendor's tentative INSTALL windows on an assessment order.
+
+    Optional, and offered while the vendor is still standing in the dwelling -- which
+    is the only moment anyone knows what the job needs. There is no work order yet to
+    attach them to, so they live on the assessment and are COPIED to each work order
+    created from it (see ``copy_install_windows``).
+
+    ⚠ THREE DISTINCT DATES when any are given, counted as DATES not rows -- three
+    windows on one Tuesday is one option, not three, and the whole point is to give
+    the scheduler a real choice. Zero is allowed: this is optional, and a vendor who
+    cannot commit to anything should not be forced to invent dates.
+
+    Replaces rather than appends, so re-submitting a corrected set does not leave the
+    old one alongside it.
+    """
+    from api.models import DispatchAvailabilityWindow, WindowPurpose
+
+    parsed = _parse_window_rows(rows)
+    if parsed and len({day for day, _s, _e in parsed}) < 3:
+        raise ValueError(
+            "offer at least three DIFFERENT dates (several times on one day counts "
+            "as one option)"
+        )
+    DispatchAvailabilityWindow.objects.filter(
+        dispatch_order=assessment, purpose=WindowPurpose.INSTALL,
+    ).delete()
+    return [
+        DispatchAvailabilityWindow.objects.create(
+            dispatch_order=assessment, purpose=WindowPurpose.INSTALL,
+            date=day, start_time=start, end_time=end,
+        )
+        for day, start, end in parsed
+    ]
+
+
+def install_windows(order):
+    """The INSTALL windows on an order, in date order."""
+    from api.models import WindowPurpose
+
+    return list(
+        order.availability_windows.filter(purpose=WindowPurpose.INSTALL)
+        .order_by("date", "start_time")
+    )
+
+
+def copy_install_windows(assessment, work_order):
+    """Copy the assessment's install windows onto a new work order.
+
+    ⚠ COPIED, NOT SHARED. One assessment can produce several work orders -- the air
+    conditioner now, the heater when its case is authorised -- and rescheduling the
+    second must not move the first. Each order owns its own rows and can be edited
+    independently.
+
+    Silent when there are none: the windows are optional and a work order with no
+    suggestions is simply scheduled from scratch.
+    """
+    from api.models import DispatchAvailabilityWindow, WindowPurpose
+
+    rows = install_windows(assessment)
+    if not rows:
+        return []
+    return DispatchAvailabilityWindow.objects.bulk_create([
+        DispatchAvailabilityWindow(
+            dispatch_order=work_order, purpose=WindowPurpose.INSTALL,
+            date=r.date, start_time=r.start_time, end_time=r.end_time,
+        )
+        for r in rows
+    ])
