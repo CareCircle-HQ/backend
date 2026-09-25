@@ -42608,14 +42608,26 @@ class MemberDeliveriesTest(TestCase):
         self._delivery(days=4, quantity=11)
         self.assertEqual(self._get()["next"]["quantity"], 11)
 
-    def test_CANCELLED_deliveries_STAY_in_the_history(self):
-        """⚠ 53% of all orders are cancelled, and a member who was expecting food
-        that never came is exactly the person who opens this screen. Hiding them
-        answers "where was my delivery?" with a blank."""
+    def test_CANCELLED_deliveries_are_HIDDEN(self):
+        """⚠ REVERSED, and the data is why. 99% of cancelled (member, date) pairs
+        ALSO have a live order on the same date -- 37,608 of 38,052 sampled, and 12 of
+        12 for James Bethea. A cancellation is almost always RE-PLANNING: voided and
+        immediately reissued. Listing them told a member their food was cancelled
+        twelve times on twelve days they actually ate.
+
+        The earlier test asserted the opposite on the reasoning that someone whose
+        food did not come is who opens this screen. True of a delivery system; not
+        true of this one."""
         self._delivery(days=-2, status="cancelled")
+        self._delivery(days=-2, quantity=9)
         history = self._get()["history"]
         self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["status"], "cancelled")
+        self.assertNotEqual(history[0]["status"], "cancelled")
+
+    def test_a_cancelled_order_is_never_the_LAST_delivery(self):
+        self._delivery(days=-1, status="cancelled")
+        self._delivery(days=-4, quantity=9)
+        self.assertEqual(self._get()["last"]["quantity"], 9)
 
     def test_the_history_is_newest_first_and_capped(self):
         for d in range(1, 26):
@@ -42717,10 +42729,11 @@ class MemberDeliveryHistoryTest(TestCase):
                            delivered=d % 3 == 0)
         data = self._get("?limit=2")
         self.assertEqual(len(data["deliveries"]), 2)
-        self.assertEqual(data["total"], 12)
-        self.assertEqual(sum(data["summary"].values()), 12)
+        # Cancelled ones are excluded entirely, so the total is the 4 delivered.
+        self.assertEqual(data["total"], 4)
+        self.assertEqual(sum(data["summary"].values()), 4)
         self.assertEqual(data["summary"]["delivered"], 4)
-        self.assertEqual(data["summary"]["cancelled"], 8)
+        self.assertNotIn("cancelled", data["summary"])
 
     def test_pagination_does_not_SKIP_or_REPEAT_a_row(self):
         """⚠ Two orders on the SAME DATE are normal -- a cancelled one and its
@@ -42866,3 +42879,71 @@ class MemberDeliveryPhotosTest(TestCase):
             mobile_app_must_change_password=True,
         )
         self.assertEqual(self._get().status_code, 403)
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberDeliveryTodayBoundaryTest(TestCase):
+    """The day a delivery arrives is the awkward one, and both gaps were real."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Bou", last_name="Ndary",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Ndary HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3055554444",
+            mobile_app_password=make_password("x" * 10),
+        )
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _delivery(self, *, days, status="ready_for_delivery", delivered=False):
+        from datetime import timedelta
+
+        from .models import DeliveryOrder, PurchaseOrder
+
+        return DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.create(),
+            member=self.client_rec, quantity=7, status=status,
+            expected_delivery_date=timezone.localdate() + timedelta(days=days),
+            delivered_at=timezone.now() if delivered else None,
+        )
+
+    def _get(self):
+        return self.api.get("/v1/me/deliveries/", HTTP_HOST=MEMBER_HOST).data
+
+    def test_a_delivery_that_ALREADY_ARRIVED_today_is_not_NEXT(self):
+        """⚠ Today's order stays in range until midnight, so once confirmed it was
+        shown as the thing still to come -- "Next Delivery: today" to somebody holding
+        the food."""
+        self._delivery(days=0, status="delivered", delivered=True)
+        self._delivery(days=4)
+        self.assertEqual(
+            str(self._get()["next"]["date"]),
+            str(timezone.localdate() + timezone.timedelta(days=4)),
+        )
+
+    def test_a_delivery_that_arrived_TODAY_IS_the_last_one(self):
+        """⚠ THE OTHER HALF OF THE SAME GAP. Filtering "last" on date < today meant a
+        delivery that arrived THIS MORNING was neither next nor last: it dropped out
+        of one when confirmed and did not enter the other until midnight. The member's
+        most recent delivery vanished for a day."""
+        self._delivery(days=-6)
+        today_one = self._delivery(days=0, status="delivered", delivered=True)
+        self.assertEqual(
+            self._get()["last"]["id"], str(today_one.delivery_order_id),
+        )
+
+    def test_an_unconfirmed_delivery_TODAY_is_still_next(self):
+        """It has not arrived; it is still what the member is waiting for."""
+        self._delivery(days=0)
+        data = self._get()
+        self.assertTrue(data["next"]["is_today"])

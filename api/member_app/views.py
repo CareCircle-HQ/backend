@@ -553,9 +553,13 @@ class MemberDeliveriesView(MemberAPIView):
         today = timezone.localdate()
         # ⚠ SCOPED TO THE CLIENT, not the household: meals are cooked to ONE person's
         # dietary profile, and another member's allergen-free meals are not theirs.
+        # Cancelled excluded HERE, not per-query: `total` is derived from this, and
+        # reporting 34 while the list shows 15 is the kind of mismatch a member reads
+        # as missing deliveries.
         base = (
             DeliveryOrder.objects
             .filter(member=client)
+            .exclude(status__in=["cancelled", "canceled"])
             .select_related("menu_type")
         )
 
@@ -579,9 +583,11 @@ class MemberDeliveriesView(MemberAPIView):
                 "confirmed": row.delivered_at is not None,
             }
 
+        # ⚠ AND A DELIVERY THAT ALREADY ARRIVED IS NOT "NEXT". Today's order stays in
+        # range until midnight, so once it is confirmed it was being shown as the
+        # thing still to come -- "Next Delivery: today" to someone holding the food.
         nxt = (
-            base.filter(expected_delivery_date__gte=today)
-            .exclude(status__in=["cancelled", "canceled"])
+            base.filter(expected_delivery_date__gte=today, delivered_at__isnull=True)
             .order_by("expected_delivery_date")
             .first()
         )
@@ -597,17 +603,25 @@ class MemberDeliveriesView(MemberAPIView):
         # whether anyone confirmed it. Both are worth showing; conflating them is not.
         # `confirmed` carries the distinction and the app words it honestly rather
         # than claiming an arrival we cannot evidence.
+        # ⚠ "PAST" IS date < today OR delivered_at SET. Excluding today's date left a
+        # delivery that ARRIVED THIS MORNING showing as neither next nor last -- it
+        # had dropped out of "next" once confirmed, and never entered "last" until
+        # midnight. The member's most recent delivery simply vanished for a day.
+        from django.db.models import Q
+
         last = (
-            base.filter(expected_delivery_date__lt=today)
+            base.filter(
+                Q(expected_delivery_date__lt=today) | Q(delivered_at__isnull=False),
+            )
             .order_by("-expected_delivery_date", "-delivered_at")
             .first()
         )
-        # ⚠ CANCELLED DELIVERIES STAY IN THE HISTORY. 53% of all orders are cancelled,
-        # and a member who was expecting food that did not come is exactly the person
-        # who opens this screen. Hiding them would answer "where was my delivery?"
-        # with a blank.
+        # ⚠ CANCELLED DELIVERIES ARE EXCLUDED HERE TOO -- see the note on the history
+        # endpoint. 99% are same-day re-planning, so listing them reports failures
+        # that did not happen.
         history = [
-            block(r) for r in base.filter(expected_delivery_date__lt=today)
+            block(r) for r in base
+            .filter(expected_delivery_date__lt=today)
             .order_by("-expected_delivery_date")[:self.HISTORY_LIMIT]
         ]
 
@@ -651,14 +665,26 @@ class MemberDeliveryHistoryView(MemberAPIView):
         except (TypeError, ValueError):
             limit, offset = self.DEFAULT_LIMIT, 0
 
+        # ⚠ CANCELLED ORDERS ARE HIDDEN, and the data is why. 99% of cancelled
+        # (member, date) pairs ALSO have a live order on that same date -- 37,608 of
+        # 38,052 sampled -- and for James Bethea it is 12 of 12. A cancellation here
+        # is almost always RE-PLANNING: an order is voided and immediately reissued,
+        # usually for a changed quantity or kitchen.
+        #
+        # So showing them told a member "your food was cancelled 12 times" on twelve
+        # days they actually received food. I argued earlier for keeping them --
+        # "someone whose food did not come is exactly who opens this screen" -- and
+        # that was reasoning about a delivery system this is not. The 1% where a
+        # cancellation stands alone is a real gap, but it is a support conversation,
+        # not a row a member should have to interpret.
         base = (
             DeliveryOrder.objects
             .filter(member=client)
+            .exclude(status__in=["cancelled", "canceled"])
             .select_related("menu_type")
-            # ⚠ SECOND KEY ON THE ID. A member can have two orders on the SAME DATE --
-            # James Bethea has a cancelled and a live one on 18 Sep -- and without a
-            # tiebreak their order changes between pages, so a row can appear twice or
-            # not at all while scrolling.
+            # ⚠ SECOND KEY ON THE ID. A member can still have two orders on one date
+            # without a tiebreak their order changes between pages, so a row can
+            # appear twice or not at all while scrolling.
             .order_by("-expected_delivery_date", "-created_at")
         )
         total = base.count()
@@ -696,9 +722,9 @@ class MemberDeliveryHistoryView(MemberAPIView):
             "has_more": offset + limit < total,
             "summary": {
                 "delivered": counts.get("delivered", 0),
-                "cancelled": (
-                    counts.get("cancelled", 0) + counts.get("canceled", 0)
-                ),
+                # No cancelled count: they are excluded above, so it would always be
+                # zero -- and a running tally of "times we failed to send your food"
+                # is not a summary a member wants at the top of the screen anyway.
                 "scheduled": sum(
                     n for s, n in counts.items()
                     if s not in {"delivered", "cancelled", "canceled"}
