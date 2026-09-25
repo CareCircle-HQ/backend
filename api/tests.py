@@ -40925,3 +40925,177 @@ class WorkOrderExpiredAuthorizationTest(TestCase):
         self.assertNotIn("EXPIRED", order.notes or "")
         ev = StageEvent.objects.filter(dispatch_order=order).first()
         self.assertEqual((ev.metadata or {}).get("expired_override"), [])
+
+
+class WorkOrderPickerScopeTest(TestCase):
+    """The picker offers what the ASSESSMENT recommended, one case per product.
+
+    ⚠ MIRIAM ISRAEL held 13 housing cases across five product categories -- Air
+    Conditioner, De-humidifier, Heater, Air Filtration Device, Humidifier, three of
+    each -- while her assessment recommended TWO products. Every one was listed, so
+    the picker asked an agent to know that Heater was not wanted and which of three
+    identically-named "Air Conditioner" cases was the live funding vehicle.
+
+    A case is the FUNDING VEHICLE; the recommendation is the PRODUCT to install.
+    BillableItem.billing_category bridges them and already lines up exactly:
+    window_ac -> "Air Conditioner", dehumidifier_portable -> "De-humidifier".
+    """
+
+    def _build(self, recommended=(("window_ac", 1),), cases=()):
+        from django.utils import timezone
+
+        from .models import (
+            BillableItem, Case, CaseStatus, CaseType, Client, DispatchItem,
+            DispatchKind, DispatchOrder, DispatchQuestionnaire, DispatchStatus,
+        )
+
+        BillableItem.objects.get_or_create(
+            option_code="window_ac",
+            defaults={"item": "Window air conditioner",
+                      "billing_category": "Air Conditioner", "is_active": True,
+                      "vendor_price": "300.00"},
+        )
+        BillableItem.objects.get_or_create(
+            option_code="dehumidifier_portable",
+            defaults={"item": "Dehumidifier (portable)",
+                      "billing_category": "De-humidifier", "is_active": True,
+                      "vendor_price": "200.00"},
+        )
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pick", last_name="Er",
+            client_added_at=timezone.now(),
+        )
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=client,
+            status=DispatchStatus.SUBMITTED,
+        )
+        if recommended is not None:
+            DispatchQuestionnaire.objects.create(
+                # The FK is dispatch_order, and the reverse accessor the service
+                # reads is `questionnaire`.
+                dispatch_order=assessment, state="submitted",
+                interventions=[
+                    {"option": code, "qty": qty} for code, qty in recommended
+                ],
+            )
+        items = []
+        for product, status in cases:
+            case = Case.objects.create(
+                case_id=uuid.uuid4(), client=client,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=status,
+                service_type="Home Expense Assistance/Repairs",
+                program_name=f"Home Remediation - {product} - Queens",
+                case_created_at=timezone.now(), date_opened=timezone.now(),
+                service_authorization_status="approved",
+                service_authorization_approval_starts_at=(
+                    timezone.now() - timezone.timedelta(days=10)
+                ),
+                service_authorization_approval_ends_at=(
+                    timezone.now() + timezone.timedelta(days=10)
+                ),
+            )
+            items.append(DispatchItem.objects.create(
+                assessment=assessment, case=case, item=product,
+                location="Queens",
+                program_name=f"Home Remediation - {product} - Queens",
+            ))
+        return assessment, items
+
+    def _annotate(self, assessment):
+        from .models import DispatchItem
+        from .services import dispatch as dispatch_svc
+
+        items = list(
+            DispatchItem.objects.filter(assessment=assessment)
+            .select_related("case").order_by("dispatch_item_id")
+        )
+        dispatch_svc.annotate_items_for_picker(assessment, items)
+        return items
+
+    # ── option code -> product category ────────────────────────────────────
+    def test_the_recommendation_maps_to_a_product_category(self):
+        from .services import dispatch as dispatch_svc
+
+        assessment, _ = self._build(
+            recommended=(("window_ac", 1), ("dehumidifier_portable", 1)),
+        )
+        self.assertEqual(
+            dispatch_svc.recommended_products(assessment),
+            {"Air Conditioner": 1, "De-humidifier": 1},
+        )
+
+    # ── scope ──────────────────────────────────────────────────────────────
+    def test_an_UNRECOMMENDED_product_is_not_offered(self):
+        """⚠ Heater was never recommended, and it was offered anyway."""
+        assessment, _ = self._build(
+            recommended=(("window_ac", 1),),
+            cases=(("Air Conditioner", "open"), ("Heater", "open")),
+        )
+        items = self._annotate(assessment)
+        offered = [i for i in items if i.recommended and i.preferred]
+        self.assertEqual([i.item for i in offered], ["Air Conditioner"])
+
+    def test_ONE_case_per_product_and_the_OPEN_one_wins(self):
+        """⚠ Three identically-named Air Conditioner cases, one open. Offering all
+        three asks the agent to guess which is the live funding vehicle."""
+        assessment, _ = self._build(
+            recommended=(("window_ac", 1),),
+            cases=(
+                ("Air Conditioner", "closed"),
+                ("Air Conditioner", "open"),
+                ("Air Conditioner", "closed"),
+            ),
+        )
+        items = self._annotate(assessment)
+        offered = [i for i in items if i.preferred]
+        self.assertEqual(len(offered), 1)
+        self.assertEqual(offered[0].case.case_status, "open")
+
+    def test_a_CLOSED_case_is_ranked_lower_but_NEVER_dropped(self):
+        """is_available deliberately ignores case status -- a Home Remediation case
+        can close in Unite Us while the approved device still has to be fitted. So a
+        closed case is the fallback when it is the only one."""
+        assessment, _ = self._build(
+            recommended=(("window_ac", 1),),
+            cases=(("Air Conditioner", "closed"),),
+        )
+        items = self._annotate(assessment)
+        self.assertTrue(items[0].preferred)
+
+    def test_a_QUANTITY_OF_TWO_offers_two_cases(self):
+        assessment, _ = self._build(
+            recommended=(("window_ac", 2),),
+            cases=(
+                ("Air Conditioner", "open"),
+                ("Air Conditioner", "open"),
+                ("Air Conditioner", "closed"),
+            ),
+        )
+        items = self._annotate(assessment)
+        self.assertEqual(sum(1 for i in items if i.preferred), 2)
+
+    # ── the fallback that stops the picker going empty ─────────────────────
+    def test_NO_recommendation_recorded_shows_EVERYTHING(self):
+        """⚠ An empty result means "we do not know", not "nothing was recommended".
+        An assessment taken on paper has no interventions stored, and filtering it to
+        nothing would leave an agent unable to raise a work order at all."""
+        assessment, _ = self._build(
+            recommended=None,
+            cases=(("Air Conditioner", "open"), ("Heater", "open")),
+        )
+        items = self._annotate(assessment)
+        self.assertTrue(all(i.recommended and i.preferred for i in items))
+
+    def test_a_questionnaire_with_an_EMPTY_list_also_shows_everything(self):
+        assessment, _ = self._build(
+            recommended=(),
+            cases=(("Air Conditioner", "open"), ("Heater", "open")),
+        )
+        items = self._annotate(assessment)
+        self.assertTrue(all(i.recommended and i.preferred for i in items))
+
+    def test_a_ZERO_quantity_is_not_a_recommendation(self):
+        from .services import dispatch as dispatch_svc
+
+        assessment, _ = self._build(recommended=(("window_ac", 0),))
+        self.assertEqual(dispatch_svc.recommended_products(assessment), {})

@@ -546,3 +546,103 @@ def not_dispatchable_reason(order):
 
 def is_dispatchable(order):
     return not not_dispatchable_reason(order)
+
+
+def recommended_products(assessment):
+    """The product CATEGORIES this assessment recommended, from its questionnaire.
+
+    An assessment recommends CATALOGUE PRODUCTS by option code (``window_ac``); a
+    housing case is named after a product CATEGORY (``Home Remediation - Air
+    Conditioner - Queens``). ``BillableItem.billing_category`` is the bridge, and it
+    already lines up exactly:
+
+        window_ac              -> "Air Conditioner"
+        dehumidifier_portable  -> "De-humidifier"
+
+    Returns ``{category: qty}``, or ``{}`` when nothing was recorded.
+
+    ⚠ AN EMPTY RESULT MEANS "WE DO NOT KNOW", NOT "NOTHING WAS RECOMMENDED". Callers
+    must not filter items down to nothing on the strength of it: an assessment
+    predating the questionnaire, or one submitted on paper, has no interventions
+    recorded, and hiding every item would leave an agent unable to raise a work order
+    at all. Show everything in that case and say so.
+    """
+    from api.models import BillableItem
+
+    form = getattr(assessment, "questionnaire", None)
+    entries = (getattr(form, "interventions", None) or []) if form else []
+    wanted = {}
+    for entry in entries:
+        code = (entry or {}).get("option")
+        if not code:
+            continue
+        try:
+            qty = int((entry or {}).get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            continue
+        wanted[code] = wanted.get(code, 0) + qty
+    if not wanted:
+        return {}
+    categories = {}
+    rows = BillableItem.objects.filter(option_code__in=wanted).values_list(
+        "option_code", "billing_category",
+    )
+    for code, category in rows:
+        if not category:
+            continue
+        categories[category] = categories.get(category, 0) + wanted.get(code, 0)
+    return categories
+
+
+def annotate_items_for_picker(assessment, items):
+    """Mark which items the work-order picker should offer, and pre-tick.
+
+    Three facts per item, so the panel renders rather than decides:
+
+    ``recommended``  this assessment asked for that product category
+    ``preferred``    the ONE case chosen to fund it -- an OPEN case beats a closed
+                     one, then a dispatchable beats an expired, then the newest
+    ``recommended_qty``  how many the assessment asked for
+
+    ⚠ WHY ONE CASE PER CATEGORY. MIRIAM ISRAEL holds THREE "Air Conditioner" cases
+    (one open, two closed) against a recommended quantity of one. Offering all three
+    asks the agent to know which of three identically-named rows is the live funding
+    vehicle -- and she had 13 cases across five categories while the assessment
+    recommended two products, so eleven of the rows were noise.
+
+    A closed case is still eligible (``is_available`` deliberately ignores case
+    status -- a Home Remediation case can close in Unite Us while the approved device
+    still has to be fitted), so closed cases are ranked LOWER, never dropped.
+    """
+    wanted = recommended_products(assessment)
+    # No recommendation recorded -> we do not know, so hide nothing.
+    if not wanted:
+        for item in items:
+            item.recommended = True
+            item.preferred = True
+            item.recommended_qty = 0
+        return {}
+
+    by_category = {}
+    for item in items:
+        item.recommended = item.item in wanted
+        item.recommended_qty = wanted.get(item.item, 0)
+        item.preferred = False
+        if item.recommended:
+            by_category.setdefault(item.item, []).append(item)
+
+    for category, group in by_category.items():
+        group.sort(key=lambda i: (
+            # An OPEN case first.
+            0 if (i.case and (i.case.case_status or "") == "open") else 1,
+            # Then one that needs no override.
+            0 if i.is_available else 1,
+            # Then the most recent, so a re-authorization beats a stale case.
+            -(i.created_at.timestamp() if i.created_at else 0),
+        ))
+        # As many as were recommended -- a quantity of 2 needs two cases.
+        for item in group[:max(1, wanted.get(category, 1))]:
+            item.preferred = True
+    return wanted

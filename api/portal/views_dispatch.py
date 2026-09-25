@@ -81,7 +81,32 @@ def _serialize_item(row):
         "unavailable_reason": row.unavailable_reason,
         # Overridable: approved and undispatched, blocked only by a lapsed window.
         "expired_only": row.expired_only,
+        # Set by dispatch.annotate_items_for_picker. Defaults are PERMISSIVE so a
+        # caller that forgot to annotate shows everything rather than an empty
+        # picker -- the failure mode that hides work is the worse one.
+        "recommended": bool(getattr(row, "recommended", True)),
+        "preferred": bool(getattr(row, "preferred", True)),
+        "recommended_qty": int(getattr(row, "recommended_qty", 0) or 0),
     }
+
+
+def _picker_items(order):
+    """An order's items, ANNOTATED for the work-order picker on an assessment.
+
+    The annotation says which items this assessment actually recommended and which
+    single case should fund each one -- MIRIAM ISRAEL held 13 cases across five
+    product categories against an assessment that recommended two products, so
+    eleven of the rows were noise and three identically-named "Air Conditioner"
+    cases asked the agent to guess which was live.
+
+    A work order's own line items are returned untouched: they are what was already
+    dispatched, and nothing there is a choice any more.
+    """
+    if order.kind != DispatchKind.ASSESSMENT:
+        return list(order.line_items.all())
+    items = list(order.items.select_related("case").all())
+    dispatch_svc.annotate_items_for_picker(order, items)
+    return items
 
 
 def _serialize_order(order):
@@ -137,13 +162,7 @@ def _serialize_order(order):
         # the ones that work order covers. An item is not a status -- it is a thing
         # to install -- so it carries its case's AUTHORIZATION rather than a
         # dispatch stage.
-        "items": [
-            _serialize_item(i)
-            for i in (
-                order.items.all() if order.kind == DispatchKind.ASSESSMENT
-                else order.line_items.all()
-            )
-        ],
+        "items": [_serialize_item(i) for i in _picker_items(order)],
         "service_address": order.service_address,
         "address_notes": order.address_notes,
         # The address in PARTS as well as formatted, so the Details tab can EDIT it.
