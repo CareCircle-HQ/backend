@@ -574,6 +574,9 @@ class MemberDeliveriesView(MemberAPIView):
                 "menu_type": str(row.menu_type) if row.menu_type_id else "",
                 "meal_type": (row.kitchen_meal_type or "").strip(),
                 "is_today": row.expected_delivery_date == today,
+                # Whether anyone actually confirmed the food arrived. False on almost
+                # every row -- see the note on `last`.
+                "confirmed": row.delivered_at is not None,
             }
 
         nxt = (
@@ -582,9 +585,21 @@ class MemberDeliveriesView(MemberAPIView):
             .order_by("expected_delivery_date")
             .first()
         )
+        # ⚠ THE MOST RECENT PAST DELIVERY, NOT THE MOST RECENT *CONFIRMED* ONE.
+        #
+        # Requiring delivered_at was technically correct and practically useless:
+        # James Bethea has THIRTY past deliveries and not one carries it, so the
+        # screen told him "no delivery has been confirmed yet" — which reads as "you
+        # have never been sent food". Across the whole system only 184 of 472,628
+        # orders are marked delivered, so that was the answer for 99% of members.
+        #
+        # What we actually know is: an order was scheduled for a past date, and
+        # whether anyone confirmed it. Both are worth showing; conflating them is not.
+        # `confirmed` carries the distinction and the app words it honestly rather
+        # than claiming an arrival we cannot evidence.
         last = (
-            base.exclude(delivered_at=None)
-            .order_by("-delivered_at")
+            base.filter(expected_delivery_date__lt=today)
+            .order_by("-expected_delivery_date", "-delivered_at")
             .first()
         )
         # ⚠ CANCELLED DELIVERIES STAY IN THE HISTORY. 53% of all orders are cancelled,

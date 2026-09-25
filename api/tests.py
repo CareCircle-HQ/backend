@@ -42574,18 +42574,33 @@ class MemberDeliveriesTest(TestCase):
     def _get(self):
         return self.api.get("/v1/me/deliveries/", HTTP_HOST=MEMBER_HOST).data
 
-    def test_a_member_with_NO_delivered_order_gets_null_not_a_guess(self):
-        """⚠ THIS IS THE COMMON CASE, not an edge case. Only 184 of 472,628 delivery
-        orders are marked delivered -- 0.04% -- so "Last Delivery" is empty for
-        virtually every member. The screen must say so rather than show the most
-        recent SCHEDULED one as though it had arrived."""
-        self._delivery(days=-3)
-        self._delivery(days=2)
-        self.assertIsNone(self._get()["last"])
+    def test_an_UNCONFIRMED_past_delivery_is_still_shown_as_the_last_one(self):
+        """⚠ REQUIRING delivered_at WAS TECHNICALLY CORRECT AND USELESS. James Bethea
+        has THIRTY past deliveries and not one carries it, so the screen told him "no
+        delivery has been confirmed yet" -- which reads as "you have never been sent
+        food". Only 184 of 472,628 orders system-wide are marked delivered, so that
+        was the answer for 99% of members.
 
-    def test_the_last_delivery_is_the_most_recently_DELIVERED(self):
-        self._delivery(days=-10, status="delivered", delivered=True, quantity=5)
+        It is shown, with confirmed=False, and the app words it as "sent, no
+        confirmation it arrived" rather than claiming a delivery."""
+        self._delivery(days=-3, quantity=9)
+        self._delivery(days=2)
+        last = self._get()["last"]
+        self.assertIsNotNone(last)
+        self.assertEqual(last["quantity"], 9)
+        self.assertFalse(last["confirmed"])
+
+    def test_a_CONFIRMED_delivery_reports_confirmed(self):
         self._delivery(days=-2, status="delivered", delivered=True, quantity=9)
+        last = self._get()["last"]
+        self.assertTrue(last["confirmed"])
+        self.assertIsNotNone(last["delivered_at"])
+
+    def test_the_last_delivery_is_the_most_recent_PAST_one(self):
+        self._delivery(days=-10, status="delivered", delivered=True, quantity=5)
+        self._delivery(days=-2, quantity=9)
+        # The more recent one wins even though the older one is the only CONFIRMED
+        # one: "when did food last come" is a question about dates.
         self.assertEqual(self._get()["last"]["quantity"], 9)
 
     def test_the_next_delivery_skips_CANCELLED_ones(self):
