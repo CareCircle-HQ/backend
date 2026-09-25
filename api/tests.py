@@ -42108,3 +42108,263 @@ class MemberMobileAppProvisioningTest(TestCase):
         self.assertEqual(self.member.mobile_app_password, "")
         self.assertEqual(self.member.mobile_app_username, "3055550142")
         self.assertFalse(self.member.mobile_app_enabled)
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberAppVerifyCodeTest(TestCase):
+    """The SECOND way in: a one-time code, for a member who forgot their password.
+
+    Both paths end at the same MemberAccessToken, so nothing downstream cares which
+    was used. What differs is what a code login must NOT do.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Otp", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Otp HH"), client=client,
+            is_primary=True, mobile_app_username="3055551234",
+            mobile_app_password=make_password("issued-by-agent"),
+            mobile_app_must_change_password=True,
+        )
+        self.api = APIClient()
+
+    def _issue(self, number="3055551234", member=None):
+        from .models import HouseholdMemberLoginCode
+
+        return HouseholdMemberLoginCode.issue(
+            number, member=member if member is not None else self.member,
+        )
+
+    def _verify(self, code, number="3055551234"):
+        return self.api.post(
+            "/v1/auth/verify-code/", {"username": number, "code": code},
+            format="json", HTTP_HOST=MEMBER_HOST,
+        )
+
+    def test_a_valid_code_returns_a_session(self):
+        _obj, code = self._issue()
+        r = self._verify(code)
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertTrue(r.data["access_token"].startswith("ccmt_"))
+
+    def test_a_code_login_does_NOT_clear_the_forced_change(self):
+        """⚠ A member who signs in by code still has an AGENT-ISSUED password. Letting
+        the OTP route around that would turn the forced change into a suggestion."""
+        _obj, code = self._issue()
+        r = self._verify(code)
+        self.assertTrue(r.data["member"]["must_change_password"])
+        self.member.refresh_from_db()
+        self.assertTrue(self.member.mobile_app_must_change_password)
+
+    def test_a_member_with_NO_password_cannot_get_in_by_code(self):
+        """⚠ 7,235 household members carry a username from an old import. A code login
+        must not be a back door into an account nobody provisioned."""
+        from .models import HouseholdMember
+
+        HouseholdMember.objects.filter(pk=self.member.pk).update(
+            mobile_app_password="",
+        )
+        _obj, code = self._issue()
+        self.assertEqual(self._verify(code).status_code, 401)
+
+    def test_a_code_is_SINGLE_USE(self):
+        _obj, code = self._issue()
+        self.assertEqual(self._verify(code).status_code, 200)
+        self.assertEqual(self._verify(code).status_code, 401)
+
+    def test_an_EXPIRED_code_is_refused(self):
+        from datetime import timedelta
+
+        from .models import HouseholdMemberLoginCode
+
+        obj, code = self._issue()
+        HouseholdMemberLoginCode.objects.filter(pk=obj.pk).update(
+            expires_at=timezone.now() - timedelta(minutes=1),
+        )
+        self.assertEqual(self._verify(code).status_code, 401)
+
+    def test_a_wrong_code_counts_an_attempt_and_BURNS_after_five(self):
+        """A guessable 6-digit code left alive is a 1-in-a-million lottery an attacker
+        can enter repeatedly."""
+        from .models import HouseholdMemberLoginCode
+
+        obj, code = self._issue()
+        for _ in range(5):
+            self.assertEqual(self._verify("000000").status_code, 401)
+        obj.refresh_from_db()
+        self.assertEqual(obj.attempts, 5)
+        # Even the RIGHT code no longer works.
+        self.assertEqual(self._verify(code).status_code, 401)
+        obj.refresh_from_db()
+        self.assertIsNotNone(obj.consumed_at)
+
+    def test_every_failure_answers_IDENTICALLY(self):
+        """Anti-enumeration: wrong code, no code, unknown number must be one answer."""
+        _obj, _code = self._issue()
+        wrong = self._verify("000000")
+        unknown = self._verify("000000", number="9995550000")
+        self.assertEqual(wrong.status_code, unknown.status_code)
+        self.assertEqual(wrong.data["error"], unknown.data["error"])
+        self.assertEqual(wrong.data["detail"], unknown.data["detail"])
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberDashboardTest(TestCase):
+    """The Home screen's single request."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="JAMES", last_name="BETHEA",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Bethea HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3057813277",
+            mobile_app_password=make_password("chosen-by-the-member"),
+            mobile_app_must_change_password=False,
+        )
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _get(self):
+        return self.api.get("/v1/me/dashboard/", HTTP_HOST=MEMBER_HOST)
+
+    def _delivery(self, *, days, status="scheduled", member=None):
+        """⚠ DeliveryOrder.purchase_order is NOT NULL. A delivery always belongs to a
+        purchase order in this domain -- there is no such thing as a loose one."""
+        from datetime import timedelta
+
+        from .models import DeliveryOrder, PurchaseOrder
+
+        return DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.create(),
+            member=member or self.client_rec, quantity=7, status=status,
+            expected_delivery_date=timezone.localdate() + timedelta(days=days),
+        )
+
+    def test_the_name_is_TITLE_CASED(self):
+        """⚠ The CRM stores "JAMES BETHEA" in caps for matching. "Good morning,
+        JAMES" reads as shouting at the person whose benefits these are."""
+        self.assertEqual(self._get().data["member"]["first_name"], "James")
+
+    def test_a_9999_expiry_is_reported_as_NO_END_DATE(self):
+        """⚠ 47% OF ALL INSURANCE ROWS carry expired_at = 9999-12-31. It is a
+        sentinel for open-ended coverage, not a date, and "Valid until Dec 31, 9999"
+        on a member's phone is nonsense. Returned as null so the screen can say
+        "ongoing"."""
+        from datetime import datetime, timezone as dt_timezone
+
+        from .models import Insurance
+
+        Insurance.objects.create(
+            client=self.client_rec, plan_name="Fidelis Care (NY)", status="active",
+            is_primary=True,
+            expired_at=datetime(9999, 12, 31, tzinfo=dt_timezone.utc),
+        )
+        data = self._get().data
+        self.assertIsNone(data["coverage"]["valid_until"])
+        self.assertEqual(data["coverage"]["status"], "active")
+        self.assertEqual(data["coverage"]["plan_name"], "Fidelis Care (NY)")
+
+    def test_a_REAL_expiry_is_reported(self):
+        from datetime import datetime, timezone as dt_timezone
+
+        from .models import Insurance
+
+        Insurance.objects.create(
+            client=self.client_rec, plan_name="Fidelis", status="active",
+            is_primary=True,
+            expired_at=datetime(2027, 3, 31, tzinfo=dt_timezone.utc),
+        )
+        self.assertEqual(
+            str(self._get().data["coverage"]["valid_until"]), "2027-03-31",
+        )
+
+    def test_no_insurance_is_UNKNOWN_not_a_guess(self):
+        data = self._get().data
+        self.assertEqual(data["coverage"]["status"], "unknown")
+        self.assertIsNone(data["coverage"]["valid_until"])
+
+    def test_the_next_delivery_is_the_soonest_UPCOMING_one(self):
+        from datetime import timedelta
+
+        from .models import DeliveryOrder
+
+        today = timezone.localdate()
+        for offset in (10, 2, -3):
+            self._delivery(days=offset)
+        data = self._get().data
+        self.assertEqual(
+            str(data["next_delivery"]["date"]), str(today + timedelta(days=2)),
+        )
+        self.assertFalse(data["next_delivery"]["is_today"])
+
+    def test_a_CANCELLED_delivery_is_not_the_next_one(self):
+        """Telling a member food is coming when it was cancelled is worse than
+        telling them nothing."""
+        from datetime import timedelta
+
+        from .models import DeliveryOrder
+
+        today = timezone.localdate()
+        self._delivery(days=1, status="cancelled")
+        self._delivery(days=5)
+        self.assertEqual(
+            str(self._get().data["next_delivery"]["date"]),
+            str(today + timedelta(days=5)),
+        )
+
+    def test_no_upcoming_delivery_is_NULL_not_an_empty_object(self):
+        self.assertIsNone(self._get().data["next_delivery"])
+
+    def test_ANOTHER_members_deliveries_are_not_shown(self):
+        """⚠ Scoped to the CLIENT, not the household: meals are cooked to ONE
+        person's dietary profile, and showing a household's deliveries would show a
+        member food they must not eat."""
+        from datetime import timedelta
+
+        from .models import Client, DeliveryOrder, HouseholdMember
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Other", last_name="Person",
+            client_added_at=timezone.now(),
+        )
+        HouseholdMember.objects.create(
+            household=self.member.household, client=other, is_primary=False,
+        )
+        self._delivery(days=1, member=other)
+        self.assertIsNone(self._get().data["next_delivery"])
+
+    def test_it_is_REFUSED_while_the_password_change_is_pending(self):
+        """⚠ THE FIRST ENDPOINT THAT CAN PROVE THE GATE. Every earlier one was exempt
+        or unauthenticated, so the forced change had never actually been shown to
+        block anything."""
+        from .models import HouseholdMember
+
+        HouseholdMember.objects.filter(pk=self.member.pk).update(
+            mobile_app_must_change_password=True,
+        )
+        r = self._get()
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.data["error"], "password_change_required")
+
+    def test_it_is_refused_without_a_token(self):
+        self.assertEqual(
+            APIClient().get(
+                "/v1/me/dashboard/", HTTP_HOST=MEMBER_HOST,
+            ).status_code, 403,
+        )

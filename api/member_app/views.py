@@ -17,7 +17,9 @@ from rest_framework import status as http
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..models import HouseholdMember, MemberAccessToken
+from ..models import (
+    HouseholdMember, HouseholdMemberLoginCode, MemberAccessToken,
+)
 from .auth import (
     IsMember, MemberAuthentication, authenticate_member, issue_token,
     normalize_username,
@@ -211,3 +213,179 @@ class MemberPasswordView(MemberAPIView):
         ).exclude(pk=request.user.token.pk).update(revoked_at=timezone.now())
         logger.info("member %s changed their app password", member.id)
         return Response({"ok": True, "must_change_password": False})
+
+
+class MemberVerifyCodeView(APIView):
+    """POST /v1/auth/verify-code/ -- exchange a one-time code for a session.
+
+    THE SECOND WAY IN. A member who has forgotten their password asks for a code
+    (``/api/member-app/request-code/`` on the CRM host, which predates this surface)
+    and exchanges it here. Both paths end at the same :class:`MemberAccessToken`, so
+    nothing downstream cares which was used.
+
+    ⚠ A CODE LOGIN DOES NOT CLEAR ``must_change_password``. A member who never set
+    their own password still has an agent-issued one, and letting the OTP route around
+    that would turn the forced change into a suggestion.
+
+    ⚠ AND IT DOES NOT SET ONE EITHER. A member who signs in by code with no password at
+    all is refused: the CRM's Mobile App tab is the only thing that issues credentials,
+    and a self-service path into an unprovisioned account would make the primary-only
+    policy unenforceable.
+    """
+
+    authentication_classes = []
+    permission_classes = []
+    throttle_scope = "anon"
+
+    MAX_ATTEMPTS = 5
+
+    def post(self, request):
+        from .auth import normalize_username
+
+        data = request.data or {}
+        digits = normalize_username(
+            data.get("username") or data.get("mobile_number") or "",
+        )
+        code = str(data.get("code") or "").strip()
+        if not digits or not code:
+            return error("missing_code", "Mobile number and code are required.")
+
+        # Uniform failure for every reason -- expired, wrong, already used, no such
+        # member. A specific answer would tell an attacker which numbers exist and
+        # which codes are live.
+        generic = error(
+            "invalid_code", "That code is not valid. Request a new one.",
+            http.HTTP_401_UNAUTHORIZED,
+        )
+
+        record = (
+            HouseholdMemberLoginCode.objects
+            .filter(mobile_number=digits, consumed_at__isnull=True)
+            .order_by("-created_at")
+            .first()
+        )
+        if record is None or record.is_expired or record.is_consumed:
+            return generic
+        if record.attempts >= self.MAX_ATTEMPTS:
+            # Burn it rather than leave a guessable code alive.
+            HouseholdMemberLoginCode.objects.filter(pk=record.pk).update(
+                consumed_at=timezone.now(),
+            )
+            return generic
+        if not record.check_code(code):
+            HouseholdMemberLoginCode.objects.filter(pk=record.pk).update(
+                attempts=record.attempts + 1,
+            )
+            return generic
+
+        member = record.member or (
+            HouseholdMember.objects
+            .select_related("client", "household")
+            .filter(mobile_app_username=digits)
+            .first()
+        )
+        # ⚠ NO PASSWORD MEANS NO ACCOUNT, even with a valid code. 7,235 household
+        # members carry a username from an old import; a code login must not become a
+        # back door into those.
+        if member is None or not member.mobile_app_enabled:
+            return generic
+
+        HouseholdMemberLoginCode.objects.filter(pk=record.pk).update(
+            consumed_at=timezone.now(), member=member,
+        )
+        raw, token = issue_token(
+            member,
+            ip=_client_ip(request),
+            device_label=(data.get("device_label") or "").strip(),
+        )
+        client = member.client
+        return Response({
+            "access_token": raw,
+            "expires_at": token.expires_at,
+            "member": {
+                "id": str(member.id),
+                "first_name": getattr(client, "first_name", "") if client else "",
+                "is_primary": member.is_primary,
+                "must_change_password": member.mobile_app_must_change_password,
+            },
+        })
+
+
+# ── home ─────────────────────────────────────────────────────────────────────
+
+class MemberDashboardView(MemberAPIView):
+    """GET /v1/me/dashboard/ -- everything the Home screen shows.
+
+    ONE request, not four. The home screen is the first thing a member sees, often on
+    a phone with poor signal, and four round trips means four chances to show a
+    spinner. The pieces are small and always shown together.
+
+    ⚠ WHAT IS DELIBERATELY ABSENT: no case state, no hold reason, no warning codes, no
+    Medicaid ID, no plan external ids. Those are agent-facing judgements, and a member
+    reading them would be reading what we say about them internally.
+    """
+
+    def get(self, request):
+        from django.utils import timezone
+
+        from ..models import DeliveryOrder, Insurance
+
+        member = request.user.household_member
+        client = request.user.client
+        today = timezone.localdate()
+
+        first_name = (getattr(client, "first_name", "") or "").strip()
+
+        # ── coverage ──────────────────────────────────────────────────────
+        coverage = {"status": "unknown", "plan_name": "", "valid_until": None}
+        if client is not None:
+            ins = (
+                Insurance.objects
+                .filter(client=client)
+                .order_by("-is_primary", "-enrolled_at")
+                .first()
+            )
+            if ins is not None:
+                coverage["plan_name"] = (ins.plan_name or ins.plan_type or "").strip()
+                coverage["status"] = (
+                    "active" if (ins.status or "").lower() == "active"
+                    else "inactive"
+                )
+                # ⚠ 9999-12-31 IS A SENTINEL, NOT A DATE, and it is 47% of all
+                # insurance rows. "Valid until: Dec 31, 9999" is nonsense on a
+                # member's phone; an open-ended coverage has no end date to show, so
+                # this returns null and the screen says "ongoing" instead.
+                if ins.expired_at and ins.expired_at.year < 9999:
+                    coverage["valid_until"] = ins.expired_at.date()
+
+        # ── the next delivery ─────────────────────────────────────────────
+        # ⚠ SCOPED TO THE CLIENT, not the household. DeliveryOrder.member is a
+        # Client, and meals are cooked to ONE person's dietary profile -- showing a
+        # household's deliveries would show a member food they must not eat.
+        next_delivery = None
+        if client is not None:
+            row = (
+                DeliveryOrder.objects
+                .filter(member=client, expected_delivery_date__gte=today)
+                .exclude(status__in=["cancelled", "canceled"])
+                .order_by("expected_delivery_date")
+                .first()
+            )
+            if row is not None:
+                next_delivery = {
+                    "date": row.expected_delivery_date,
+                    "quantity": row.quantity,
+                    "status": row.status,
+                    "is_today": row.expected_delivery_date == today,
+                }
+
+        return Response({
+            "member": {
+                "id": str(member.id),
+                # Title-cased: the CRM stores "JAMES BETHEA" in caps for matching, and
+                # "Good morning, JAMES" reads as shouting at the person.
+                "first_name": first_name.title(),
+            },
+            "coverage": coverage,
+            "next_delivery": next_delivery,
+        })

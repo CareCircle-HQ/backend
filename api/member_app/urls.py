@@ -10,11 +10,21 @@ from django.urls import path
 
 from .views import (
     MemberLoginView, MemberLogoutView, MemberMeView, MemberPasswordView,
+    MemberVerifyCodeView,
 )
+from .views import MemberDashboardView
 
 urlpatterns = [
     path("v1/auth/login/", MemberLoginView.as_view(), name="member-app-login"),
+    path(
+        "v1/auth/verify-code/",
+        MemberVerifyCodeView.as_view(), name="member-app-verify-code",
+    ),
     path("v1/auth/logout/", MemberLogoutView.as_view(), name="member-app-logout"),
     path("v1/me/", MemberMeView.as_view(), name="member-app-me"),
     path("v1/me/password/", MemberPasswordView.as_view(), name="member-app-password"),
+    path(
+        "v1/me/dashboard/",
+        MemberDashboardView.as_view(), name="member-app-dashboard",
+    ),
 ]
