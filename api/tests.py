@@ -41438,3 +41438,171 @@ class WorkOrderCompletionTest(TestCase):
             dispatch_svc.missing_for_submission(wo),
             dispatch_svc.missing_for_completion(wo),
         )
+
+
+class WorkOrderDocumentTest(TestCase):
+    """The two work-order PDFs, and the shared helpers they borrow.
+
+    ⚠ EVERY BUG HERE IS SILENT BY DESIGN. ``generate_work_order_documents`` swallows a
+    rendering fault on purpose -- the completion is the record and a broken photograph
+    must not undo a finished job -- so a mistake produces "completed, zero documents"
+    with nothing on screen. Three did, during this work:
+
+      * ``_member_block`` reads ``submitted_at``; the context only had ``completed_at``
+      * ``_signature_block`` returns ONE Table, so ``story += `` raised TypeError
+      * ``_proof_flowable`` is the helper's name; I had invented ``_proof_image``
+
+    These tests assert the documents EXIST and are non-trivial, which is the only
+    assertion that would have caught any of them.
+    """
+
+    def _completed_work_order(self):
+        import hashlib
+
+        from django.utils import timezone
+
+        from .models import (
+            BillableItem, Case, CaseStatus, CaseType, Client, DispatchItem,
+            DispatchKind, DispatchOrder, DispatchSignature, DispatchSignerRole,
+            DispatchStatus, Vendor, VendorPrice,
+        )
+        from .services import dispatch as dispatch_svc
+
+        vendor = Vendor.objects.create(name="Fitters Ltd", is_active=True)
+        item_row = BillableItem.objects.create(
+            item="Window air conditioner", option_code="window_ac",
+            billing_category="Air Conditioner", vendor_price="300.00",
+            is_active=True,
+        )
+        VendorPrice.objects.create(
+            vendor=vendor, billable_item=item_row, price="325.00",
+        )
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pdf", last_name="Member",
+            client_added_at=timezone.now(),
+        )
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=client, vendor=vendor,
+            status=DispatchStatus.SUBMITTED,
+        )
+        wo = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=client, vendor=vendor,
+            parent=assessment, status=DispatchStatus.CONFIRMED,
+        )
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client,
+            case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+            service_type="Home Expense Assistance/Repairs",
+            program_name="Home Remediation - Air Conditioner - Queens",
+            case_created_at=timezone.now(), date_opened=timezone.now(),
+        )
+        item = DispatchItem.objects.create(
+            assessment=assessment, case=case, item="Air Conditioner",
+            location="Queens",
+            program_name="Home Remediation - Air Conditioner - Queens",
+            dispatch_order=wo,
+        )
+        dispatch_svc.start_work_order(wo)
+        from .models import DispatchProof
+
+        DispatchProof.objects.create(
+            dispatch_order=wo, dispatch_item=item, s3_key="k/missing-on-purpose",
+            content_hash=hashlib.sha256(b"x").hexdigest(),
+            captured_at=timezone.now(),
+        )
+        submission = dispatch_svc.active_submission(wo)
+        for role in (DispatchSignerRole.MEMBER, DispatchSignerRole.VENDOR):
+            DispatchSignature.objects.create(
+                dispatch_submission=submission, signer_role=role,
+                signer_name="Signer", s3_key="", content_hash=uuid.uuid4().hex,
+                signed_at=timezone.now(),
+            )
+        return wo, item
+
+    def test_BOTH_documents_render_and_are_real_pdfs(self):
+        from .services import dispatch_pdf
+
+        wo, _item = self._completed_work_order()
+        for doc_type, renderer in dispatch_pdf.WORK_ORDER_RENDERERS.items():
+            with self.subTest(doc_type=doc_type):
+                pdf = renderer(wo)
+                self.assertTrue(pdf.startswith(b"%PDF-"), doc_type)
+                # ⚠ 1,500 NOT 5,000. I first asserted 5,000 because the real documents
+                # are ~47 KB -- but almost all of that is the vendor's embedded LOGO,
+                # and this fixture's vendor has none. A letterhead, a member block and
+                # a table come to ~2 KB; an empty shell is a few hundred bytes, which
+                # is what this is actually distinguishing.
+                self.assertGreater(len(pdf), 1500, doc_type)
+                # Page structure, which a failed flowable would change.
+                self.assertIn(b"/Page", pdf)
+
+    def test_an_UNREADABLE_photo_does_not_lose_the_certificate(self):
+        """⚠ The proof's s3_key points at nothing here, on purpose. One bad photograph
+        must not cost the vendor their paperwork -- it renders "(photograph
+        unavailable)" instead, which is a different problem from never taking one."""
+        from .services import dispatch_pdf
+
+        wo, _item = self._completed_work_order()
+        pdf = dispatch_pdf.render_completion_certificate(wo)
+        self.assertTrue(pdf.startswith(b"%PDF-"))
+
+    def test_a_signature_with_no_image_still_renders(self):
+        """The FACT of signing is in the database; a blank space would read as
+        "nobody signed"."""
+        from .services import dispatch_pdf
+
+        wo, _item = self._completed_work_order()
+        self.assertTrue(
+            dispatch_pdf.render_completion_certificate(wo).startswith(b"%PDF-"),
+        )
+
+    def test_the_invoice_prices_from_the_VENDORS_rate_not_the_base(self):
+        from .services import dispatch_pdf
+
+        wo, _item = self._completed_work_order()
+        ctx = dispatch_pdf._work_order_context(wo)
+        self.assertEqual(len(ctx["lines"]), 1)
+        # 325.00 is the vendor's negotiated price; 300.00 is the catalogue base.
+        self.assertEqual(str(ctx["lines"][0]["unit"]), "325.00")
+
+    def test_an_UNPRICED_product_is_None_not_zero(self):
+        """"$0.00" on an invoice reads as free; the document names it instead."""
+        from .models import BillableItem
+        from .services import dispatch_pdf
+
+        wo, _item = self._completed_work_order()
+        BillableItem.objects.all().delete()
+        ctx = dispatch_pdf._work_order_context(wo)
+        self.assertIsNone(ctx["lines"][0]["unit"])
+
+    def test_the_date_is_labelled_INSTALLED_not_assessment_date(self):
+        """⚠ The shared _member_block says "Assessment date". On a certificate of
+        completion that names the wrong event -- and on a reassessed dwelling the two
+        are months apart."""
+        from .services import dispatch_pdf
+
+        wo, _item = self._completed_work_order()
+        self.assertEqual(
+            dispatch_pdf._work_order_context(wo)["date_label"], "Installed",
+        )
+
+    def test_the_documents_are_stored_ONCE_however_often_it_is_rerun(self):
+        from .models import DispatchDocument
+        from .services import dispatch_pdf
+
+        wo, _item = self._completed_work_order()
+        dispatch_pdf.generate_work_order_documents(wo)
+        first = DispatchDocument.objects.filter(dispatch_order=wo).count()
+        dispatch_pdf.generate_work_order_documents(wo)
+        self.assertEqual(
+            DispatchDocument.objects.filter(dispatch_order=wo).count(), first,
+        )
+        self.assertEqual(first, 2)
+
+    def test_they_carry_the_labels_the_documents_tab_shows(self):
+        from .services.dispatch_pdf import (
+            DOC_COMPLETION, DOC_LABELS, DOC_WORK_INVOICE,
+        )
+
+        self.assertEqual(DOC_LABELS[DOC_WORK_INVOICE], "Work Order Invoice")
+        self.assertEqual(DOC_LABELS[DOC_COMPLETION], "Certificate of Completion")

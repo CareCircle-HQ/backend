@@ -341,7 +341,14 @@ def _member_block(ctx, styles, *, heading="Member"):
         lines.append(f"<b>Address:</b> {ctx['address']}")
     if ctx["case_id"]:
         lines.append(f"<b>Dwelling case:</b> {ctx['case_id']}")
-    lines.append(f"<b>Assessment date:</b> {ctx['submitted_at']:%d %b %Y}")
+    # ⚠ THE LABEL FOLLOWS THE DOCUMENT. A work order's documents reuse this block,
+    # and "Assessment date" on a certificate of completion names the wrong event --
+    # the reader would take the install date for the date of the assessment, which on
+    # a reassessed dwelling is months apart.
+    lines.append(
+        f"<b>{ctx.get('date_label') or 'Assessment date'}:</b> "
+        f"{ctx['submitted_at']:%d %b %Y}"
+    )
     return Paragraph("<br/>".join(lines), styles["body"])
 
 
@@ -718,6 +725,8 @@ def _work_order_context(work_order):
         "submitted_at": timezone.now(),
         # Present for the same reason: shared helpers expect the assessment's shape.
         "form": None,
+        # What _member_block should CALL that date on these documents.
+        "date_label": "Installed",
     }
 
 
