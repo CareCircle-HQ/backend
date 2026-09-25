@@ -42368,3 +42368,164 @@ class MemberDashboardTest(TestCase):
                 "/v1/me/dashboard/", HTTP_HOST=MEMBER_HOST,
             ).status_code, 403,
         )
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberBenefitsTest(TestCase):
+    """One card per SERVICE, not one per case."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ben", last_name="Efit",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Efit HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3055559999",
+            mobile_app_password=make_password("x" * 10),
+        )
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _case(self, *, service_type, status="open", auth="approved",
+              program="", ends_in_days=90, case_type="internal_service"):
+        from datetime import timedelta
+
+        from .models import Case
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.client_rec, case_type=case_type,
+            case_status=status, service_type=service_type, program_name=program,
+            service_authorization_status=auth,
+            service_authorization_approval_starts_at=timezone.now() - timedelta(days=1),
+            service_authorization_approval_ends_at=(
+                timezone.now() + timedelta(days=ends_in_days)
+                if ends_in_days is not None else None
+            ),
+            case_created_at=timezone.now(), date_opened=timezone.now(),
+        )
+
+    def _get(self):
+        return self.api.get("/v1/me/benefits/", HTTP_HOST=MEMBER_HOST).data["benefits"]
+
+    def test_NINE_housing_cases_become_ONE_card(self):
+        """⚠ THE WHOLE POINT. James Bethea has 22 cases, nine of them Home Remediation
+        for five devices in open/closed pairs. Listed raw that is nine near-identical
+        cards and no way to tell what he has."""
+        for device in ("Air Conditioner", "Heater", "De-humidifier"):
+            for state in ("open", "closed"):
+                self._case(
+                    service_type="Home Expense Assistance/Repairs", status=state,
+                    program=f"Home Remediation - {device} - Queens",
+                )
+        cards = self._get()
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["case_count"], 6)
+        self.assertCountEqual(
+            cards[0]["items"], ["Air Conditioner", "Heater", "De-humidifier"],
+        )
+
+    def test_ELIGIBILITY_and_NAVIGATION_cases_are_NOT_benefits(self):
+        """⚠ They are OUR process -- screening a member and managing their file. A
+        member reading "Social Service Case Management" on a list of their benefits
+        would think they had been given something they have not."""
+        self._case(
+            service_type="Social Service Case Management", case_type="navigation",
+        )
+        self._case(
+            service_type="Social Service Case Management", case_type="eligibility",
+        )
+        self.assertEqual(self._get(), [])
+
+    def test_ONE_live_case_among_closed_ones_means_ACTIVE(self):
+        """⚠ A member with one live meals case and three closed ones HAS meals.
+        Saying "expired" because most rows are closed would be a lie with real
+        consequences -- they would stop expecting food that is coming."""
+        for _ in range(3):
+            self._case(service_type="Medically Tailored Meals", status="closed")
+        self._case(service_type="Medically Tailored Meals", status="open")
+        cards = self._get()
+        self.assertEqual(cards[0]["status"], "active")
+
+    def test_a_LAPSED_authorization_is_expired_even_while_the_case_is_open(self):
+        self._case(
+            service_type="Medically Tailored Meals", status="open", ends_in_days=-5,
+        )
+        self.assertEqual(self._get()[0]["status"], "expired")
+
+    def test_a_DENIED_authorization_is_not_active(self):
+        self._case(service_type="Medically Tailored Meals", auth="denied")
+        self.assertEqual(self._get()[0]["status"], "expired")
+
+    def test_a_PENDING_authorization_reads_as_pending(self):
+        self._case(service_type="Medically Tailored Meals", auth="pending")
+        self.assertEqual(self._get()[0]["status"], "pending")
+
+    def test_ACTIVE_sorts_before_pending_before_expired(self):
+        """A member opens this to see what they HAVE."""
+        self._case(service_type="Food Pantry", auth="denied")
+        self._case(service_type="Produce Prescription/Voucher", auth="pending")
+        self._case(service_type="Medically Tailored Meals")
+        self.assertEqual(
+            [c["status"] for c in self._get()], ["active", "pending", "expired"],
+        )
+
+    def test_the_names_are_MEMBER_language_not_payer_language(self):
+        """⚠ "Home Expense Assistance/Repairs" is what the 1115 waiver calls it.
+        Nobody describes their own home that way."""
+        self._case(service_type="Home Expense Assistance/Repairs")
+        self.assertEqual(self._get()[0]["name"], "Home Repairs & Equipment")
+
+    def test_an_UNMAPPED_service_type_still_appears(self):
+        """⚠ A benefit MISSING from this screen is worse than one with an awkward
+        name -- the member would not know they have it."""
+        self._case(service_type="Some New Waiver Service")
+        cards = self._get()
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["name"], "Some New Waiver Service")
+
+    def test_items_are_only_extracted_for_HOME_REMEDIATION(self):
+        """⚠ Applied to every service this produced noise: "Medically Tailored Meals
+        (MTM) - Other Eligible Populations" yielded "Other Eligible Populations", a
+        PAYER POPULATION CATEGORY, not something anybody has been given. Found by
+        reading the real output, not by a test."""
+        self._case(
+            service_type="Medically Tailored Meals",
+            program="Medically Tailored Meals (MTM) - Other Eligible Populations",
+        )
+        self.assertEqual(self._get()[0]["items"], [])
+
+    def test_a_9999_window_is_not_shown_as_a_date(self):
+        """The same sentinel the dashboard handles."""
+        from datetime import datetime, timezone as dt_timezone
+
+        from .models import Case
+
+        case = self._case(service_type="Medically Tailored Meals")
+        Case.objects.filter(pk=case.pk).update(
+            service_authorization_approval_ends_at=datetime(
+                9999, 12, 31, tzinfo=dt_timezone.utc,
+            ),
+        )
+        card = self._get()[0]
+        self.assertEqual(card["status"], "active")
+        self.assertIsNone(card["valid_until"])
+
+    def test_it_is_refused_while_the_password_change_is_pending(self):
+        from .models import HouseholdMember
+
+        HouseholdMember.objects.filter(pk=self.member.pk).update(
+            mobile_app_must_change_password=True,
+        )
+        self.assertEqual(
+            self.api.get(
+                "/v1/me/benefits/", HTTP_HOST=MEMBER_HOST,
+            ).status_code, 403,
+        )

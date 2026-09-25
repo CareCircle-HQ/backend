@@ -389,3 +389,132 @@ class MemberDashboardView(MemberAPIView):
             "coverage": coverage,
             "next_delivery": next_delivery,
         })
+
+
+# ── benefits ─────────────────────────────────────────────────────────────────
+
+#: What a member calls the thing, keyed by our internal service_type.
+#:
+#: ⚠ SERVICE TYPES ARE PAYER VOCABULARY. "Home Expense Assistance/Repairs" and
+#: "Environmental Exposure Assessment" are what the 1115 waiver calls these; nobody
+#: describes their own home that way. An unmapped type falls back to the raw value
+#: rather than being hidden -- a benefit missing from this screen is worse than one
+#: with an awkward name.
+BENEFIT_LABELS = {
+    "Medically Tailored Meals": "Medically Tailored Meals",
+    "Produce Prescription/Voucher": "Fresh Produce",
+    "Home Expense Assistance/Repairs": "Home Repairs & Equipment",
+    "Environmental Exposure Assessment": "Home Assessment",
+    "Environmental Modifications/Accessibility": "Home Modifications",
+    "Food Pantry": "Food Pantry",
+}
+
+BENEFIT_BLURBS = {
+    "Medically Tailored Meals":
+        "Meals designed by a dietitian for your health conditions, delivered to "
+        "your home at no cost.",
+    "Produce Prescription/Voucher":
+        "Fresh fruit and vegetables, at no cost to you.",
+    "Home Expense Assistance/Repairs":
+        "Equipment and repairs that make your home healthier — such as an air "
+        "conditioner, heater or dehumidifier.",
+    "Environmental Exposure Assessment":
+        "A specialist visits your home to find anything affecting your health.",
+    "Environmental Modifications/Accessibility":
+        "Changes to your home that make it safer and easier to move around.",
+    "Food Pantry": "Groceries from a local pantry.",
+}
+
+#: ⚠ NOT BENEFITS, AND THEY MUST NOT APPEAR HERE. ``eligibility`` and ``navigation``
+#: cases are OUR process -- screening a member and managing their file. A member
+#: reading "Social Service Case Management" on a list of their benefits would think
+#: they had been given something they have not.
+BENEFIT_CASE_TYPES = {"internal_service"}
+
+
+class MemberBenefitsView(MemberAPIView):
+    """GET /v1/me/benefits/ -- what this member is actually receiving.
+
+    ⚠ ONE CARD PER SERVICE, NOT ONE PER CASE. A case is a funding vehicle: James
+    Bethea has 22 cases, of which NINE are Home Remediation for five different devices
+    in open/closed pairs. Listed raw that is nine near-identical cards and no way to
+    tell what he has. Grouped by service it is one card that says which devices.
+
+    Status is derived from the group, strongest first -- a member with one live meals
+    case and three closed ones has meals, and saying "expired" because most rows are
+    closed would be a lie with real consequences.
+    """
+
+    def get(self, request):
+        from django.utils import timezone
+
+        from ..models import Case
+
+        client = request.user.client
+        if client is None:
+            return Response({"benefits": []})
+
+        today = timezone.now()
+        groups = {}
+        for case in Case.objects.filter(
+            client=client, case_type__in=BENEFIT_CASE_TYPES,
+        ).order_by("-case_created_at"):
+            key = case.service_type or "Other"
+            g = groups.setdefault(key, {"cases": [], "items": []})
+            g["cases"].append(case)
+            # ⚠ ONLY FOR HOME REMEDIATION. Its programme names carry the DEVICE,
+            # which is the only thing distinguishing nine otherwise identical cases:
+            #   "Home Remediation - Air Conditioner - Queens" -> "Air Conditioner"
+            #
+            # Applied to every service this produced noise that means nothing to a
+            # member: "Medically Tailored Meals (MTM) - Other Eligible Populations"
+            # yielded "Other Eligible Populations", which is a PAYER POPULATION
+            # CATEGORY, not something anybody has been given. Caught by reading the
+            # real output rather than by a test.
+            name = (case.program_name or "").strip()
+            if name.startswith("Home Remediation - ") and " - " in name:
+                device = name.split(" - ")[1].strip()
+                if device and device not in g["items"]:
+                    g["items"].append(device)
+
+        out = []
+        for service_type, g in groups.items():
+            status = "expired"
+            valid_until = None
+            for case in g["cases"]:
+                auth = (case.service_authorization_status or "").lower()
+                start, end = case.effective_authorization_window()
+                live = (
+                    case.case_status == "open"
+                    and auth == "approved"
+                    and (end is None or end >= today)
+                )
+                if live:
+                    status = "active"
+                    # The furthest-out end date in the group: it is the answer to
+                    # "how long have I got this for".
+                    if end is not None and end.year < 9999:
+                        d = end.date()
+                        valid_until = d if valid_until is None else max(valid_until, d)
+                    break
+                if auth in {"pending", "in_review"} and status != "active":
+                    status = "pending"
+
+            out.append({
+                "id": service_type,
+                "name": BENEFIT_LABELS.get(service_type, service_type),
+                "description": BENEFIT_BLURBS.get(service_type, ""),
+                "status": status,
+                "valid_until": valid_until,
+                # Named devices for housing; empty for meals, where the service IS
+                # the thing.
+                "items": g["items"][:6],
+                "case_count": len(g["cases"]),
+            })
+
+        # Active first, then pending, then expired -- a member opens this to see what
+        # they HAVE. Alphabetical within a status so the order does not jump around
+        # between loads.
+        rank = {"active": 0, "pending": 1, "expired": 2}
+        out.sort(key=lambda b: (rank.get(b["status"], 3), b["name"]))
+        return Response({"benefits": out})
