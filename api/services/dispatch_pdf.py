@@ -627,3 +627,262 @@ def generate_submission_documents(order, *, vendor_user=None):
             uploaded_by_vendor_user=vendor_user,
         ))
     return out
+
+
+# ── work order documents ─────────────────────────────────────────────────────
+
+DOC_WORK_INVOICE = "work_order_invoice"
+DOC_COMPLETION = "completion_certificate"
+
+DOC_LABELS[DOC_WORK_INVOICE] = "Work Order Invoice"
+DOC_LABELS[DOC_COMPLETION] = "Certificate of Completion"
+
+
+def _work_order_context(work_order):
+    """What both work-order documents draw from.
+
+    Deliberately NOT ``_context``: that resolves the assessment's questionnaire and
+    its recommended items, and a work order has neither. Its lines are the products
+    actually dispatched -- ``line_items`` -- priced at THIS vendor's rate.
+    """
+    from . import pricing
+
+    vendor = work_order.vendor
+    client = work_order.client
+    items = list(work_order.line_items.select_related("case").all())
+    prices = {
+        r["option_code"]: r["price"]
+        for r in pricing.price_list_for(vendor) if r["option_code"]
+    }
+    # A line item is named after its CASE's product category ("Air Conditioner"),
+    # while a price is keyed by catalogue option code. billing_category is the bridge
+    # -- the same one the work-order picker uses.
+    from api.models import BillableItem
+
+    by_category = {}
+    for code, category in BillableItem.objects.filter(
+        option_code__in=prices, is_active=True,
+    ).values_list("option_code", "billing_category"):
+        if category and category not in by_category:
+            by_category[category] = prices.get(code)
+
+    lines = []
+    for item in items:
+        unit = by_category.get(item.item)
+        lines.append({
+            "description": item.item or "Installed product",
+            "qty": 1,
+            # None rather than 0 when unpriced: "$0.00" on an invoice reads as free,
+            # and a missing price is something to ask about.
+            "unit": unit,
+            "item": item,
+        })
+
+    # ⚠ SAME SHAPE AS _context: a DICT keyed by signer_role, with the image as RAW
+    # BYTES. _signature_block expects that, and my first version passed a list of
+    # decoded images -- which renders as no signatures at all rather than failing.
+    from .dispatch import active_submission
+
+    submission = active_submission(work_order)
+    signatures = {}
+    if submission is not None:
+        for sig in submission.signatures.all():
+            image = b""
+            if sig.s3_key:
+                try:
+                    from . import import_storage
+
+                    image, _ct = import_storage.read_bytes(sig.s3_key)
+                except Exception:  # noqa: BLE001 - the FACT of signing still counts
+                    logger.warning(
+                        "dispatch_pdf: signature unavailable %s", sig.s3_key,
+                    )
+            signatures[sig.signer_role] = {
+                "name": sig.signer_name, "signed_at": sig.signed_at, "image": image,
+            }
+
+    return {
+        "vendor": vendor,
+        "client": client,
+        "member_name": f"{client.first_name} {client.last_name}".strip(),
+        "order": work_order,
+        "items": items,
+        "lines": lines,
+        "signatures": signatures,
+        "address": work_order.service_address,
+        "case_id": str(work_order.case.case_id) if work_order.case_id else "",
+        "completed_at": timezone.now(),
+        # ⚠ _member_block READS submitted_at, and a KeyError there is caught by
+        # generate_*_documents -- so the completion succeeded and zero documents
+        # appeared, silently. For a work order the completion IS the submission date.
+        "submitted_at": timezone.now(),
+        # Present for the same reason: shared helpers expect the assessment's shape.
+        "form": None,
+    }
+
+
+def render_work_order_invoice(work_order):
+    """What the vendor bills us for THIS work order -- its products, nothing else.
+
+    ⚠ ONLY THE PRODUCTS ON THIS ORDER. An assessment can produce several work orders,
+    and invoicing the whole recommendation on the first would bill for devices nobody
+    has installed. The assessment's own fee is not here either: it was invoiced when
+    the assessment was submitted, and billing it again per installation would charge
+    for one visit several times.
+    """
+    from reportlab.platypus import Paragraph, Spacer
+
+    ctx = _work_order_context(work_order)
+    styles = _styles()
+    buf = BytesIO()
+    doc = _doc(buf, "Work Order Invoice")
+    story = _letterhead(
+        ctx["vendor"], styles, "INVOICE",
+        f"Installation · {ctx['completed_at']:%d %b %Y}",
+    )
+    story += [Spacer(1, 10), _member_block(ctx, styles, heading="Installed for"),
+              Spacer(1, 12)]
+    if ctx["lines"]:
+        table, _total = _line_table(
+            ctx["lines"], styles, total_label="Total due",
+        )
+        story.append(table)
+    else:
+        story.append(Paragraph("No products on this work order.", styles["body"]))
+    unpriced = [l["description"] for l in ctx["lines"] if l["unit"] is None]
+    if unpriced:
+        # Named rather than silently excluded: "why is the total lower than I expect?"
+        # needs an answer, and a missing price is a conversation not a zero.
+        story += [
+            Spacer(1, 8),
+            Paragraph(
+                "Not priced on your rate card, so excluded from the total: "
+                + ", ".join(unpriced)
+                + ". Contact CareCircle to have these added.",
+                styles["small"],
+            ),
+        ]
+    doc.build(story)
+    return buf.getvalue()
+
+
+def render_completion_certificate(work_order):
+    """Proof the work happened: every product, its photograph, and both signatures.
+
+    The photographs are the point. A certificate asserting an installation without
+    showing it is a claim, not evidence -- so each product is shown with the photo
+    taken on site, and the completion gate requires one per product precisely so this
+    document cannot be produced half-empty.
+
+    Same letterhead, palette and signature block as the assessment documents: an
+    agent and a member should not have to work out whether two pieces of CareCircle
+    paperwork came from the same process.
+    """
+    from reportlab.lib.units import inch
+    from reportlab.platypus import Paragraph, Spacer
+
+    ctx = _work_order_context(work_order)
+    styles = _styles()
+    buf = BytesIO()
+    doc = _doc(buf, "Certificate of Completion")
+    story = _letterhead(
+        ctx["vendor"], styles, "CERTIFICATE OF COMPLETION",
+        f"Installation completed {ctx['completed_at']:%d %b %Y}",
+    )
+    story += [Spacer(1, 10), _member_block(ctx, styles, heading="Installed for"),
+              Spacer(1, 12)]
+
+    story.append(Paragraph(
+        "The products listed below were installed at the address above and "
+        "demonstrated to the member.",
+        styles["body"],
+    ))
+    story.append(Spacer(1, 10))
+
+    proofs = {}
+    for proof in work_order.proofs.exclude(dispatch_item=None):
+        proofs.setdefault(proof.dispatch_item_id, proof)
+
+    for item in ctx["items"]:
+        story.append(Paragraph(
+            f"<b>{item.item or 'Product'}</b>"
+            + (f" — {item.location}" if item.location else ""),
+            styles["body"],
+        ))
+        image = None
+        proof = proofs.get(item.dispatch_item_id)
+        if proof is not None:
+            image = _proof_flowable(proof, max_width_inch=4.2, max_height_inch=3.2)
+        if image is not None:
+            story += [Spacer(1, 4), image, Spacer(1, 10)]
+        else:
+            # Said plainly rather than left as a gap: the gate requires a photo, so
+            # its absence here means the image could not be read, which is a
+            # different problem from it never having been taken.
+            story += [
+                Spacer(1, 2),
+                Paragraph("(photograph unavailable)", styles["small"]),
+                Spacer(1, 10),
+            ]
+
+    # ⚠ APPEND, not +=. _signature_block returns a single Table flowable, not a
+    # list -- "+=" iterates it and raises TypeError, which generate_* swallows, so
+    # the certificate would simply never appear while the completion succeeded.
+    story.append(Spacer(1, 6))
+    story.append(_signature_block(ctx["signatures"], styles))
+    doc.build(story)
+    return buf.getvalue()
+
+
+WORK_ORDER_RENDERERS = {
+    DOC_WORK_INVOICE: render_work_order_invoice,
+    DOC_COMPLETION: render_completion_certificate,
+}
+
+
+def generate_work_order_documents(work_order, *, vendor_user=None):
+    """Render both and attach them to the work order. Returns the documents.
+
+    Same storage, same idempotency and the same DispatchDocument rows as the
+    assessment's documents, so they appear in the CRM's existing Documents tab with no
+    second mechanism -- the tab lists an order's documents, and a work order is an
+    order.
+
+    Idempotent on CONTENT: re-completing after a correction does not leave two
+    identical invoices, while a genuinely different one still lands. One failure does
+    not lose the other -- a photograph that will not decode should not cost the vendor
+    their invoice.
+    """
+    import hashlib
+
+    from ..models import DispatchDocument
+    from . import import_storage
+
+    out = []
+    for doc_type, renderer in WORK_ORDER_RENDERERS.items():
+        try:
+            pdf = renderer(work_order)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "dispatch_pdf: %s failed for work order %s", doc_type, work_order.pk,
+            )
+            continue
+        digest = hashlib.sha256(pdf).hexdigest()
+        existing = DispatchDocument.objects.filter(
+            dispatch_order=work_order, content_hash=digest,
+        ).first()
+        if existing is not None:
+            out.append(existing)
+            continue
+        stamp = timezone.now().strftime("%Y%m%d")
+        filename = f"{DOC_LABELS[doc_type].replace(' ', '-')}-{stamp}.pdf"
+        key = import_storage.build_key(
+            f"dispatch-documents/{work_order.pk}/{doc_type}-{digest[:16]}.pdf"
+        )
+        import_storage.upload_bytes(key, pdf, content_type="application/pdf")
+        out.append(DispatchDocument.objects.create(
+            dispatch_order=work_order, s3_key=key, content_hash=digest,
+            filename=filename, doc_type=doc_type,
+            uploaded_by_vendor_user=vendor_user,
+        ))
+    return out

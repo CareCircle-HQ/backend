@@ -6253,6 +6253,18 @@ class DispatchProof(models.Model):
         DispatchFinding, on_delete=models.CASCADE, null=True, blank=True,
         related_name="proofs",
     )
+    # WHICH INSTALLED PRODUCT this photo evidences, on a WORK ORDER. Null on an
+    # assessment photo, which evidences a problem (``finding`` / ``intervention_group``)
+    # rather than a completed installation.
+    #
+    # ⚠ A REAL FK, not a reuse of ``intervention_group``. The completion gate requires
+    # one photo PER PRODUCT, and counting a free-text field would let two photos of
+    # the same item read as two items covered -- the certificate of completion is
+    # evidence, and evidence that cannot be tied to a specific device is worthless.
+    dispatch_item = models.ForeignKey(
+        "DispatchItem", on_delete=models.CASCADE, null=True, blank=True,
+        related_name="proofs",
+    )
     s3_key = models.CharField(max_length=500)
     file_url = models.URLField(max_length=1000, blank=True)
     content_hash = models.CharField(max_length=64, db_index=True)

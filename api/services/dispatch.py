@@ -110,6 +110,17 @@ def missing_for_submission(order):
     check is how the food verification endpoint still accepted a housing case after
     the picker had been fixed.
     """
+    # ⚠ A WORK ORDER HAS A DIFFERENT GATE, and this is the function every caller
+    # reads. Left generic it would accept a work order with ONE photo and no per-
+    # product coverage: the rules below are written for an assessment -- a photo per
+    # identified PROBLEM -- while a work order needs a photo per installed PRODUCT.
+    # Delegating here keeps "what blocks submission" a single question with one
+    # answer per kind, rather than two functions a caller has to choose between.
+    from api.models import DispatchKind
+
+    if order.kind == DispatchKind.REMEDIATION:
+        return missing_for_completion(order)
+
     missing = []
 
     submission = active_submission(order)
@@ -759,3 +770,119 @@ def copy_install_windows(assessment, work_order):
         )
         for r in rows
     ])
+
+
+def scheduling_windows(order):
+    """The windows that apply when SCHEDULING this order.
+
+    ⚠ FILTERED BY PURPOSE, and it has to be. An assessment order carries the MEMBER's
+    availability for the assessment visit AND -- once submitted -- the vendor's
+    tentative INSTALL windows. Reading ``availability_windows.all()`` would show the
+    install offers on the assessment's scheduling screen as though the member had
+    offered them, which is exactly the merge the model's docstring warns about.
+
+    An ASSESSMENT schedules against the member's offer; a WORK ORDER schedules against
+    the install windows copied from its assessment.
+    """
+    from api.models import DispatchKind, WindowPurpose
+
+    purpose = (
+        WindowPurpose.ASSESSMENT if order.kind == DispatchKind.ASSESSMENT
+        else WindowPurpose.INSTALL
+    )
+    return list(
+        order.availability_windows.filter(purpose=purpose)
+        .order_by("date", "start_time")
+    )
+
+
+# ── working a WORK ORDER ──────────────────────────────────────────────────────
+
+def missing_for_completion(work_order):
+    """What still blocks a work order's completion. Empty list = ready.
+
+    REASONS, not a bool, for the same reason as ``missing_for_submission``: the vendor
+    is standing in a dwelling and "not ready" tells them nothing.
+
+    ⚠ ONE PHOTO PER PRODUCT, counted by ``DispatchProof.dispatch_item``. The
+    certificate of completion is the evidence that the work happened, and evidence
+    that cannot be tied to a specific device is worthless -- three photos of the air
+    conditioner must not satisfy a dehumidifier. Counting a free-text group, or the
+    total number of photos, would let exactly that through.
+
+    Both signatures too, on the same reasoning as the assessment: the member confirms
+    what was installed in their home, and the vendor confirms they installed it.
+    """
+    from api.models import DispatchSignerRole
+
+    missing = []
+    items = list(work_order.line_items.all())
+    if not items:
+        # Nothing to install means nothing to certify. A completion here would
+        # produce an invoice for no products.
+        missing.append("no products on this work order")
+        return missing
+
+    photographed = set(
+        work_order.proofs.exclude(dispatch_item=None)
+        .values_list("dispatch_item_id", flat=True)
+    )
+    for item in items:
+        if item.dispatch_item_id not in photographed:
+            missing.append(f"a photo of the installed {item.item or 'product'}")
+
+    submission = active_submission(work_order)
+    roles = set()
+    if submission is not None:
+        roles = set(submission.signatures.values_list("signer_role", flat=True))
+    if DispatchSignerRole.MEMBER not in roles:
+        missing.append("member signature")
+    if DispatchSignerRole.VENDOR not in roles:
+        missing.append("vendor signature")
+    return missing
+
+
+@transaction.atomic
+def start_work_order(work_order, *, vendor_user=None):
+    """The vendor is on site and starting the job.
+
+    Moves CONFIRMED -> PENDING_SUBMISSION and opens the submission that will carry the
+    signatures. Idempotent: an offline app that retries, or a vendor who backgrounds
+    it and taps again, must not create a second submission or a second stage event.
+
+    ⚠ REQUIRES A CONFIRMED APPOINTMENT. Starting an unscheduled order would leave a
+    job in progress that nobody agreed a time for, and the member may not be home --
+    the status chain is linear precisely so this cannot be skipped.
+    """
+    from api.models import DispatchStatus
+
+    if work_order.status == DispatchStatus.PENDING_SUBMISSION:
+        return open_submission(work_order)
+    if work_order.status != DispatchStatus.CONFIRMED:
+        raise ValueError(
+            f"a work order can only be started once confirmed (it is "
+            f"{work_order.get_status_display()})"
+        )
+    set_status(
+        work_order, DispatchStatus.PENDING_SUBMISSION,
+        source=StageEventSource.MANUAL, note="work started on site",
+    )
+    return open_submission(work_order)
+
+
+@transaction.atomic
+def complete_work_order(work_order, *, vendor_user=None):
+    """Finish the job: check the gate, submit, and leave the PDFs to the caller.
+
+    Raises ValueError listing what is missing. The gate is checked HERE rather than in
+    the view, so the API and any UI cannot disagree about it.
+
+    The documents are deliberately NOT generated here: the completion is the record and
+    the PDFs are derived from it, so a rendering fault must not undo a finished job.
+    The caller renders them afterwards, wrapped -- the same order the assessment
+    submission uses.
+    """
+    missing = missing_for_completion(work_order)
+    if missing:
+        raise ValueError("; ".join(missing))
+    return submit(work_order, vendor_user=vendor_user, note="work completed on site")

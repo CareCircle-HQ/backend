@@ -33154,11 +33154,16 @@ class PhotoPerAnsweredSectionTest(TestCase):
         self.assertNotIn("photo of: Bathroom", gaps)
 
     def test_an_order_with_no_questionnaire_falls_back_to_the_minimum(self):
+        """⚠ ASSESSMENT, not REMEDIATION. This built a remediation order as a
+        convenient "order with no questionnaire" -- incidental then, wrong now: a
+        work order has its OWN gate (a photo per installed product), so the
+        assessment fallback this test is about stopped being exercised at all.
+        The kind used to be arbitrary and is now load-bearing."""
         from .models import Client, DispatchKind, DispatchOrder
         from .services import dispatch
 
         bare = DispatchOrder.objects.create(
-            kind=DispatchKind.REMEDIATION, vendor=self.vendor,
+            kind=DispatchKind.ASSESSMENT, vendor=self.vendor,
             client=Client.objects.create(
                 client_id=str(uuid.uuid4()), first_name="B", last_name="O",
                 client_added_at=timezone.now(),
@@ -41247,3 +41252,189 @@ class InstallWindowTest(TestCase):
             status=DispatchStatus.PENDING_SCHEDULE,
         )
         self.assertEqual(dispatch_svc.copy_install_windows(a, wo), [])
+
+
+class WorkOrderCompletionTest(TestCase):
+    """Working a work order: start, a photo per product, both signatures, complete.
+
+    The gate is ``missing_for_completion``, and it is deliberately DIFFERENT from the
+    assessment's: an assessment evidences PROBLEMS (a photo per identified category),
+    a work order evidences INSTALLATIONS (a photo per product).
+    """
+
+    def _work_order(self, products=("Air Conditioner", "De-humidifier")):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DispatchItem, DispatchKind,
+            DispatchOrder, DispatchStatus, Vendor,
+        )
+
+        vendor = Vendor.objects.create(name="Fitters Ltd", is_active=True)
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Work", last_name="Order",
+            client_added_at=timezone.now(),
+        )
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=client, vendor=vendor,
+            status=DispatchStatus.SUBMITTED,
+        )
+        wo = DispatchOrder.objects.create(
+            kind=DispatchKind.REMEDIATION, client=client, vendor=vendor,
+            parent=assessment, status=DispatchStatus.CONFIRMED,
+        )
+        for product in products:
+            case = Case.objects.create(
+                case_id=uuid.uuid4(), client=client,
+                case_type=CaseType.INTERNAL_SERVICE, case_status=CaseStatus.OPEN,
+                service_type="Home Expense Assistance/Repairs",
+                program_name=f"Home Remediation - {product} - Queens",
+                case_created_at=timezone.now(), date_opened=timezone.now(),
+            )
+            DispatchItem.objects.create(
+                assessment=assessment, case=case, item=product, location="Queens",
+                program_name=f"Home Remediation - {product} - Queens",
+                dispatch_order=wo,
+            )
+        return wo
+
+    def _photograph(self, wo, item, *, digest=None):
+        from django.utils import timezone
+
+        from .models import DispatchProof
+
+        return DispatchProof.objects.create(
+            dispatch_order=wo, dispatch_item=item,
+            s3_key=f"k/{uuid.uuid4()}",
+            content_hash=digest or uuid.uuid4().hex,
+            captured_at=timezone.now(),
+        )
+
+    def _sign(self, wo, role):
+        from django.utils import timezone
+
+        from .models import DispatchSignature
+        from .services import dispatch as dispatch_svc
+
+        submission = dispatch_svc.active_submission(wo)
+        return DispatchSignature.objects.create(
+            dispatch_submission=submission, signer_role=role,
+            signer_name="Someone", s3_key=f"s/{uuid.uuid4()}",
+            content_hash=uuid.uuid4().hex, signed_at=timezone.now(),
+        )
+
+    # ── starting ───────────────────────────────────────────────────────────
+    def test_starting_moves_it_to_pending_submission(self):
+        from .models import DispatchStatus
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order()
+        dispatch_svc.start_work_order(wo)
+        wo.refresh_from_db()
+        self.assertEqual(wo.status, DispatchStatus.PENDING_SUBMISSION)
+
+    def test_starting_TWICE_reuses_the_same_submission(self):
+        """An offline app retrying, or a vendor tapping again, is not a second job."""
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order()
+        first = dispatch_svc.start_work_order(wo)
+        second = dispatch_svc.start_work_order(wo)
+        self.assertEqual(first.pk, second.pk)
+
+    def test_an_UNSCHEDULED_order_cannot_be_started(self):
+        """⚠ Starting without a confirmed appointment leaves a job in progress that
+        nobody agreed a time for, and the member may not be home."""
+        from .models import DispatchStatus
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order()
+        wo.status = DispatchStatus.PENDING_SCHEDULE
+        wo.save(update_fields=["status"])
+        with self.assertRaises(ValueError) as ctx:
+            dispatch_svc.start_work_order(wo)
+        self.assertIn("confirmed", str(ctx.exception))
+
+    # ── the completion gate ────────────────────────────────────────────────
+    def test_the_gate_names_EVERY_missing_product_by_name(self):
+        """Reasons, not a bool: the vendor is on a doorstep and "not ready" is
+        useless."""
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order()
+        missing = dispatch_svc.missing_for_completion(wo)
+        self.assertIn("a photo of the installed Air Conditioner", missing)
+        self.assertIn("a photo of the installed De-humidifier", missing)
+        self.assertIn("member signature", missing)
+        self.assertIn("vendor signature", missing)
+
+    def test_ONE_PRODUCT_PHOTOGRAPHED_TWICE_does_not_cover_the_other(self):
+        """⚠ THE POINT OF THE PER-ITEM FK. Counting photos, or a free-text group,
+        would let two shots of the air conditioner satisfy the dehumidifier -- and the
+        certificate of completion is evidence."""
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order()
+        first = wo.line_items.first()
+        self._photograph(wo, first)
+        self._photograph(wo, first)
+        missing = dispatch_svc.missing_for_completion(wo)
+        self.assertNotIn("a photo of the installed Air Conditioner", missing)
+        self.assertIn("a photo of the installed De-humidifier", missing)
+
+    def test_a_photo_with_NO_item_satisfies_nothing(self):
+        from django.utils import timezone
+
+        from .models import DispatchProof
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order()
+        DispatchProof.objects.create(
+            dispatch_order=wo, s3_key="k/x", content_hash=uuid.uuid4().hex,
+            captured_at=timezone.now(),
+        )
+        missing = dispatch_svc.missing_for_completion(wo)
+        self.assertIn("a photo of the installed Air Conditioner", missing)
+
+    def test_an_order_with_NO_products_cannot_be_completed(self):
+        """A completion here would produce an invoice for nothing."""
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order(products=())
+        self.assertEqual(
+            dispatch_svc.missing_for_completion(wo), ["no products on this work order"],
+        )
+
+    def test_completing_without_the_gate_satisfied_RAISES(self):
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order()
+        dispatch_svc.start_work_order(wo)
+        with self.assertRaises(ValueError):
+            dispatch_svc.complete_work_order(wo)
+
+    def test_the_full_happy_path(self):
+        from .models import DispatchSignerRole, DispatchStatus
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order()
+        dispatch_svc.start_work_order(wo)
+        for item in wo.line_items.all():
+            self._photograph(wo, item)
+        self._sign(wo, DispatchSignerRole.MEMBER)
+        self._sign(wo, DispatchSignerRole.VENDOR)
+        self.assertEqual(dispatch_svc.missing_for_completion(wo), [])
+        dispatch_svc.complete_work_order(wo)
+        wo.refresh_from_db()
+        self.assertEqual(wo.status, DispatchStatus.SUBMITTED)
+
+    def test_missing_for_submission_DELEGATES_for_a_work_order(self):
+        """⚠ Every caller reads missing_for_submission. Left generic it accepted a
+        work order with one photo and no per-product coverage."""
+        from .services import dispatch as dispatch_svc
+
+        wo = self._work_order()
+        self.assertEqual(
+            dispatch_svc.missing_for_submission(wo),
+            dispatch_svc.missing_for_completion(wo),
+        )

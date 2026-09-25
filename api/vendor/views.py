@@ -29,6 +29,13 @@ from .auth import (
     client_ip, issue_token,
 )
 
+# ⚠ MODULE LEVEL, deliberately. This was imported inside a dozen methods, and a
+# helper that needed it (_order_block) had no import of its own -- so adding one
+# call there raised NameError at request time with every test passing, because
+# the tests that exercise that path do not assert on a 500. There is no cycle:
+# services.dispatch does not import the vendor views.
+from ..services import dispatch as dispatch_svc
+
 logger = logging.getLogger(__name__)
 
 
@@ -201,7 +208,8 @@ def _order_block(order):
         # appointment; it is not itself an appointment.
         "availability": [
             {"date": w.date, "start_time": w.start_time, "end_time": w.end_time}
-            for w in order.availability_windows.all()
+            # Scheduling windows only -- see dispatch.scheduling_windows.
+            for w in dispatch_svc.scheduling_windows(order)
         ],
         "visits": [
             {
@@ -278,7 +286,6 @@ class VendorWorkListView(VendorAPIView):
         # In Python, not SQL: the answer depends on the ServiceZipCode whitelist and,
         # for a work order, on its PARENT's address. An open list is a handful of
         # rows, which is cheaper than making the rule expressible twice.
-        from ..services import dispatch as dispatch_svc
 
         return Response([
             _order_block(o) for o in qs if dispatch_svc.is_dispatchable(o)
@@ -307,7 +314,6 @@ class VendorWorkDetailView(VendorAPIView):
         # it: it was never sent. 404 rather than an explanation, because the vendor
         # is not the person who can fix a service-area problem and the dwelling's
         # ZIP is not theirs to know. Logged so WE can see what was withheld.
-        from ..services import dispatch as dispatch_svc
 
         if not dispatch_svc.is_dispatchable(order):
             logger.info(
@@ -713,7 +719,10 @@ class VendorScheduleView(VendorAPIView):
         if order is None:
             return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
 
-        windows = list(order.availability_windows.all())
+        # ⚠ PURPOSE-FILTERED. An assessment carries the MEMBER's availability AND,
+        # once submitted, the vendor's tentative INSTALL windows -- reading them all
+        # would present the install offers as member availability.
+        windows = dispatch_svc.scheduling_windows(order)
         # The vendor's existing appointments on each offered day, so the app can
         # warn before they pick rather than after they submit.
         dates = sorted({w.date for w in windows})
@@ -866,7 +875,6 @@ class VendorRevealPhoneView(VendorAPIView):
 
     def post(self, request, order_id):
         from ..models import StageEventSource
-        from ..services import dispatch as dispatch_svc
 
         order = (
             DispatchOrder.objects
@@ -1042,6 +1050,19 @@ class VendorPhotoView(VendorAPIView):
         # the dwelling has no category -- but a WRONG one is refused rather than
         # stored, because a typo would leave the gate permanently unsatisfiable and
         # the vendor unable to submit with no way to see why.
+        # WHICH INSTALLED PRODUCT, on a work order. Validated against THIS order's
+        # line items -- an id from another order would satisfy no gate here and would
+        # quietly attach evidence to the wrong job.
+        from ..models import DispatchItem
+        item = None
+        item_id = str(request.data.get("dispatch_item") or "").strip()
+        if item_id:
+            item = DispatchItem.objects.filter(
+                dispatch_item_id=item_id, dispatch_order=order,
+            ).first()
+            if item is None:
+                return error("bad_item", "That product is not on this work order.")
+
         from ..services.assessment_forms import FORMS
 
         group = (request.data.get("intervention_group") or "").strip()
@@ -1082,11 +1103,29 @@ class VendorPhotoView(VendorAPIView):
                 dispatch_order=order, content_hash=digest,
             ).first()
             if existing is not None:
-                if existing.intervention_group == group:
+                if (existing.intervention_group == group
+                        and existing.dispatch_item_id == (
+                            item.dispatch_item_id if item else None
+                        )):
                     # The same upload retried -- idempotent, as an offline client
                     # needs.
                     created.append(existing)
                     continue
+                # ⚠ THE SAME IMAGE FOR A DIFFERENT PRODUCT. Without the item in the
+                # comparison above this read as an idempotent retry, so the second
+                # product silently kept no photo -- and since completion requires one
+                # per product, the gate became unsatisfiable with nothing on screen
+                # explaining why. One photo, one product, for the same reason one
+                # photo evidences one problem: a single image that cleared every
+                # product would make the requirement theatre.
+                if item is not None or existing.dispatch_item_id is not None:
+                    return error(
+                        "photo_reused",
+                        f"That photo is already attached to "
+                        f"{existing.dispatch_item.item if existing.dispatch_item_id else 'another item'}"
+                        f". Take a separate photo of "
+                        f"{item.item if item else 'this one'}.",
+                    )
                 # The same image offered for a DIFFERENT problem. Said plainly,
                 # because the alternative is a database error the vendor cannot act
                 # on.
@@ -1111,6 +1150,9 @@ class VendorPhotoView(VendorAPIView):
             )
             created.append(DispatchProof.objects.create(
                 dispatch_order=order,
+                # Null on an assessment photo: that evidences a PROBLEM, this
+                # evidences a completed INSTALLATION.
+                dispatch_item=item,
                 s3_key=key,
                 content_hash=digest,
                 intervention_group=group,
@@ -1118,7 +1160,6 @@ class VendorPhotoView(VendorAPIView):
                 captured_at=timezone.now(),
             ))
 
-        from ..services import dispatch as dispatch_svc
 
         return Response({
             "photos": [
@@ -1141,7 +1182,6 @@ class VendorPhotoView(VendorAPIView):
         not ask again for a photo the server already holds.
         """
         from ..models import DispatchOrder
-        from ..services import dispatch as dispatch_svc
 
         order = DispatchOrder.objects.filter(
             pk=order_id, vendor=request.user.vendor,
@@ -1176,7 +1216,6 @@ class VendorSignatureView(VendorAPIView):
         from ..models import (
             DispatchOrder, DispatchSignature, DispatchSignerRole,
         )
-        from ..services import dispatch as dispatch_svc
         from ..services import import_storage
 
         order = DispatchOrder.objects.filter(
@@ -1242,7 +1281,6 @@ class VendorSubmitAssessmentView(VendorAPIView):
 
     def get(self, request, order_id):
         from ..models import DispatchOrder
-        from ..services import dispatch as dispatch_svc
 
         order = DispatchOrder.objects.filter(
             pk=order_id, vendor=request.user.vendor,
@@ -1270,7 +1308,6 @@ class VendorSubmitAssessmentView(VendorAPIView):
         from ..models import (
             DispatchOrder, DispatchQuestionnaire, DispatchQuestionnaireState,
         )
-        from ..services import dispatch as dispatch_svc
         from ..services.assessment_forms import build_schema
 
         order = DispatchOrder.objects.filter(
@@ -1524,3 +1561,122 @@ class VendorLogoView(VendorAdminAPIView):
             "updated_at",
         ])
         return Response(_company_payload(vendor))
+
+
+class VendorWorkOrderStartView(VendorAPIView):
+    """POST /v1/work/<order_id>/start/ -- the vendor is on site, starting the job.
+
+    Moves a CONFIRMED work order to Pending Submission and opens the submission that
+    will carry the signatures.
+
+    Idempotent: an offline app retrying, or a vendor who backgrounds it and taps
+    again, must not open a second submission -- there is no second job.
+    """
+
+    def post(self, request, order_id):
+        from ..models import DispatchKind, DispatchOrder
+
+        order = DispatchOrder.objects.filter(
+            pk=order_id, vendor=request.user.vendor,
+        ).select_related("client", "vendor").first()
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+        if order.kind != DispatchKind.REMEDIATION:
+            return error("wrong_kind", "Only a work order can be started.")
+        try:
+            dispatch_svc.start_work_order(
+                order, vendor_user=request.user.vendor_user,
+            )
+        except ValueError as exc:
+            return error("cannot_start", str(exc))
+        order.refresh_from_db()
+        return Response({
+            "status": order.status,
+            "status_label": order.get_status_display(),
+            "missing": dispatch_svc.missing_for_completion(order),
+        })
+
+
+class VendorWorkOrderCompleteView(VendorAPIView):
+    """GET / POST /v1/work/<order_id>/complete/ -- finish the job.
+
+    GET reports what is still missing so the app can disable the button and SAY WHY,
+    rather than leaving a vendor guessing on someone's doorstep. POST checks the same
+    gate server-side and renders the two documents.
+    """
+
+    def _order(self, request, order_id):
+        from ..models import DispatchOrder
+
+        return (
+            DispatchOrder.objects
+            .filter(pk=order_id, vendor=request.user.vendor)
+            .select_related("client", "vendor")
+            .prefetch_related("line_items", "proofs")
+            .first()
+        )
+
+    def get(self, request, order_id):
+
+        order = self._order(request, order_id)
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+        photographed = set(
+            order.proofs.exclude(dispatch_item=None)
+            .values_list("dispatch_item_id", flat=True)
+        )
+        return Response({
+            "status": order.status,
+            "missing": dispatch_svc.missing_for_completion(order),
+            # Per product, so the app can tick them off rather than print a list of
+            # sentences -- the vendor is working through physical devices.
+            "items": [
+                {
+                    "id": str(i.dispatch_item_id),
+                    "item": i.item,
+                    "location": i.location,
+                    "photographed": i.dispatch_item_id in photographed,
+                }
+                for i in order.line_items.all()
+            ],
+        })
+
+    def post(self, request, order_id):
+
+        order = self._order(request, order_id)
+        if order is None:
+            return error("not_found", "No such assignment.", http.HTTP_404_NOT_FOUND)
+        from ..models import DispatchKind
+
+        if order.kind != DispatchKind.REMEDIATION:
+            return error("wrong_kind", "Only a work order can be completed.")
+        try:
+            dispatch_svc.complete_work_order(
+                order, vendor_user=request.user.vendor_user,
+            )
+        except ValueError as exc:
+            return error("incomplete", str(exc))
+
+        # The documents, AFTER the completion succeeds and wrapped so a rendering
+        # fault cannot undo it. The completed job is the record; the PDFs are derived
+        # from it, and losing a finished installation because a photograph would not
+        # decode would be the wrong way round -- the same order the assessment
+        # submission uses.
+        documents = []
+        try:
+            from ..services import dispatch_pdf
+
+            documents = dispatch_pdf.generate_work_order_documents(
+                order, vendor_user=request.user.vendor_user,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("work order documents failed for order %s", order.pk)
+
+        order.refresh_from_db()
+        return Response({
+            "status": order.status,
+            "status_label": order.get_status_display(),
+            "documents": [
+                {"doc_type": d.doc_type, "filename": d.filename} for d in documents
+            ],
+        }, status=http.HTTP_201_CREATED)
