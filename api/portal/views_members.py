@@ -9530,3 +9530,200 @@ class MemberDiagnosticView(PortalAPIView):
     def get(self, request, client_id):
         client = get_object_or_404(Client, pk=client_id)
         return Response(diagnose_client(client))
+
+
+# ── member mobile-app provisioning ───────────────────────────────────────────
+
+MOBILE_APP_GROUPS = frozenset({"Management", "Verifiers"})
+
+
+def _can_provision_app(agent):
+    """Management and Verifiers, by policy.
+
+    ⚠ NOT every portal agent. Issuing these credentials hands someone a login to a
+    member's benefits, and the password is read out loud to them -- so it is the two
+    groups that already handle member identity, not whoever happens to be on the file.
+    """
+    if agent is None:
+        return False
+    return (agent.group or "") in MOBILE_APP_GROUPS or getattr(
+        agent, "is_manager", False,
+    )
+
+
+def _mobile_app_payload(member):
+    from api.models import MemberAccessToken
+
+    return {
+        "enabled": member.mobile_app_enabled if member else False,
+        "username": (member.mobile_app_username or "") if member else "",
+        "must_change_password": (
+            member.mobile_app_must_change_password if member else False
+        ),
+        "provisioned_at": member.mobile_app_provisioned_at if member else None,
+        "provisioned_by": (
+            member.mobile_app_provisioned_by.name
+            if member and member.mobile_app_provisioned_by_id else ""
+        ),
+        "last_login_at": member.mobile_app_last_login_at if member else None,
+        "active_sessions": (
+            MemberAccessToken.objects.filter(
+                household_member=member, revoked_at__isnull=True,
+                expires_at__gt=timezone.now(),
+            ).count() if member else 0
+        ),
+    }
+
+
+class MemberMobileAppView(PortalAPIView):
+    """GET / POST / DELETE /members/<client_id>/mobile-app/ -- the Mobile App tab.
+
+    GET reports whether the member can sign in and when they last did. POST provisions
+    or re-issues; DELETE revokes access entirely.
+
+    ⚠ THE PRIMARY HOUSEHOLD MEMBER ONLY, by policy: one app account per household. A
+    dependent's deliveries are the household's, so a second account would show the same
+    data twice while doubling the number of credentials that can go astray. Enforced
+    here rather than by a model constraint, because ``is_primary`` legitimately moves
+    between rows when a household is restructured.
+    """
+
+    def _member(self, client):
+        from api.models import HouseholdMember
+
+        return (
+            HouseholdMember.objects
+            .filter(client=client, is_primary=True)
+            .select_related("household", "mobile_app_provisioned_by")
+            .first()
+        )
+
+    def get(self, request, client_id):
+        client = get_object_or_404(Client, pk=client_id)
+        member = self._member(client)
+        payload = _mobile_app_payload(member)
+        # Said plainly rather than left as an empty state: "no primary household
+        # member" is a data problem an agent can act on, and it is the ONLY reason a
+        # member cannot be given app access.
+        payload["can_provision"] = member is not None
+        payload["blocked_reason"] = (
+            "" if member is not None
+            else "This client is not the primary member of a household."
+        )
+        payload["may_manage"] = _can_provision_app(current_agent(request))
+        return Response(payload)
+
+    @transaction.atomic
+    def post(self, request, client_id):
+        from django.contrib.auth.hashers import make_password
+        from django.utils.crypto import get_random_string
+
+        from api.models import HouseholdMember
+        from api.member_app.auth import normalize_username
+
+        agent = current_agent(request)
+        if not _can_provision_app(agent):
+            return Response(
+                {"detail": "Management or Verifier access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        member = self._member(client)
+        if member is None:
+            return Response(
+                {"detail": "This client is not the primary member of a household."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+
+        data = request.data or {}
+        # The USERNAME IS THE MOBILE NUMBER, stored as digits. Members do not type a
+        # phone number the same way twice, and being locked out over a bracket is the
+        # most likely support call on this surface.
+        raw_username = data.get("username") or member.mobile_app_username or ""
+        username = normalize_username(raw_username)
+        if len(username) < 10:
+            return Response(
+                {"detail": "Enter the member's 10-digit mobile number."},
+                status=http.HTTP_400_BAD_REQUEST,
+            )
+        clash = (
+            HouseholdMember.objects
+            .filter(mobile_app_username=username)
+            .exclude(pk=member.pk)
+            .first()
+        )
+        if clash is not None:
+            # Named as a clash rather than a validation error: the same number on two
+            # members is a real situation (a shared family phone) and needs a human.
+            return Response(
+                {"detail": "That mobile number is already the username for another "
+                           "member. Use a different number."},
+                status=http.HTTP_409_CONFLICT,
+            )
+
+        password = get_random_string(12)
+        member.mobile_app_username = username
+        member.mobile_app_password = make_password(password)
+        # Somebody else chose this password and it will be read out loud, so it is
+        # replaced at first sign-in -- enforced on every member endpoint.
+        member.mobile_app_must_change_password = True
+        member.mobile_app_provisioned_at = timezone.now()
+        member.mobile_app_provisioned_by = agent
+        member.save(update_fields=[
+            "mobile_app_username", "mobile_app_password",
+            "mobile_app_must_change_password", "mobile_app_provisioned_at",
+            "mobile_app_provisioned_by",
+        ])
+        # ⚠ RE-ISSUING REVOKES EVERY EXISTING SESSION. An agent re-issuing a password
+        # is usually doing it because the member lost the phone.
+        from api.models import MemberAccessToken
+
+        MemberAccessToken.objects.filter(
+            household_member=member, revoked_at__isnull=True,
+        ).update(revoked_at=timezone.now())
+
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=agent.name or "",
+            body=(f"Mobile app access provisioned by {agent.name} "
+                  f"(username {username})."),
+        )
+        payload = _mobile_app_payload(member)
+        # ⚠ SHOWN ONCE AND NEVER AGAIN. It is not stored in a readable form, so an
+        # agent who navigates away has to re-issue -- which is the correct trade, and
+        # the UI says so.
+        payload["temporary_password"] = password
+        payload["can_provision"] = True
+        payload["may_manage"] = True
+        return Response(payload, status=http.HTTP_201_CREATED)
+
+    @transaction.atomic
+    def delete(self, request, client_id):
+        from api.models import HouseholdMember, MemberAccessToken
+
+        agent = current_agent(request)
+        if not _can_provision_app(agent):
+            return Response(
+                {"detail": "Management or Verifier access required."},
+                status=http.HTTP_403_FORBIDDEN,
+            )
+        client = get_object_or_404(Client, pk=client_id)
+        member = self._member(client)
+        if member is None:
+            return Response(status=http.HTTP_204_NO_CONTENT)
+        # ⚠ THE PASSWORD IS CLEARED, THE USERNAME IS KEPT. mobile_app_username is the
+        # member's own phone number and is used elsewhere; wiping it would lose a fact
+        # about the member to revoke a credential. mobile_app_enabled requires BOTH, so
+        # clearing the password is what ends access.
+        member.mobile_app_password = ""
+        member.mobile_app_must_change_password = False
+        member.save(update_fields=[
+            "mobile_app_password", "mobile_app_must_change_password",
+        ])
+        MemberAccessToken.objects.filter(
+            household_member=member, revoked_at__isnull=True,
+        ).update(revoked_at=timezone.now())
+        Note.objects.create(
+            client=client, source=NoteSource.AGENT, author_name=agent.name or "",
+            body=f"Mobile app access revoked by {agent.name}.",
+        )
+        return Response(_mobile_app_payload(member))

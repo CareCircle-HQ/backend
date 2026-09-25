@@ -46,6 +46,7 @@ from .views_leads import (
     PortalScreenersView,
 )
 from .views_members import (
+    MemberMobileAppView,
     BulkAssignBoxesView,
     BulkAssignMealsView,
     CasesSummaryView,
@@ -317,6 +318,10 @@ urlpatterns = [
         "members/<uuid:client_id>/dispatch-documents/",
         MemberDispatchDocumentsView.as_view(),
         name="portal-member-dispatch-documents",
+    ),
+    path(
+        "members/<uuid:client_id>/mobile-app/",
+        MemberMobileAppView.as_view(), name="portal-member-mobile-app",
     ),
     path(
         "members/<uuid:client_id>/service-tracker/",

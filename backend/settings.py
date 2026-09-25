@@ -133,6 +133,9 @@ MIDDLEWARE = [
     # swap request.urlconf. See api/vendor/__init__.py for the three isolation
     # layers this is the second of.
     'api.middleware.VendorHostMiddleware',
+    # Serves ONLY the member mobile-app API on MEMBER_API_HOST, so no CRM route
+    # exists on the hostname a member's phone talks to. See MemberAppHostMiddleware.
+    'api.middleware.MemberAppHostMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -184,6 +187,9 @@ PARTNER_API_HOST = os.getenv('PARTNER_API_HOST', '').strip()
 # delivery company's machine credential and a vendor employee's session token
 # must never be presentable to the same surface. Unset -> the middleware is inert.
 VENDOR_API_HOST = os.getenv('VENDOR_API_HOST', '').strip()
+# Hostname that serves ONLY the member mobile-app API. Unset means the middleware is
+# inert and the member surface is unreachable -- which is the safe default.
+MEMBER_API_HOST = os.getenv('MEMBER_API_HOST', '').strip()
 
 # Partner access-token lifetime, and how long a rotated-away client secret keeps
 # working so a vendor can redeploy without an outage.

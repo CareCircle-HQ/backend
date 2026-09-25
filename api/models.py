@@ -911,7 +911,41 @@ class HouseholdMember(models.Model):
     mobile_app_username = models.CharField(
         max_length=32, null=True, blank=True, unique=True, db_index=True
     )
+    # ── mobile-app credentials ───────────────────────────────────────────────
+    # Django's hasher; never a plaintext or reversible value. Blank until an
+    # agent provisions app access from the member profile's Mobile App tab.
+    #
+    # ⚠ THE CREDENTIALS LIVE HERE because the USERNAME already does. A separate
+    # MemberAppUser model would put the two halves of one identity in two tables
+    # and make "is this person enrolled in the app?" a join.
+    #
+    # ⚠ PRIMARY MEMBERS ONLY, by policy -- one account per household, held by the
+    # primary client. Enforced where credentials are issued rather than by a
+    # constraint here, because is_primary can legitimately move between rows when
+    # a household is restructured and a constraint would block that.
+    mobile_app_password = models.CharField(max_length=255, blank=True)
+    # The password was issued BY AN AGENT and read out to the member, so until
+    # they replace it their credential is known to at least two people. Set on
+    # provisioning and on every reset. Enforced server-side, not in the app.
+    mobile_app_must_change_password = models.BooleanField(default=False)
+    mobile_app_provisioned_at = models.DateTimeField(null=True, blank=True)
+    mobile_app_provisioned_by = models.ForeignKey(
+        "Agent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="provisioned_member_app_users",
+    )
+    mobile_app_last_login_at = models.DateTimeField(null=True, blank=True)
     added_at = models.DateTimeField(auto_now_add=True)
+
+    @property
+    def mobile_app_enabled(self):
+        """True when this member can sign in to the app.
+
+        BOTH halves are required. A username with no password is a member somebody
+        started to enrol and did not finish, and it must not read as enabled -- 7,235
+        household members already carry a ``mobile_app_username`` from an earlier
+        import and none of them has a password.
+        """
+        return bool(self.mobile_app_username and self.mobile_app_password)
 
     class Meta:
         ordering = ["-is_primary", "added_at"]
@@ -5779,6 +5813,50 @@ class VendorAccessToken(models.Model):
 
     def __str__(self):
         return f"VendorAccessToken({self.vendor_user_id})"
+
+    @property
+    def is_valid(self):
+        return self.revoked_at is None and self.expires_at > timezone.now()
+
+
+class MemberAccessToken(models.Model):
+    """A short-lived OPAQUE bearer token for a logged-in mobile-app member.
+
+    Mirrors :class:`VendorAccessToken` and :class:`PartnerAccessToken`, for the same
+    reason restated once more because it is the most important decision on any of these
+    surfaces: the project's ``DEFAULT_AUTHENTICATION_CLASSES`` include JWT
+    authenticators, so a member JWT signed with the shared key would authenticate
+    against the WHOLE CRM. An opaque random token is meaningless to those
+    authenticators, and revoking it is one row update.
+
+    ⚠ NOT a SimpleJWT, deliberately. A member token in the ``auth/token/`` family
+    would rely on claim inspection to stay separate from an agent's, and "we check a
+    claim" is a weaker guarantee than "the authenticator cannot parse it".
+
+    The principal is a :class:`HouseholdMember` -- a PERSON in a household, not the
+    household and not the ``Client``. Queries scope to whichever of those the data
+    belongs to, which is a per-endpoint decision, not a property of the token.
+    """
+
+    household_member = models.ForeignKey(
+        HouseholdMember, on_delete=models.CASCADE, related_name="app_tokens"
+    )
+    # sha256 of the token; the raw value is returned once and never stored.
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    expires_at = models.DateTimeField(db_index=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    created_ip = models.CharField(max_length=64, blank=True)
+    # Free text from the login request, so "sign out my other devices" can name them.
+    device_label = models.CharField(max_length=120, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["household_member", "expires_at"])]
+
+    def __str__(self):
+        return f"MemberAccessToken({self.household_member_id})"
 
     @property
     def is_valid(self):

@@ -42,6 +42,41 @@ class VendorHostMiddleware:
         return self.get_response(request)
 
 
+class MemberAppHostMiddleware:
+    """Serve ONLY the member mobile-app API on ``settings.MEMBER_API_HOST``.
+
+    The third instance of this device, and for the same reason as the other two:
+    swapping ``request.urlconf`` means the CRM's routes do not EXIST on that
+    hostname, so ``/api/clients/`` is a 404 rather than a 403. That is what lets a
+    member's phone hold a token without any part of the CRM being reachable from it.
+
+    ⚠ A SEPARATE HOST FROM THE VENDOR AND PARTNER APIS, deliberately. A member's
+    session token, a vendor employee's session token and a delivery company's machine
+    credential should never be presentable to the same surface -- and a member's phone
+    is the least trusted device of the three.
+
+    Must run BEFORE URL resolution, hence its position near the top of MIDDLEWARE.
+    Inert when ``MEMBER_API_HOST`` is unset.
+    """
+
+    URLCONF = "api.member_app.urls"
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        # Read the setting per request so tests can override_settings it.
+        expected = (getattr(settings, "MEMBER_API_HOST", "") or "").strip().lower()
+        if expected:
+            # Host header only, never a forwarded one: a client must not be able to
+            # select -- or escape -- this surface by spoofing a proxy header.
+            host = (request.get_host() or "").split(":")[0].lower()
+            if host == expected:
+                request.urlconf = self.URLCONF
+                request.is_member_api = True
+        return self.get_response(request)
+
+
 class PartnerHostMiddleware:
     """Serve ONLY the delivery-partner API on ``settings.PARTNER_API_HOST``.
 

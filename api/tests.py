@@ -41803,3 +41803,308 @@ class VendorForcedPasswordChangeTest(TestCase):
         self.assertFalse(r.data["emailed"])
         self.assertTrue(r.data["temporary_password"])
         self.assertTrue(VendorUser.objects.filter(email="fourth@example.com").exists())
+
+
+MEMBER_HOST = "member.localhost"
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberAppAuthTest(TestCase):
+    """The member mobile-app surface: host isolation, password login, forced change.
+
+    A third principal alongside the agent and the vendor, on its own hostname, and a
+    member's phone is the least trusted device of the three.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Tanisha", last_name="Myers",
+            client_added_at=timezone.now(),
+        )
+        self.household = Household.objects.create(name="Myers HH")
+        self.member = HouseholdMember.objects.create(
+            household=self.household, client=self.client_rec, is_primary=True,
+            mobile_app_username="3055550142",
+            mobile_app_password=make_password("issued-by-agent"),
+            mobile_app_must_change_password=True,
+        )
+        self.api = APIClient()
+
+    def _login(self, username="3055550142", password="issued-by-agent"):
+        return self.api.post(
+            "/v1/auth/login/", {"username": username, "password": password},
+            format="json", HTTP_HOST=MEMBER_HOST,
+        )
+
+    # ── host isolation ─────────────────────────────────────────────────────
+    def test_the_CRM_does_not_EXIST_on_the_member_host(self):
+        """⚠ 404, not 403. The URLConf is swapped, so a member's phone cannot reach a
+        CRM route even to be refused by it -- the same device as the vendor and
+        partner surfaces."""
+        for path in ("/api/clients/", "/api/portal/dashboard/"):
+            with self.subTest(path=path):
+                r = self.api.get(path, HTTP_HOST=MEMBER_HOST)
+                self.assertEqual(r.status_code, 404, path)
+
+    def test_the_member_api_does_not_exist_on_the_CRM_host(self):
+        """The isolation runs both ways."""
+        r = self.api.post("/v1/auth/login/", {}, format="json", HTTP_HOST="testserver")
+        self.assertEqual(r.status_code, 404)
+
+    # ── login ──────────────────────────────────────────────────────────────
+    def test_login_returns_an_OPAQUE_token_not_a_jwt(self):
+        """⚠ The whole reason for this model. DEFAULT_AUTHENTICATION_CLASSES include
+        JWT authenticators, so a member JWT signed with the shared key would
+        authenticate against the entire CRM."""
+        r = self._login()
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertTrue(r.data["access_token"].startswith("ccmt_"))
+        self.assertNotIn(".", r.data["access_token"].split("ccmt_")[1][:40])
+
+    def test_the_number_can_be_typed_ANY_way(self):
+        """⚠ Members do not type a phone number the same way twice, and being locked
+        out of their benefits over a bracket is the likeliest support call here."""
+        for typed in ("3055550142", "305-555-0142", "(305) 555-0142", "305 555 0142"):
+            with self.subTest(typed=typed):
+                self.assertEqual(self._login(username=typed).status_code, 200)
+
+    def test_a_wrong_password_and_an_unknown_number_answer_IDENTICALLY(self):
+        """Anti-enumeration: a different answer would let anyone test which phone
+        numbers belong to Medicaid members."""
+        wrong = self._login(password="nope")
+        unknown = self._login(username="9995550000", password="nope")
+        self.assertEqual(wrong.status_code, unknown.status_code, 401)
+        self.assertEqual(wrong.data["error"], unknown.data["error"])
+        self.assertEqual(wrong.data["detail"], unknown.data["detail"])
+
+    def test_a_member_with_a_username_but_NO_password_cannot_sign_in(self):
+        """⚠ 7,235 household members already carry a mobile_app_username from an
+        earlier import and none has a password. They must not be accounts."""
+        from .models import HouseholdMember
+
+        HouseholdMember.objects.filter(pk=self.member.pk).update(
+            mobile_app_password="",
+        )
+        self.assertEqual(self._login().status_code, 401)
+        self.member.refresh_from_db()
+        self.assertFalse(self.member.mobile_app_enabled)
+
+    # ── the forced change ──────────────────────────────────────────────────
+    def _auth(self):
+        token = self._login().data["access_token"]
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+        return api, token
+
+    def test_ME_is_reachable_before_the_change(self):
+        api, _t = self._auth()
+        r = api.get("/v1/me/", HTTP_HOST=MEMBER_HOST)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.data["member"]["must_change_password"])
+
+    def test_changing_the_password_clears_the_flag(self):
+        api, _t = self._auth()
+        r = api.post("/v1/me/password/", {
+            "current_password": "issued-by-agent", "new_password": "chosen-by-me",
+        }, format="json", HTTP_HOST=MEMBER_HOST)
+        self.assertEqual(r.status_code, 200, r.data)
+        self.member.refresh_from_db()
+        self.assertFalse(self.member.mobile_app_must_change_password)
+
+    def test_the_change_REVOKES_every_other_session(self):
+        """⚠ A member changing a password somebody else has seen expects that to end
+        the other person's access -- and the forced first change IS that situation."""
+        from .models import MemberAccessToken
+
+        _first, first_token = self._auth()
+        api, _second = self._auth()
+        self.assertEqual(
+            MemberAccessToken.objects.filter(revoked_at__isnull=True).count(), 2,
+        )
+        api.post("/v1/me/password/", {
+            "current_password": "issued-by-agent", "new_password": "chosen-by-me",
+        }, format="json", HTTP_HOST=MEMBER_HOST)
+        live = MemberAccessToken.objects.filter(revoked_at__isnull=True)
+        self.assertEqual(live.count(), 1)
+        # The one that did the changing survives; the other does not.
+        old = APIClient()
+        old.credentials(HTTP_AUTHORIZATION=f"Bearer {first_token}")
+        self.assertEqual(
+            old.get("/v1/me/", HTTP_HOST=MEMBER_HOST).status_code, 403,
+        )
+
+    def test_the_CURRENT_password_is_required(self):
+        api, _t = self._auth()
+        r = api.post("/v1/me/password/", {
+            "current_password": "wrong", "new_password": "chosen-by-me",
+        }, format="json", HTTP_HOST=MEMBER_HOST)
+        self.assertEqual(r.status_code, 401)
+
+    def test_reusing_the_issued_password_is_refused(self):
+        api, _t = self._auth()
+        r = api.post("/v1/me/password/", {
+            "current_password": "issued-by-agent", "new_password": "issued-by-agent",
+        }, format="json", HTTP_HOST=MEMBER_HOST)
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.data["error"], "password_unchanged")
+
+    def test_logout_revokes_the_token(self):
+        api, _t = self._auth()
+        self.assertEqual(
+            api.post("/v1/auth/logout/", {}, format="json",
+                     HTTP_HOST=MEMBER_HOST).status_code, 200,
+        )
+        self.assertEqual(
+            api.get("/v1/me/", HTTP_HOST=MEMBER_HOST).status_code, 403,
+        )
+
+
+class MemberMobileAppProvisioningTest(TestCase):
+    """The CRM's Mobile App tab: who may issue credentials, and to whom."""
+
+    def setUp(self):
+        from .models import Client, Household, HouseholdMember
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Prim", last_name="Ary",
+            client_added_at=timezone.now(),
+        )
+        household = Household.objects.create(name="Ary HH")
+        self.member = HouseholdMember.objects.create(
+            household=household, client=self.client_rec, is_primary=True,
+        )
+
+    def _api(self, group):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        from .models import Agent
+
+        agent = Agent.objects.create(
+            name=f"{group} Agent", agent_code=str(uuid.uuid4())[:8], group=group,
+        )
+        acc = AccessToken()
+        acc["agent_id"] = str(agent.id)
+        acc["agent_code"] = agent.agent_code
+        acc["agent_name"] = agent.name
+        acc["agent_group"] = agent.group
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {acc}")
+        return api
+
+    def _url(self):
+        return f"/api/portal/members/{self.client_rec.client_id}/mobile-app/"
+
+    def test_MANAGEMENT_and_VERIFIERS_may_provision(self):
+        for group in ("Management", "Verifiers"):
+            with self.subTest(group=group):
+                r = self._api(group).post(
+                    self._url(), {"username": "3055550142"}, format="json",
+                )
+                self.assertEqual(r.status_code, 201, r.data)
+
+    def test_other_groups_may_NOT(self):
+        """⚠ Issuing these credentials hands someone a login to a member's benefits,
+        and the password is read out loud. Not whoever happens to be on the file."""
+        for group in ("Screeners", "CS", "Logistics", "Nutritionist"):
+            with self.subTest(group=group):
+                r = self._api(group).post(
+                    self._url(), {"username": "3055550142"}, format="json",
+                )
+                self.assertEqual(r.status_code, 403, group)
+
+    def test_the_username_is_stored_as_DIGITS(self):
+        r = self._api("Management").post(
+            self._url(), {"username": "(305) 555-0142"}, format="json",
+        )
+        self.assertEqual(r.data["username"], "3055550142")
+
+    def test_the_password_is_returned_ONCE_and_hashed_at_rest(self):
+        r = self._api("Management").post(
+            self._url(), {"username": "3055550142"}, format="json",
+        )
+        issued = r.data["temporary_password"]
+        self.assertTrue(issued)
+        self.member.refresh_from_db()
+        self.assertNotEqual(self.member.mobile_app_password, issued)
+        self.assertTrue(self.member.mobile_app_password.startswith("pbkdf2_"))
+        # A second GET must NOT carry it -- there is no way to read it back.
+        again = self._api("Management").get(self._url())
+        self.assertNotIn("temporary_password", again.data)
+
+    def test_provisioning_arms_the_forced_change(self):
+        self._api("Management").post(
+            self._url(), {"username": "3055550142"}, format="json",
+        )
+        self.member.refresh_from_db()
+        self.assertTrue(self.member.mobile_app_must_change_password)
+
+    def test_RE_ISSUING_revokes_every_live_session(self):
+        """An agent re-issuing is usually doing it because the phone was lost."""
+        from .models import MemberAccessToken
+        from .member_app.auth import issue_token
+
+        self._api("Management").post(
+            self._url(), {"username": "3055550142"}, format="json",
+        )
+        self.member.refresh_from_db()
+        issue_token(self.member)
+        self.assertEqual(
+            MemberAccessToken.objects.filter(revoked_at__isnull=True).count(), 1,
+        )
+        self._api("Management").post(self._url(), {}, format="json")
+        self.assertEqual(
+            MemberAccessToken.objects.filter(revoked_at__isnull=True).count(), 0,
+        )
+
+    def test_a_NON_PRIMARY_client_cannot_be_given_access(self):
+        """⚠ One app account per household, by policy. Said plainly, because "not the
+        primary member" is something an agent can act on."""
+        from .models import Client, Household, HouseholdMember
+
+        dependent = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dep", last_name="Endant",
+            client_added_at=timezone.now(),
+        )
+        HouseholdMember.objects.create(
+            household=Household.objects.create(name="Dep HH"), client=dependent,
+            is_primary=False,
+        )
+        r = self._api("Management").post(
+            f"/api/portal/members/{dependent.client_id}/mobile-app/",
+            {"username": "3055559999"}, format="json",
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("primary", r.data["detail"].lower())
+
+    def test_a_username_already_used_by_ANOTHER_member_is_a_conflict(self):
+        from .models import Client, Household, HouseholdMember
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Oth", last_name="Er",
+            client_added_at=timezone.now(),
+        )
+        HouseholdMember.objects.create(
+            household=Household.objects.create(name="Other HH"), client=other,
+            is_primary=True, mobile_app_username="3055550142",
+        )
+        r = self._api("Management").post(
+            self._url(), {"username": "3055550142"}, format="json",
+        )
+        self.assertEqual(r.status_code, 409)
+
+    def test_REVOKING_clears_the_password_but_KEEPS_the_username(self):
+        """⚠ The username is the member's own phone number and is used elsewhere.
+        Wiping it would lose a fact about the member in order to revoke a credential;
+        mobile_app_enabled requires both, so clearing the password is enough."""
+        self._api("Management").post(
+            self._url(), {"username": "3055550142"}, format="json",
+        )
+        self._api("Management").delete(self._url())
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.mobile_app_password, "")
+        self.assertEqual(self.member.mobile_app_username, "3055550142")
+        self.assertFalse(self.member.mobile_app_enabled)

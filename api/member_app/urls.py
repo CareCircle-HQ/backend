@@ -1,0 +1,20 @@
+"""The member mobile-app URLConf.
+
+⚠ THIS IS THE WHOLE SURFACE. It is swapped in by ``MemberAppHostMiddleware`` on
+``MEMBER_API_HOST``, which means no CRM route, no extension route and no portal route
+EXISTS on that hostname -- ``/api/clients/`` there is a 404, not a 403.
+
+Anything added to this file is reachable from a member's phone. Nothing else is.
+"""
+from django.urls import path
+
+from .views import (
+    MemberLoginView, MemberLogoutView, MemberMeView, MemberPasswordView,
+)
+
+urlpatterns = [
+    path("v1/auth/login/", MemberLoginView.as_view(), name="member-app-login"),
+    path("v1/auth/logout/", MemberLogoutView.as_view(), name="member-app-logout"),
+    path("v1/me/", MemberMeView.as_view(), name="member-app-me"),
+    path("v1/me/password/", MemberPasswordView.as_view(), name="member-app-password"),
+]
