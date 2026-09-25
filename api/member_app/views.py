@@ -432,6 +432,31 @@ BENEFIT_BLURBS = {
 BENEFIT_CASE_TYPES = {"internal_service"}
 
 
+#: How a member should hear a dispatch status. The internal vocabulary is workflow
+#: state -- "Pending Submission" means the vendor has not filed their paperwork, which
+#: is true and is none of the member's business.
+#:
+#: ⚠ AND THIS IS THE STATUS THAT MATTERS FOR HOUSING. The CASE's status describes a
+#: funding authorization; the DISPATCH ORDER describes whether somebody is coming to
+#: the member's home. "Expired" on a Home Assessment card meant the authorization
+#: window had lapsed -- while an assessor was booked for next Monday.
+DISPATCH_MEMBER_STATUS = {
+    "pending_schedule": ("pending", "We are arranging a visit."),
+    "confirmed": ("active", "A visit is booked."),
+    "pending_submission": ("active", "The visit has happened. We are finishing up."),
+    "submitted": ("active", "The visit is complete."),
+    "uploaded": ("active", "The visit is complete."),
+    "cancelled": ("expired", "This visit was cancelled."),
+}
+
+#: Which dispatch kind speaks for which benefit.
+SERVICE_DISPATCH_KIND = {
+    "Environmental Exposure Assessment": "assessment",
+    "Home Expense Assistance/Repairs": "remediation",
+    "Environmental Modifications/Accessibility": "remediation",
+}
+
+
 class MemberBenefitsView(MemberAPIView):
     """GET /v1/me/benefits/ -- what this member is actually receiving.
 
@@ -448,7 +473,7 @@ class MemberBenefitsView(MemberAPIView):
     def get(self, request):
         from django.utils import timezone
 
-        from ..models import Case
+        from ..models import Case, DispatchOrder
 
         client = request.user.client
         if client is None:
@@ -481,6 +506,7 @@ class MemberBenefitsView(MemberAPIView):
         for service_type, g in groups.items():
             status = "expired"
             valid_until = None
+            note = ""
             for case in g["cases"]:
                 auth = (case.service_authorization_status or "").lower()
                 start, end = case.effective_authorization_window()
@@ -500,11 +526,51 @@ class MemberBenefitsView(MemberAPIView):
                 if auth in {"pending", "in_review"} and status != "active":
                     status = "pending"
 
+            # ⚠ A HOUSING BENEFIT'S STATUS IS ITS VISIT, NOT ITS AUTHORIZATION. For
+            # an assessment or a repair the member's question is "is somebody
+            # coming?", and the dispatch order answers it; the case only says whether
+            # a payer has agreed to fund it. James Bethea's Home Assessment card read
+            # "expired" while an assessor was booked for the following Monday.
+            visit_on = None
+            kind = SERVICE_DISPATCH_KIND.get(service_type)
+            if kind:
+                order = (
+                    DispatchOrder.objects
+                    .filter(client=client, kind=kind)
+                    .exclude(status="cancelled")
+                    .order_by("-created_at")
+                    .first()
+                )
+                if order is not None:
+                    mapped = DISPATCH_MEMBER_STATUS.get(order.status)
+                    if mapped:
+                        status, note = mapped
+                    visit = (
+                        order.visits
+                        .filter(scheduled_for__isnull=False)
+                        .order_by("-scheduled_for")
+                        .first()
+                    )
+                    if visit is not None:
+                        visit_on = visit.scheduled_for
+                        # ⚠ A FUTURE VISIT OVERRIDES THE PAPERWORK STATUS. The order
+                        # status is the vendor's workflow, and it can say "submitted"
+                        # while the appointment is still days away -- James Bethea's
+                        # assessment is submitted with a visit on the 28th, read on
+                        # the 25th. Telling a member "the visit is complete" about an
+                        # appointment they have not had yet is worse than saying
+                        # nothing, and they may not open the door for it.
+                        if visit_on > timezone.now():
+                            status, note = "active", "A visit is booked."
+
             out.append({
                 "id": service_type,
                 "name": BENEFIT_LABELS.get(service_type, service_type),
                 "description": BENEFIT_BLURBS.get(service_type, ""),
                 "status": status,
+                # Said in member language when we have a visit to speak about.
+                "note": note,
+                "visit_on": visit_on,
                 "valid_until": valid_until,
                 # Named devices for housing; empty for meals, where the service IS
                 # the thing.

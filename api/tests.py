@@ -42947,3 +42947,141 @@ class MemberDeliveryTodayBoundaryTest(TestCase):
         self._delivery(days=0)
         data = self._get()
         self.assertTrue(data["next"]["is_today"])
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberHousingBenefitStatusTest(TestCase):
+    """A housing benefit's status is its VISIT, not its authorization.
+
+    ⚠ THE BUG THIS FIXES. The Home Assessment card read "expired" — the case's
+    authorization window had lapsed — while an assessor was booked for the following
+    Monday. The case says whether a payer agreed to fund the work; the dispatch order
+    says whether somebody is coming to the member's home, and only the second answers
+    the question a member is asking.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember, Vendor
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Hou", last_name="Sing",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Sing HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3055553333",
+            mobile_app_password=make_password("x" * 10),
+        )
+        self.vendor = Vendor.objects.create(name="Fitters", is_active=True)
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _expired_case(self, service_type="Environmental Exposure Assessment"):
+        from datetime import timedelta
+
+        from .models import Case
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.client_rec,
+            case_type="internal_service", case_status="open",
+            service_type=service_type, service_authorization_status="approved",
+            service_authorization_approval_starts_at=timezone.now() - timedelta(days=60),
+            # LAPSED — this is what made the card say "expired".
+            service_authorization_approval_ends_at=timezone.now() - timedelta(days=5),
+            case_created_at=timezone.now(), date_opened=timezone.now(),
+        )
+
+    def _order(self, *, status, visit_in_days=None, kind="assessment"):
+        from datetime import timedelta
+
+        from .models import DispatchOrder, DispatchVisit
+
+        order = DispatchOrder.objects.create(
+            kind=kind, client=self.client_rec, vendor=self.vendor, status=status,
+        )
+        if visit_in_days is not None:
+            DispatchVisit.objects.create(
+                dispatch_order=order,
+                scheduled_for=timezone.now() + timedelta(days=visit_in_days),
+            )
+        return order
+
+    def _card(self, name="Home Assessment"):
+        cards = self.api.get(
+            "/v1/me/benefits/", HTTP_HOST=MEMBER_HOST,
+        ).data["benefits"]
+        return next((c for c in cards if c["name"] == name), None)
+
+    def test_a_BOOKED_visit_beats_a_lapsed_authorization(self):
+        self._expired_case()
+        self._order(status="confirmed", visit_in_days=3)
+        card = self._card()
+        self.assertEqual(card["status"], "active")
+        self.assertEqual(card["note"], "A visit is booked.")
+        self.assertIsNotNone(card["visit_on"])
+
+    def test_a_FUTURE_visit_overrides_a_submitted_order(self):
+        """⚠ The order status is the VENDOR's workflow and can say "submitted" while
+        the appointment is still days away — James Bethea's assessment is submitted
+        with a visit on the 28th, read on the 25th. Telling a member the visit is
+        complete about an appointment they have not had is worse than saying nothing,
+        and they may not open the door for it."""
+        self._expired_case()
+        self._order(status="submitted", visit_in_days=3)
+        self.assertEqual(self._card()["note"], "A visit is booked.")
+
+    def test_a_PAST_visit_on_a_submitted_order_reads_as_complete(self):
+        self._expired_case()
+        self._order(status="submitted", visit_in_days=-3)
+        card = self._card()
+        self.assertEqual(card["status"], "active")
+        self.assertEqual(card["note"], "The visit is complete.")
+
+    def test_an_unscheduled_order_says_we_are_arranging_it(self):
+        self._expired_case()
+        self._order(status="pending_schedule")
+        card = self._card()
+        self.assertEqual(card["status"], "pending")
+        self.assertEqual(card["note"], "We are arranging a visit.")
+
+    def test_a_CANCELLED_order_is_ignored_in_favour_of_a_live_one(self):
+        """⚠ Uses REMEDIATION, because a UNIQUE CONSTRAINT allows only ONE assessment
+        order per client -- `one_assessment_order_per_client`, conditioned on
+        kind="assessment" and NOT on status. So a cancelled assessment can never be
+        replaced by a new one. That is a real limitation worth knowing about; it is
+        not this endpoint's to fix."""
+        self._expired_case(service_type="Home Expense Assistance/Repairs")
+        self._order(status="cancelled", visit_in_days=-10, kind="remediation")
+        self._order(status="confirmed", visit_in_days=4, kind="remediation")
+        card = self._card("Home Repairs & Equipment")
+        self.assertEqual(card["note"], "A visit is booked.")
+
+    def test_with_NO_dispatch_order_it_falls_back_to_the_case(self):
+        """A housing case with no visit yet is still described by its authorization —
+        there is nothing better to say."""
+        self._expired_case()
+        card = self._card()
+        self.assertEqual(card["status"], "expired")
+        self.assertEqual(card["note"], "")
+
+    def test_MEALS_are_unaffected(self):
+        """⚠ Only housing has visits. A meals card must not acquire one because the
+        member happens to have an assessment booked."""
+        from .models import Case
+
+        Case.objects.create(
+            case_id=uuid.uuid4(), client=self.client_rec,
+            case_type="internal_service", case_status="open",
+            service_type="Medically Tailored Meals",
+            service_authorization_status="approved",
+            case_created_at=timezone.now(), date_opened=timezone.now(),
+        )
+        self._order(status="confirmed", visit_in_days=3)
+        meals = self._card("Medically Tailored Meals")
+        self.assertIsNone(meals["visit_on"])
+        self.assertEqual(meals["note"], "")
