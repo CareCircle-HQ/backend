@@ -42529,3 +42529,122 @@ class MemberBenefitsTest(TestCase):
                 "/v1/me/benefits/", HTTP_HOST=MEMBER_HOST,
             ).status_code, 403,
         )
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberDeliveriesTest(TestCase):
+    """The food programme detail screen."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Del", last_name="Ivery",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Ivery HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3055558888",
+            mobile_app_password=make_password("x" * 10),
+        )
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _delivery(self, *, days, status="ready_for_delivery", delivered=False,
+                  member=None, quantity=7):
+        from datetime import timedelta
+
+        from .models import DeliveryOrder, PurchaseOrder
+
+        when = timezone.localdate() + timedelta(days=days)
+        return DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.create(),
+            member=member or self.client_rec, quantity=quantity, status=status,
+            expected_delivery_date=when,
+            delivered_at=(
+                timezone.now() + timedelta(days=days) if delivered else None
+            ),
+        )
+
+    def _get(self):
+        return self.api.get("/v1/me/deliveries/", HTTP_HOST=MEMBER_HOST).data
+
+    def test_a_member_with_NO_delivered_order_gets_null_not_a_guess(self):
+        """⚠ THIS IS THE COMMON CASE, not an edge case. Only 184 of 472,628 delivery
+        orders are marked delivered -- 0.04% -- so "Last Delivery" is empty for
+        virtually every member. The screen must say so rather than show the most
+        recent SCHEDULED one as though it had arrived."""
+        self._delivery(days=-3)
+        self._delivery(days=2)
+        self.assertIsNone(self._get()["last"])
+
+    def test_the_last_delivery_is_the_most_recently_DELIVERED(self):
+        self._delivery(days=-10, status="delivered", delivered=True, quantity=5)
+        self._delivery(days=-2, status="delivered", delivered=True, quantity=9)
+        self.assertEqual(self._get()["last"]["quantity"], 9)
+
+    def test_the_next_delivery_skips_CANCELLED_ones(self):
+        self._delivery(days=1, status="cancelled")
+        self._delivery(days=4, quantity=11)
+        self.assertEqual(self._get()["next"]["quantity"], 11)
+
+    def test_CANCELLED_deliveries_STAY_in_the_history(self):
+        """⚠ 53% of all orders are cancelled, and a member who was expecting food
+        that never came is exactly the person who opens this screen. Hiding them
+        answers "where was my delivery?" with a blank."""
+        self._delivery(days=-2, status="cancelled")
+        history = self._get()["history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["status"], "cancelled")
+
+    def test_the_history_is_newest_first_and_capped(self):
+        for d in range(1, 26):
+            self._delivery(days=-d)
+        history = self._get()["history"]
+        self.assertEqual(len(history), 20)
+        self.assertGreater(history[0]["date"], history[-1]["date"])
+
+    def test_todays_delivery_is_flagged(self):
+        self._delivery(days=0)
+        self.assertTrue(self._get()["next"]["is_today"])
+
+    def test_ANOTHER_members_deliveries_are_not_shown(self):
+        """⚠ Meals are cooked to ONE person's dietary profile. Another household
+        member's allergen-free meals are not this member's."""
+        from .models import Client, HouseholdMember
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Oth", last_name="Er",
+            client_added_at=timezone.now(),
+        )
+        HouseholdMember.objects.create(
+            household=self.member.household, client=other, is_primary=False,
+        )
+        self._delivery(days=1, member=other)
+        data = self._get()
+        self.assertIsNone(data["next"])
+        self.assertEqual(data["total"], 0)
+
+    def test_a_member_with_nothing_gets_empty_rather_than_an_error(self):
+        data = self._get()
+        self.assertIsNone(data["next"])
+        self.assertIsNone(data["last"])
+        self.assertEqual(data["history"], [])
+        self.assertEqual(data["total"], 0)
+
+    def test_it_is_refused_while_the_password_change_is_pending(self):
+        from .models import HouseholdMember
+
+        HouseholdMember.objects.filter(pk=self.member.pk).update(
+            mobile_app_must_change_password=True,
+        )
+        self.assertEqual(
+            self.api.get(
+                "/v1/me/deliveries/", HTTP_HOST=MEMBER_HOST,
+            ).status_code, 403,
+        )

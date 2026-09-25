@@ -518,3 +518,88 @@ class MemberBenefitsView(MemberAPIView):
         rank = {"active": 0, "pending": 1, "expired": 2}
         out.sort(key=lambda b: (rank.get(b["status"], 3), b["name"]))
         return Response({"benefits": out})
+
+
+class MemberDeliveriesView(MemberAPIView):
+    """GET /v1/me/deliveries/ -- the food programme detail screen.
+
+    Returns the NEXT delivery, the LAST completed one, and a short history.
+
+    ⚠ "LAST DELIVERY" IS EMPTY FOR ALMOST EVERYBODY. Of 472,628 delivery orders only
+    184 are marked delivered -- 0.04% -- and just 184 of 19,418 members with any
+    delivery have one. 252,152 are CANCELLED and 220,292 sit at ready_for_delivery.
+    Whether that reflects reality or a status feed that never closes the loop is a
+    question for the delivery pipeline, not for this screen; what this screen must do
+    is not pretend. It returns null and the app says so.
+
+    ⚠ THERE IS NO DELIVERY TIME WINDOW IN THE DATA. The mock showed "10:00 AM -
+    2:00 PM" against every delivery; no field carries it. Inventing one would have a
+    member waiting in for a window nobody promised.
+    """
+
+    #: A couple of months of context. A member scrolling years of meal deliveries is
+    #: not a use case anybody has; the next one and the recent past is.
+    HISTORY_LIMIT = 20
+
+    def get(self, request):
+        from django.utils import timezone
+
+        from ..models import DeliveryOrder
+
+        client = request.user.client
+        if client is None:
+            return Response({"next": None, "last": None, "history": []})
+
+        today = timezone.localdate()
+        # ⚠ SCOPED TO THE CLIENT, not the household: meals are cooked to ONE person's
+        # dietary profile, and another member's allergen-free meals are not theirs.
+        base = (
+            DeliveryOrder.objects
+            .filter(member=client)
+            .select_related("menu_type")
+        )
+
+        def block(row):
+            if row is None:
+                return None
+            return {
+                "id": str(row.delivery_order_id),
+                "date": row.expected_delivery_date,
+                "delivered_at": row.delivered_at,
+                "quantity": row.quantity,
+                "status": row.status,
+                # What KIND of meal, in the member's terms. Two fields because the
+                # kitchen and the menu describe different things -- "Dairy Free" is
+                # the menu, "Allergen Free" is how the kitchen prepares it.
+                "menu_type": str(row.menu_type) if row.menu_type_id else "",
+                "meal_type": (row.kitchen_meal_type or "").strip(),
+                "is_today": row.expected_delivery_date == today,
+            }
+
+        nxt = (
+            base.filter(expected_delivery_date__gte=today)
+            .exclude(status__in=["cancelled", "canceled"])
+            .order_by("expected_delivery_date")
+            .first()
+        )
+        last = (
+            base.exclude(delivered_at=None)
+            .order_by("-delivered_at")
+            .first()
+        )
+        # ⚠ CANCELLED DELIVERIES STAY IN THE HISTORY. 53% of all orders are cancelled,
+        # and a member who was expecting food that did not come is exactly the person
+        # who opens this screen. Hiding them would answer "where was my delivery?"
+        # with a blank.
+        history = [
+            block(r) for r in base.filter(expected_delivery_date__lt=today)
+            .order_by("-expected_delivery_date")[:self.HISTORY_LIMIT]
+        ]
+
+        return Response({
+            "next": block(nxt),
+            "last": block(last),
+            "history": history,
+            # So the screen can say "no deliveries yet" rather than "none this month".
+            "total": base.count(),
+        })

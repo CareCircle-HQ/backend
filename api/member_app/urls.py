@@ -12,7 +12,9 @@ from .views import (
     MemberLoginView, MemberLogoutView, MemberMeView, MemberPasswordView,
     MemberVerifyCodeView,
 )
-from .views import MemberBenefitsView, MemberDashboardView
+from .views import (
+    MemberBenefitsView, MemberDashboardView, MemberDeliveriesView,
+)
 
 urlpatterns = [
     path("v1/auth/login/", MemberLoginView.as_view(), name="member-app-login"),
@@ -30,5 +32,9 @@ urlpatterns = [
     path(
         "v1/me/benefits/",
         MemberBenefitsView.as_view(), name="member-app-benefits",
+    ),
+    path(
+        "v1/me/deliveries/",
+        MemberDeliveriesView.as_view(), name="member-app-deliveries",
     ),
 ]
