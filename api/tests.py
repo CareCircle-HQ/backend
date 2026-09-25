@@ -42481,7 +42481,7 @@ class MemberBenefitsTest(TestCase):
         """⚠ "Home Expense Assistance/Repairs" is what the 1115 waiver calls it.
         Nobody describes their own home that way."""
         self._case(service_type="Home Expense Assistance/Repairs")
-        self.assertEqual(self._get()[0]["name"], "Home Repairs & Equipment")
+        self.assertEqual(self._get()[0]["name"], "Home Repairs")
 
     def test_an_UNMAPPED_service_type_still_appears(self):
         """⚠ A benefit MISSING from this screen is worse than one with an awkward
@@ -42951,13 +42951,17 @@ class MemberDeliveryTodayBoundaryTest(TestCase):
 
 @override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
 class MemberHousingBenefitStatusTest(TestCase):
-    """A housing benefit's status is its VISIT, not its authorization.
+    """A HOME REPAIRS benefit's status is its VISIT, not its authorization.
 
-    ⚠ THE BUG THIS FIXES. The Home Assessment card read "expired" — the case's
-    authorization window had lapsed — while an assessor was booked for the following
-    Monday. The case says whether a payer agreed to fund the work; the dispatch order
-    says whether somebody is coming to the member's home, and only the second answers
-    the question a member is asking.
+    ⚠ THE BUG THIS FIXES. The card read "expired" — the case's authorization window had
+    lapsed — while a fitter was booked for the following Monday. The case says whether a
+    payer agreed to fund the work; the dispatch order says whether somebody is coming to
+    the member's home, and only the second answers the question a member is asking.
+
+    ⚠ RETARGETED FROM THE ASSESSMENT CARD. These were written against Dwelling
+    Assessment, which now reads OPEN or CLOSED from its own case and shows no dispatch
+    state at all — see MemberAssessmentCardStatusTest. The visit-driven behaviour lives
+    on Home Repairs, so that is what they exercise.
     """
 
     def setUp(self):
@@ -42981,7 +42985,7 @@ class MemberHousingBenefitStatusTest(TestCase):
         self.api = APIClient()
         self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
 
-    def _expired_case(self, service_type="Environmental Exposure Assessment"):
+    def _expired_case(self, service_type="Home Expense Assistance/Repairs"):
         from datetime import timedelta
 
         from .models import Case
@@ -42996,7 +43000,7 @@ class MemberHousingBenefitStatusTest(TestCase):
             case_created_at=timezone.now(), date_opened=timezone.now(),
         )
 
-    def _order(self, *, status, visit_in_days=None, kind="assessment"):
+    def _order(self, *, status, visit_in_days=None, kind="remediation"):
         from datetime import timedelta
 
         from .models import DispatchOrder, DispatchVisit
@@ -43011,7 +43015,7 @@ class MemberHousingBenefitStatusTest(TestCase):
             )
         return order
 
-    def _card(self, name="Dwelling Assessment"):
+    def _card(self, name="Home Repairs"):
         cards = self.api.get(
             "/v1/me/benefits/", HTTP_HOST=MEMBER_HOST,
         ).data["benefits"]
@@ -43058,7 +43062,7 @@ class MemberHousingBenefitStatusTest(TestCase):
         self._expired_case(service_type="Home Expense Assistance/Repairs")
         self._order(status="cancelled", visit_in_days=-10, kind="remediation")
         self._order(status="confirmed", visit_in_days=4, kind="remediation")
-        card = self._card("Home Repairs & Equipment")
+        card = self._card("Home Repairs")
         self.assertEqual(card["note"], "A visit is booked.")
 
     def test_with_NO_dispatch_order_it_falls_back_to_the_case(self):
@@ -43237,36 +43241,21 @@ class MemberAssessmentTest(TestCase):
         self.assertEqual(len(rows), 2)
         self.assertCountEqual([r["item"] for r in rows], ["Heater", "Humidifier"])
 
-    def test_a_FUTURE_fitting_visit_is_not_an_installation(self):
-        """⚠ The work order can be "submitted" while the fitting is days away — James
-        Bethea's is, on the 29th, read on the 25th. This said "Installed." about four
-        devices nobody had fitted. The same trap as the benefits card, one endpoint
-        later."""
+    def test_EVERY_item_is_simply_IDENTIFIED(self):
+        """⚠ ONE STATE, BY DESIGN. An assessment IDENTIFIES what a home needs -- that
+        is its entire output. Whether an item is then approved, booked or fitted
+        belongs to Home Repairs, which tracks the cases doing it.
+
+        My first version derived five states here from the work orders, which made the
+        assessment a second competing view of the repairs and printed "Installed."
+        about devices nobody had fitted."""
         self._item("Heater", work_order=self._work_order(
             status="submitted", visit_in_days=4,
         ))
-        row = self._get()["items"][0]
-        self.assertEqual(row["status"], "scheduled")
-
-    def test_a_PAST_visit_on_a_submitted_work_order_is_installed(self):
-        self._item("Heater", work_order=self._work_order(
-            status="submitted", visit_in_days=-4,
-        ))
-        self.assertEqual(self._get()["items"][0]["status"], "installed")
-
-    def test_an_approved_item_with_no_work_order_reads_as_approved(self):
-        self._item("Heater")
-        self.assertEqual(self._get()["items"][0]["status"], "approved")
-
-    def test_a_DENIED_item_says_so_WITHOUT_the_payers_reason(self):
-        """⚠ Denial reasons are written for an appeal. A member reading "not medically
-        necessary" about their own home, on a phone, with nobody to ask, is a cruelty.
-        It names the action that can help instead."""
-        self._item("Heater", approved=False)
-        row = self._get()["items"][0]
-        self.assertEqual(row["status"], "not_approved")
-        self.assertIn("Contact CareCircle", row["note"])
-        self.assertNotIn("medically", row["note"].lower())
+        self._item("Humidifier", approved=False)
+        self._item("Air Conditioner")
+        rows = self._get()["items"]
+        self.assertEqual({r["status"] for r in rows}, {"identified"})
 
     def test_NO_PRICES_ANYWHERE_in_the_payload(self):
         """The vendor's rates, the programme cap and the authorized amount are all on
@@ -43301,3 +43290,233 @@ class MemberAssessmentTest(TestCase):
                 "/v1/me/assessment/", HTTP_HOST=MEMBER_HOST,
             ).status_code, 403,
         )
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberRepairsTest(TestCase):
+    """Home Repairs: the approved products, and proof of what was fitted."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DispatchOrder, Household, HouseholdMember, Vendor,
+        )
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Rep", last_name="Air",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Air HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3055551111",
+            mobile_app_password=make_password("x" * 10),
+        )
+        self.vendor = Vendor.objects.create(name="Fitters", is_active=True)
+        self.assessment = DispatchOrder.objects.create(
+            kind="assessment", client=self.client_rec, vendor=self.vendor,
+            status="submitted",
+        )
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _repair(self, product, *, approved=True, work_order=None):
+        from .models import Case, DispatchItem
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.client_rec,
+            case_type="internal_service",
+            case_status="open" if approved else "closed",
+            service_type="Home Expense Assistance/Repairs",
+            program_name=f"Home Remediation - {product} - Queens",
+            service_authorization_status="approved" if approved else "denied",
+            case_created_at=timezone.now(), date_opened=timezone.now(),
+        )
+        item = DispatchItem.objects.create(
+            assessment=self.assessment, case=case, item=product,
+            program_name=case.program_name, dispatch_order=work_order,
+        )
+        return case, item
+
+    def _work_order(self, *, status, visit_in_days=None):
+        from datetime import timedelta
+
+        from .models import DispatchOrder, DispatchVisit
+
+        wo = DispatchOrder.objects.create(
+            kind="remediation", client=self.client_rec, vendor=self.vendor,
+            parent=self.assessment, status=status,
+        )
+        if visit_in_days is not None:
+            DispatchVisit.objects.create(
+                dispatch_order=wo,
+                scheduled_for=timezone.now() + timedelta(days=visit_in_days),
+            )
+        return wo
+
+    def _proof(self, item):
+        from .models import DispatchProof
+
+        return DispatchProof.objects.create(
+            dispatch_order=item.dispatch_order, dispatch_item=item,
+            s3_key=f"proofs/{uuid.uuid4()}.jpg", content_hash=uuid.uuid4().hex,
+            captured_at=timezone.now(), caption="Fitted in the bedroom",
+        )
+
+    def _get(self):
+        return self.api.get("/v1/me/repairs/", HTTP_HOST=MEMBER_HOST).data["items"]
+
+    def test_DENIED_cases_are_not_listed(self):
+        """⚠ James Bethea has TEN repair cases: five approved and open, five DENIED and
+        closed -- the denials being earlier attempts at the SAME five products. Listing
+        all ten shows every product twice, once as a refusal, and a member cannot tell
+        which is live. A denial later approved is not news; it is our history with the
+        payer."""
+        self._repair("Heater")
+        self._repair("Heater", approved=False)
+        rows = self._get()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status_label"], "Approved")
+
+    def test_a_SUBMITTED_work_order_means_INSTALLED(self):
+        """⚠ Not "the case is closed". A housing case can close in Unite Us while the
+        device still has to be fitted -- documented on the model itself. The vendor
+        filing their completed work order is the event that means a member HAS it."""
+        _c, item = self._repair("Heater", work_order=self._work_order(
+            status="submitted", visit_in_days=4,
+        ))
+        self.assertEqual(self._get()[0]["status_label"], "Installed")
+
+    def test_a_CONFIRMED_work_order_means_BOOKED(self):
+        self._repair("Heater", work_order=self._work_order(
+            status="confirmed", visit_in_days=3,
+        ))
+        row = self._get()[0]
+        self.assertEqual(row["status_label"], "Booked")
+        self.assertIsNotNone(row["visit_on"])
+
+    def test_no_work_order_means_APPROVED(self):
+        self._repair("Heater")
+        self.assertEqual(self._get()[0]["status_label"], "Approved")
+
+    def test_the_FITTERS_PHOTO_is_returned_for_the_right_product(self):
+        """⚠ THE PHOTOGRAPH IS THE POINT. It is captured on site in the vendor app, one
+        per product, and it is the only thing that shows a member what was actually put
+        in their home."""
+        wo = self._work_order(status="submitted", visit_in_days=-1)
+        _c1, heater = self._repair("Heater", work_order=wo)
+        _c2, _hum = self._repair("Humidifier", work_order=wo)
+        self._proof(heater)
+        rows = {r["item"]: r for r in self._get()}
+        self.assertEqual(len(rows["Heater"]["photos"]), 1)
+        self.assertEqual(rows["Humidifier"]["photos"], [])
+        self.assertTrue(rows["Heater"]["photos"][0]["url"])
+
+    def test_a_proof_with_no_key_is_skipped(self):
+        from .models import DispatchProof
+
+        wo = self._work_order(status="submitted", visit_in_days=-1)
+        _c, item = self._repair("Heater", work_order=wo)
+        DispatchProof.objects.create(
+            dispatch_order=wo, dispatch_item=item, s3_key="",
+            content_hash=uuid.uuid4().hex, captured_at=timezone.now(),
+        )
+        self.assertEqual(self._get()[0]["photos"], [])
+
+    def test_a_member_with_nothing_approved_gets_an_empty_list(self):
+        self._repair("Heater", approved=False)
+        self.assertEqual(self._get(), [])
+
+    def test_NO_PRICES_in_the_payload(self):
+        self._repair("Heater")
+        body = str(self._get())
+        for banned in ("price", "amount", "cost", "cap", "rate"):
+            self.assertNotIn(banned, body.lower(), banned)
+
+    def test_it_is_refused_while_the_password_change_is_pending(self):
+        from .models import HouseholdMember
+
+        HouseholdMember.objects.filter(pk=self.member.pk).update(
+            mobile_app_must_change_password=True,
+        )
+        self.assertEqual(
+            self.api.get(
+                "/v1/me/repairs/", HTTP_HOST=MEMBER_HOST,
+            ).status_code, 403,
+        )
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberAssessmentCardStatusTest(TestCase):
+    """The Dwelling Assessment card is OPEN or CLOSED. Nothing else."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Dwe", last_name="Ll",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Ll HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3055550001",
+            mobile_app_password=make_password("x" * 10),
+        )
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _case(self, status):
+        from .models import Case
+
+        return Case.objects.create(
+            case_id=uuid.uuid4(), client=self.client_rec,
+            case_type="internal_service", case_status=status,
+            service_type="Environmental Exposure Assessment",
+            program_name="Dwelling Assessment & Statement of Work (SOW)",
+            service_authorization_status="approved",
+            case_created_at=timezone.now(), date_opened=timezone.now(),
+        )
+
+    def _card(self):
+        cards = self.api.get(
+            "/v1/me/benefits/", HTTP_HOST=MEMBER_HOST,
+        ).data["benefits"]
+        return next((c for c in cards if c["name"] == "Dwelling Assessment"), None)
+
+    def test_an_open_case_reads_OPEN(self):
+        self._case("open")
+        self.assertEqual(self._card()["note"], "Open")
+
+    def test_a_closed_case_reads_CLOSED(self):
+        self._case("closed")
+        self.assertEqual(self._card()["note"], "Closed")
+
+    def test_an_OPEN_case_wins_over_a_closed_one(self):
+        """⚠ James Bethea has both. "Closed" while their assessment is still running
+        would tell a member it is over."""
+        self._case("closed")
+        self._case("open")
+        self.assertEqual(self._card()["note"], "Open")
+
+    def test_it_does_NOT_show_a_dispatch_workflow_state(self):
+        """⚠ Six workflow states for a two-state thing is what produced "The visit is
+        complete" about an appointment three days away."""
+        from .models import DispatchOrder, Vendor
+
+        self._case("open")
+        DispatchOrder.objects.create(
+            kind="assessment", client=self.client_rec,
+            vendor=Vendor.objects.create(name="V", is_active=True),
+            status="pending_submission",
+        )
+        card = self._card()
+        self.assertEqual(card["note"], "Open")
+        self.assertIsNone(card["visit_on"])

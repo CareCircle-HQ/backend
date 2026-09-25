@@ -15,6 +15,7 @@ from .views import (
 from .views import (
     MemberBenefitsView, MemberDashboardView, MemberDeliveriesView,
     MemberAssessmentView, MemberDeliveryHistoryView, MemberDeliveryPhotosView,
+    MemberRepairsView,
 )
 
 urlpatterns = [
@@ -33,6 +34,10 @@ urlpatterns = [
     path(
         "v1/me/assessment/",
         MemberAssessmentView.as_view(), name="member-app-assessment",
+    ),
+    path(
+        "v1/me/repairs/",
+        MemberRepairsView.as_view(), name="member-app-repairs",
     ),
     path(
         "v1/me/benefits/",

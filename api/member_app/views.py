@@ -403,7 +403,7 @@ class MemberDashboardView(MemberAPIView):
 BENEFIT_LABELS = {
     "Medically Tailored Meals": "Medically Tailored Meals",
     "Produce Prescription/Voucher": "Fresh Produce",
-    "Home Expense Assistance/Repairs": "Home Repairs & Equipment",
+    "Home Expense Assistance/Repairs": "Home Repairs",
     "Environmental Exposure Assessment": "Dwelling Assessment",
     "Environmental Modifications/Accessibility": "Home Modifications",
     "Food Pantry": "Food Pantry",
@@ -447,6 +447,17 @@ DISPATCH_MEMBER_STATUS = {
     "submitted": ("active", "The visit is complete."),
     "uploaded": ("active", "The visit is complete."),
     "cancelled": ("expired", "This visit was cancelled."),
+}
+
+#: ⚠ THE DWELLING ASSESSMENT IS OPEN OR CLOSED, NOTHING ELSE. Its own case status is
+#: the whole truth: either the assessment is still running or it is finished. The
+#: dispatch workflow underneath ("Pending Submission", "Uploaded") describes the
+#: VENDOR's paperwork, and exposing six workflow states for a two-state thing invited
+#: exactly the bug it caused -- "The visit is complete" printed about an appointment
+#: three days away.
+ASSESSMENT_CASE_STATUS = {
+    "open": ("active", "Open"),
+    "closed": ("expired", "Closed"),
 }
 
 #: Which dispatch kind speaks for which benefit.
@@ -532,6 +543,27 @@ class MemberBenefitsView(MemberAPIView):
             # a payer has agreed to fund it. James Bethea's Home Assessment card read
             # "expired" while an assessor was booked for the following Monday.
             visit_on = None
+            if service_type == "Environmental Exposure Assessment":
+                # ⚠ OPEN OR CLOSED, from the case. An OPEN case wins over a closed one:
+                # James Bethea has both, and "Closed" on a member's screen while their
+                # assessment is still running would tell them it is over.
+                open_case = any(c.case_status == "open" for c in g["cases"])
+                status, note = ASSESSMENT_CASE_STATUS[
+                    "open" if open_case else "closed"
+                ]
+                out.append({
+                    "id": service_type,
+                    "name": BENEFIT_LABELS.get(service_type, service_type),
+                    "description": BENEFIT_BLURBS.get(service_type, ""),
+                    "status": status,
+                    "note": note,
+                    "visit_on": None,
+                    "valid_until": None,
+                    "items": [],
+                    "case_count": len(g["cases"]),
+                })
+                continue
+
             kind = SERVICE_DISPATCH_KIND.get(service_type)
             if kind:
                 order = (
@@ -937,52 +969,22 @@ class MemberAssessmentView(MemberAPIView):
             g = by_product.setdefault(item.item, [])
             g.append(item)
 
-        def state_of(items):
-            """The most advanced state across a product's items."""
-            best = ("recommended", "Recommended by the assessor.")
-            from django.utils import timezone as tz
-
-            for i in items:
-                wo = i.dispatch_order
-                if wo is None:
-                    pass
-                else:
-                    # ⚠ A FUTURE FITTING VISIT IS NOT AN INSTALLATION, however the
-                    # work order is filed. James Bethea's remediation order is
-                    # "submitted" with a visit on the 29th, read on the 25th -- so
-                    # this said "Installed." about four devices nobody had fitted yet.
-                    # The same trap as the benefits card, one endpoint later.
-                    upcoming = wo.visits.filter(
-                        scheduled_for__gt=tz.now(),
-                    ).exists()
-                    if upcoming:
-                        return ("scheduled", "A fitting visit is arranged.")
-                    if wo.status in {"submitted", "uploaded"}:
-                        return ("installed", "Installed.")
-                    return ("scheduled", "A fitting visit is being arranged.")
-                if i.is_approved and not i.authorization_expired:
-                    best = ("approved", "Approved. We are arranging the fitting.")
-                elif i.is_approved and best[0] == "recommended":
-                    best = ("approved", "Approved.")
-            if best[0] == "recommended" and items and not any(
-                i.is_approved for i in items
-            ):
-                return (
-                    "not_approved",
-                    "Not approved. Contact CareCircle if you have questions.",
-                )
-            return best
-
+        # ⚠ ONE STATE ONLY: IDENTIFIED. An assessment IDENTIFIES what a home needs
+        # -- that is its entire output. Whether each item is then approved, booked or
+        # fitted belongs to the Home Repairs benefit, which tracks the cases doing it.
+        #
+        # My first version derived five states here from the work orders, which made
+        # the assessment screen a second, competing view of the repairs and produced
+        # "Installed." about devices nobody had fitted yet. Fewer states, in the right
+        # place.
         items = []
         for product, group in sorted(by_product.items()):
-            state, note = state_of(group)
             items.append({
                 "item": product,
-                # The assessor's recommended quantity where we have it; the number of
-                # funding cases otherwise.
+                # The assessor's recommended quantity where we have it; one otherwise.
                 "quantity": recommended.get(product) or 1,
-                "status": state,
-                "note": note,
+                "status": "identified",
+                "note": "Identified by the assessor as needed for your home.",
             })
 
         # Products the assessor recommended that have no case at all yet -- otherwise a
@@ -997,8 +999,8 @@ class MemberAssessmentView(MemberAPIView):
         for product, qty in recommended.items():
             if dispatch_svc.product_key(product) not in seen_keys:
                 items.append({
-                    "item": product, "quantity": qty, "status": "recommended",
-                    "note": "Recommended by the assessor. We are arranging funding.",
+                    "item": product, "quantity": qty, "status": "identified",
+                    "note": "Identified by the assessor as needed for your home.",
                 })
 
         return Response({
@@ -1016,3 +1018,124 @@ class MemberAssessmentView(MemberAPIView):
             },
             "items": items,
         })
+
+
+#: A Home Repairs product's state, strongest first. Four words, and each is a thing
+#: that happened rather than a workflow stage.
+REPAIR_STATUS_LABELS = {
+    "installed": "Installed",
+    "booked": "Booked",
+    "approved": "Approved",
+    "denied": "Denied",
+}
+
+
+class MemberRepairsView(MemberAPIView):
+    """GET /v1/me/repairs/ -- the Home Repairs cases, and proof of what was fitted.
+
+    ⚠ APPROVED CASES ONLY. James Bethea has ten repair cases: five approved and open,
+    five DENIED and closed -- the denials being earlier attempts at the same five
+    products. Listing all ten shows every product twice, once as a refusal, and a
+    member cannot tell which one is live. A denial that was later approved is not news;
+    it is our history with the payer.
+
+    ⚠ INSTALLED MEANS THE WORK ORDER WAS SUBMITTED. Not "the case is closed" -- a
+    housing case can close in Unite Us while the device still has to be fitted, which
+    is documented on the model itself. The vendor filing their completed work order is
+    the event that means a member has the thing.
+
+    The installation photographs come from the vendor app: one per product, captured
+    on site, behind the same short-lived signed URLs as the delivery proofs.
+    """
+
+    PRESIGN_SECONDS = 900
+
+    def get(self, request):
+        from ..models import Case, DispatchProof
+        from ..services import import_storage
+
+        client = request.user.client
+        if client is None:
+            return Response({"items": []})
+
+        cases = (
+            Case.objects
+            .filter(
+                client=client,
+                case_type="internal_service",
+                service_type="Home Expense Assistance/Repairs",
+                service_authorization_status="approved",
+            )
+            .prefetch_related("dispatch_items__dispatch_order")
+            .order_by("program_name")
+        )
+
+        items = []
+        for case in cases:
+            name = (case.program_name or "").strip()
+            product = (
+                name.split(" - ")[1].strip()
+                if name.startswith("Home Remediation - ") and " - " in name
+                else (case.service_type or "Home repair")
+            )
+
+            state = "approved"
+            work_order = None
+            for item in case.dispatch_items.all():
+                wo = item.dispatch_order
+                if wo is None:
+                    continue
+                work_order = wo
+                if wo.status in {"submitted", "uploaded"}:
+                    state = "installed"
+                    break
+                if wo.status != "cancelled":
+                    state = "booked"
+
+            # Photos of THIS product, taken by the vendor on site. Keyed through the
+            # dispatch item, which is why that FK exists.
+            photos = []
+            item_ids = [i.dispatch_item_id for i in case.dispatch_items.all()]
+            if item_ids:
+                for proof in (
+                    DispatchProof.objects
+                    .filter(dispatch_item_id__in=item_ids)
+                    .order_by("captured_at")
+                ):
+                    if not proof.s3_key:
+                        continue
+                    try:
+                        url = import_storage.presign_get(
+                            proof.s3_key, expires=self.PRESIGN_SECONDS, inline=True,
+                            download_name=f"{product}.jpg",
+                        )
+                    except Exception:  # noqa: BLE001 - one bad key loses one photo
+                        logger.warning(
+                            "member repairs: could not presign %s", proof.s3_key,
+                        )
+                        continue
+                    photos.append({
+                        "id": str(proof.id),
+                        "url": url,
+                        "taken_at": proof.captured_at,
+                        "note": (proof.caption or "").strip(),
+                    })
+
+            items.append({
+                "id": str(case.case_id),
+                "item": product,
+                "status": state,
+                "status_label": REPAIR_STATUS_LABELS[state],
+                "visit_on": None,
+                "photos": photos,
+            })
+
+            if work_order is not None:
+                visit = (
+                    work_order.visits.filter(scheduled_for__isnull=False)
+                    .order_by("-scheduled_for").first()
+                )
+                if visit is not None:
+                    items[-1]["visit_on"] = visit.scheduled_for
+
+        return Response({"items": items})
