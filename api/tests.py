@@ -41606,3 +41606,200 @@ class WorkOrderDocumentTest(TestCase):
 
         self.assertEqual(DOC_LABELS[DOC_WORK_INVOICE], "Work Order Invoice")
         self.assertEqual(DOC_LABELS[DOC_COMPLETION], "Certificate of Completion")
+
+
+class VendorForcedPasswordChangeTest(TestCase):
+    """A member whose password was ISSUED BY SOMEONE ELSE must replace it.
+
+    An admin creates the account and an email carries a generated password, so until
+    the member replaces it their credential is known to at least two people and has
+    sat in an inbox.
+
+    ⚠ ENFORCED SERVER-SIDE, in VendorAPIView. A flag the client is trusted to honour
+    is not a gate -- and a UI-only check is how a housing case reached the food
+    verification endpoint after the picker had been fixed.
+    """
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+        from .vendor.auth import issue_token
+
+        self.vendor = Vendor.objects.create(name="Fitters", is_active=True)
+        self.user = VendorUser.objects.create(
+            vendor=self.vendor, email="new@example.com", name="New Hire",
+            password=make_password("issued-by-admin"), is_admin=False,
+            must_change_password=True,
+        )
+        raw, _t = issue_token(self.user)
+        self.api = APIClient()
+        self.api.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {raw}", HTTP_HOST="vendor.localhost",
+        )
+
+    def _settings(self):
+        from django.test import override_settings
+
+        return override_settings(
+            VENDOR_API_HOST="vendor.localhost",
+            ALLOWED_HOSTS=["vendor.localhost", "testserver", "localhost"],
+        )
+
+    def test_EVERY_endpoint_is_refused_while_pending(self):
+        with self._settings():
+            for path in ("/v1/work/", "/v1/dashboard/", "/v1/team/"):
+                with self.subTest(path=path):
+                    r = self.api.get(path)
+                    self.assertEqual(r.status_code, 403, path)
+
+    def test_ME_is_allowed_so_the_app_can_render_the_change_screen(self):
+        """⚠ Otherwise the forced change is a deadlock: the app cannot show whose
+        password it is asking about."""
+        with self._settings():
+            r = self.api.get("/v1/me/")
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.data["user"]["must_change_password"])
+
+    def test_the_CHANGE_endpoint_itself_is_allowed(self):
+        """⚠ The other half of the deadlock: every call 403s until the password
+        changes, and changing it is a call."""
+        with self._settings():
+            r = self.api.post("/v1/me/password/", {
+                "current_password": "issued-by-admin",
+                "new_password": "chosen-by-the-member",
+            }, format="json")
+            self.assertEqual(r.status_code, 200, r.data)
+
+    def test_changing_it_CLEARS_the_flag_and_opens_everything(self):
+        with self._settings():
+            self.api.post("/v1/me/password/", {
+                "current_password": "issued-by-admin",
+                "new_password": "chosen-by-the-member",
+            }, format="json")
+            self.user.refresh_from_db()
+            self.assertFalse(self.user.must_change_password)
+            self.assertEqual(self.api.get("/v1/work/").status_code, 200)
+
+    def test_the_CURRENT_password_is_required(self):
+        """It arrived by email, so anyone reading that inbox holds it. Asking again
+        means a stolen TOKEN alone cannot lock the real member out."""
+        with self._settings():
+            r = self.api.post("/v1/me/password/", {
+                "current_password": "wrong", "new_password": "chosen-by-the-member",
+            }, format="json")
+            self.assertEqual(r.status_code, 401)
+            self.user.refresh_from_db()
+            self.assertTrue(self.user.must_change_password)
+
+    def test_REUSING_the_emailed_password_is_refused(self):
+        """⚠ Otherwise "change your password" is satisfied by retyping the one that
+        was emailed, which is the thing this exists to get rid of."""
+        with self._settings():
+            r = self.api.post("/v1/me/password/", {
+                "current_password": "issued-by-admin",
+                "new_password": "issued-by-admin",
+            }, format="json")
+            self.assertEqual(r.status_code, 400)
+            self.assertEqual(r.data["error"], "password_unchanged")
+
+    def test_a_short_password_is_refused(self):
+        with self._settings():
+            r = self.api.post("/v1/me/password/", {
+                "current_password": "issued-by-admin", "new_password": "short",
+            }, format="json")
+            self.assertEqual(r.status_code, 400)
+
+    def test_a_member_who_has_ALREADY_changed_it_is_not_asked_again(self):
+        from .models import VendorUser
+
+        VendorUser.objects.filter(pk=self.user.pk).update(
+            must_change_password=False,
+        )
+        with self._settings():
+            self.assertEqual(self.api.get("/v1/work/").status_code, 200)
+
+    def test_an_ADMIN_RESET_re_arms_it(self):
+        """⚠ A reset hands out a known password again. Without this the member keeps
+        working under a credential someone else chose -- the state this ends."""
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Vendor, VendorUser
+        from .vendor.auth import issue_token
+
+        admin = VendorUser.objects.create(
+            vendor=self.vendor, email="boss@example.com", name="Boss",
+            password=make_password("boss-password"), is_admin=True,
+        )
+        VendorUser.objects.filter(pk=self.user.pk).update(
+            must_change_password=False,
+        )
+        raw, _t = issue_token(admin)
+        api = APIClient()
+        api.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {raw}", HTTP_HOST="vendor.localhost",
+        )
+        with self._settings():
+            r = api.patch(
+                f"/v1/team/{self.user.vendor_user_id}/",
+                {"password": "reset-by-the-admin"}, format="json",
+            )
+            self.assertEqual(r.status_code, 200, r.data)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.must_change_password)
+
+    def test_a_NEW_member_is_created_with_the_flag_set(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import VendorUser
+        from .vendor.auth import issue_token
+
+        admin = VendorUser.objects.create(
+            vendor=self.vendor, email="boss2@example.com", name="Boss",
+            password=make_password("boss-password"), is_admin=True,
+        )
+        raw, _t = issue_token(admin)
+        api = APIClient()
+        api.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {raw}", HTTP_HOST="vendor.localhost",
+        )
+        with self._settings():
+            r = api.post("/v1/team/", {
+                "name": "Third Hand", "email": "third@example.com",
+            }, format="json")
+            self.assertEqual(r.status_code, 201, r.data)
+            # Echoed once so an admin can pass it on when the email does not arrive.
+            self.assertTrue(r.data["temporary_password"])
+            self.assertIn("emailed", r.data)
+        created = VendorUser.objects.get(email="third@example.com")
+        self.assertTrue(created.must_change_password)
+
+    def test_a_FAILED_email_does_not_undo_the_account(self):
+        """⚠ The admin has already created it by then. Losing the account because
+        Mailgun was down would be the wrong way round -- `emailed` reports it."""
+        from unittest.mock import patch
+
+        from django.contrib.auth.hashers import make_password
+
+        from .models import VendorUser
+        from .vendor.auth import issue_token
+
+        admin = VendorUser.objects.create(
+            vendor=self.vendor, email="boss3@example.com", name="Boss",
+            password=make_password("boss-password"), is_admin=True,
+        )
+        raw, _t = issue_token(admin)
+        api = APIClient()
+        api.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {raw}", HTTP_HOST="vendor.localhost",
+        )
+        with self._settings(), patch(
+            "api.integrations.mailgun.send_email", side_effect=RuntimeError("down"),
+        ):
+            r = api.post("/v1/team/", {
+                "name": "Fourth Hand", "email": "fourth@example.com",
+            }, format="json")
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertFalse(r.data["emailed"])
+        self.assertTrue(r.data["temporary_password"])
+        self.assertTrue(VendorUser.objects.filter(email="fourth@example.com").exists())

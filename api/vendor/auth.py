@@ -10,11 +10,14 @@ signed with the shared key would authenticate against the whole CRM.
 """
 
 import hashlib
+import logging
 import secrets
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 from rest_framework import authentication, exceptions, permissions
 
 from ..models import VendorAccessToken, VendorUser
@@ -175,3 +178,55 @@ class IsVendorAdmin(permissions.BasePermission):
     def has_permission(self, request, view):
         user = getattr(request, "user", None)
         return isinstance(user, VendorPrincipal) and user.is_vendor_admin
+
+
+def send_temporary_password(vendor_user, raw_password, *, invited_by=""):
+    """Email a new member their temporary password. Returns True when it went.
+
+    ⚠ NEVER RAISES. An admin has already created the account by the time this runs, so
+    a Mailgun outage must not undo it -- the endpoint reports ``emailed: false`` and
+    still shows the password once, which is the fallback that existed before email did.
+    Losing the account because the mail failed would be the wrong way round.
+
+    The password is in the body because there is nothing to click: the vendor app has
+    no magic-link flow, and a member who cannot see the password cannot get in. It is
+    single-use in practice -- ``must_change_password`` forces a replacement at first
+    login, server-side.
+    """
+    from ..integrations.mailgun import MailgunError, send_email
+
+    vendor = vendor_user.vendor
+    subject = f"Your {vendor.name} login for CareCircle"
+    who = f" by {invited_by}" if invited_by else ""
+    text = (
+        f"Hello {vendor_user.name},\n\n"
+        f"An account has been created for you{who} so you can work "
+        f"{vendor.name}'s CareCircle assignments.\n\n"
+        f"Email:    {vendor_user.email}\n"
+        f"Password: {raw_password}\n\n"
+        "You will be asked to choose your own password the first time you sign in. "
+        "This one stops working at that point.\n\n"
+        "If you were not expecting this, tell your administrator -- do not sign in."
+    )
+    html = (
+        f"<p>Hello {vendor_user.name},</p>"
+        f"<p>An account has been created for you{who} so you can work "
+        f"<strong>{vendor.name}</strong>'s CareCircle assignments.</p>"
+        f"<p><strong>Email:</strong> {vendor_user.email}<br>"
+        f"<strong>Password:</strong> <code>{raw_password}</code></p>"
+        "<p>You will be asked to choose your own password the first time you sign "
+        "in. This one stops working at that point.</p>"
+        "<p>If you were not expecting this, tell your administrator — do not sign "
+        "in.</p>"
+    )
+    try:
+        send_email(
+            to=f"{vendor_user.name} <{vendor_user.email}>",
+            subject=subject, text=text, html=html,
+        )
+        return True
+    except (MailgunError, Exception):  # noqa: BLE001
+        logger.exception(
+            "vendor invite email failed for %s", vendor_user.vendor_user_id,
+        )
+        return False

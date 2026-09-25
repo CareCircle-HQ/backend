@@ -5714,6 +5714,15 @@ class VendorUser(models.Model):
     password = models.CharField(max_length=255, blank=True)
     is_admin = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True, db_index=True)
+    # ⚠ THE PASSWORD WAS ISSUED BY SOMEONE ELSE until this is False. An admin
+    # creates the account and an email carries a generated password, so until the
+    # member replaces it their credential is known to at least two people and has
+    # sat in an inbox. Set on creation AND on any admin reset -- a reset hands out a
+    # known password again, so it re-arms.
+    #
+    # Enforced SERVER-SIDE in VendorAPIView, not merely shown in the app: a flag the
+    # client is trusted to honour is not a gate.
+    must_change_password = models.BooleanField(default=False)
     last_login_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -25,6 +25,7 @@ from ..models import (
     DispatchKind, DispatchOrder, DispatchStatus, DispatchVisit, VendorUser,
 )
 from .auth import (
+    send_temporary_password,
     IsVendorAdmin, IsVendorUser, VendorAuthentication, authenticate_user,
     client_ip, issue_token,
 )
@@ -47,10 +48,39 @@ def error(code, detail, status_code=http.HTTP_400_BAD_REQUEST, **extra):
 
 
 class VendorAPIView(APIView):
-    """Base: vendor-only auth, and nothing inherited from the CRM's defaults."""
+    """Base: vendor-only auth, and nothing inherited from the CRM's defaults.
+
+    ⚠ IT ALSO ENFORCES THE FORCED PASSWORD CHANGE. A member whose password was issued
+    by an admin and emailed to them gets 403 ``password_change_required`` on every
+    endpoint until they replace it -- so the requirement is a GATE, not a screen the
+    app is trusted to show. A UI-only check is how a housing case reached the food
+    verification endpoint after the picker had been fixed.
+
+    ``ALLOW_PENDING_PASSWORD`` opts an endpoint out, and exactly two need it: the
+    change-password endpoint itself and /me/ (the app has to be able to see WHO is
+    signed in to render the change screen). Logout does not need auth at all.
+    """
 
     authentication_classes = [VendorAuthentication]
     permission_classes = [IsVendorUser]
+    #: Set True on a view that must work BEFORE the password has been replaced.
+    ALLOW_PENDING_PASSWORD = False
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if self.ALLOW_PENDING_PASSWORD:
+            return
+        user = getattr(request, "user", None)
+        vendor_user = getattr(user, "vendor_user", None)
+        if vendor_user is not None and vendor_user.must_change_password:
+            # PermissionDenied rather than a Response: initial() runs before the
+            # handler, and returning from here would be ignored.
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied({
+                "error": "password_change_required",
+                "detail": "Choose your own password before continuing.",
+            })
 
 
 # ── auth ─────────────────────────────────────────────────────────────────────
@@ -96,6 +126,10 @@ class VendorLoginView(APIView):
                 "name": user.name,
                 "email": user.email,
                 "is_admin": user.is_admin,
+                # So the app can go straight to the change screen. It is NOT the
+                # enforcement -- every other endpoint 403s until it is cleared -- it
+                # just saves the member discovering that by being refused.
+                "must_change_password": user.must_change_password,
             },
             "vendor": {"id": str(user.vendor_id), "name": user.vendor.name},
         })
@@ -120,6 +154,10 @@ class VendorLogoutView(VendorAPIView):
 class VendorMeView(VendorAPIView):
     """GET /v1/me/ -- who am I, and which company am I scoped to."""
 
+    # The app needs to know WHO is signed in to render the change-password screen, so
+    # this is the second and last endpoint exempt from the forced-change gate.
+    ALLOW_PENDING_PASSWORD = True
+
     def get(self, request):
         p = request.user
         return Response({
@@ -128,6 +166,9 @@ class VendorMeView(VendorAPIView):
                 "name": p.vendor_user.name,
                 "email": p.vendor_user.email,
                 "is_admin": p.is_vendor_admin,
+                # /me/ is reachable before the change, so it must report it too --
+                # otherwise a reloaded app has no way to know it is pending.
+                "must_change_password": p.vendor_user.must_change_password,
             },
             "vendor": {"id": str(p.vendor_id), "name": p.vendor.name},
             "token_expires_at": p.token.expires_at,
@@ -548,6 +589,9 @@ class VendorTeamListView(VendorAdminAPIView):
             email=email,
             phone=(data.get("phone") or "").strip(),
             password=make_password(password),
+            # Somebody else chose this password and it travelled by email, so it is
+            # replaced at first sign-in -- enforced in VendorAPIView, not just shown.
+            must_change_password=True,
             # NEVER an admin. The admin slot is CRM-provisioned and constrained to
             # one per vendor, so a company cannot grow a second administrator --
             # which is what keeps "who can add people" answerable.
@@ -564,6 +608,14 @@ class VendorTeamListView(VendorAdminAPIView):
         # response body.
         payload["temporary_password"] = "" if supplied else password
         payload["password_was_supplied"] = bool(supplied)
+        # ⚠ EMAILED, AND STILL SHOWN ONCE. The email is the normal route -- a member
+        # who cannot see the password cannot get in, and there is no magic-link flow
+        # here -- but Mailgun can be down, and losing the account because the mail
+        # failed would be the wrong way round. `emailed` tells the admin whether they
+        # need to pass it on themselves.
+        payload["emailed"] = send_temporary_password(
+            user, password, invited_by=request.user.vendor_user.name,
+        )
         return Response(payload, status=http.HTTP_201_CREATED)
 
 
@@ -618,6 +670,11 @@ class VendorTeamDetailView(VendorAdminAPIView):
                     "Password must be at least 8 characters.",
                 )
             user.password = make_password(supplied)
+            # ⚠ A RESET RE-ARMS THE FORCED CHANGE. The admin now knows this member's
+            # password; without this the member would keep working under a credential
+            # someone else chose, which is the state the whole mechanism exists to
+            # end. It re-arms on every reset, not only the first.
+            user.must_change_password = True
             changed.append("password")
 
         if changed:
@@ -1680,3 +1737,57 @@ class VendorWorkOrderCompleteView(VendorAPIView):
                 {"doc_type": d.doc_type, "filename": d.filename} for d in documents
             ],
         }, status=http.HTTP_201_CREATED)
+
+
+class VendorPasswordView(VendorAPIView):
+    """POST /v1/me/password/ -- the signed-in member replaces their own password.
+
+    ⚠ ALLOWED WHILE must_change_password IS SET, and it is the only endpoint that is
+    (besides /me/). Otherwise the forced change would be a deadlock: every call 403s
+    until the password is changed, and changing it is a call.
+
+    The CURRENT password is required even so. The temporary one arrived by email, so
+    anyone reading that inbox holds it; asking for it again means a stolen token alone
+    cannot lock the real member out of their own account.
+    """
+
+    ALLOW_PENDING_PASSWORD = True
+    MIN_LENGTH = 8
+
+    def post(self, request):
+        from django.contrib.auth.hashers import check_password, make_password
+
+        data = request.data or {}
+        current = data.get("current_password") or ""
+        # ⚠ NEVER STRIP A PASSWORD ON THE WAY IN. A leading or trailing space is a
+        # legitimate character, so trimming it silently stores something different
+        # from what the member typed -- and they then cannot sign in with the password
+        # they chose. Trim only to DECIDE whether anything was supplied.
+        # An existing source-scanning test enforces this shape across both modules,
+        # because the original bug was one .strip() among four similar places.
+        _raw = data.get("new_password") or ""
+        new = _raw if _raw.strip() else ""
+        user = request.user.vendor_user
+
+        if not check_password(current, user.password or ""):
+            return error(
+                "wrong_password", "That is not your current password.",
+                http.HTTP_401_UNAUTHORIZED,
+            )
+        if len(new) < self.MIN_LENGTH:
+            return error(
+                "password_too_short",
+                f"Choose at least {self.MIN_LENGTH} characters.",
+            )
+        if check_password(new, user.password or ""):
+            # Otherwise "change your password" is satisfied by retyping the one that
+            # was emailed, which is the thing this exists to get rid of.
+            return error(
+                "password_unchanged", "Choose a password you have not used here.",
+            )
+
+        user.password = make_password(new)
+        user.must_change_password = False
+        user.save(update_fields=["password", "must_change_password", "updated_at"])
+        logger.info("vendor user %s changed their password", user.vendor_user_id)
+        return Response({"ok": True, "must_change_password": False})

@@ -9,6 +9,7 @@ exist, not because it is forbidden.
 from django.urls import path
 
 from .views import (
+    VendorPasswordView,
     VendorWorkOrderCompleteView,
     VendorWorkOrderStartView,
     VendorAssessmentSaveView,
@@ -47,6 +48,10 @@ urlpatterns = [
         "v1/company/logo/", VendorLogoView.as_view(), name="vendor-company-logo",
     ),
     path("v1/me/", VendorMeView.as_view(), name="vendor-me"),
+    path(
+        "v1/me/password/",
+        VendorPasswordView.as_view(), name="vendor-password",
+    ),
     path("v1/dashboard/", VendorDashboardView.as_view(), name="vendor-dashboard"),
     path("v1/team/", VendorTeamListView.as_view(), name="vendor-team-list"),
     path(
