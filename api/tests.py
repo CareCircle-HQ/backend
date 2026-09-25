@@ -42772,3 +42772,97 @@ class MemberDeliveryHistoryTest(TestCase):
                 "/v1/me/deliveries/history/", HTTP_HOST=MEMBER_HOST,
             ).status_code, 403,
         )
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberDeliveryPhotosTest(TestCase):
+    """Proof of delivery, and who may see it."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import (
+            Client, DeliveryOrder, Household, HouseholdMember, PurchaseOrder,
+        )
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Pho", last_name="Tos",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Tos HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3055556666",
+            mobile_app_password=make_password("x" * 10),
+        )
+        self.order = DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.create(),
+            member=self.client_rec, quantity=7, status="delivered",
+            expected_delivery_date=timezone.localdate(),
+            delivered_at=timezone.now(),
+        )
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _proof(self, order=None, key="proofs/a.jpg"):
+        from .models import DeliveryOrderProof
+
+        return DeliveryOrderProof.objects.create(
+            delivery_order=order or self.order, s3_key=key,
+            content_hash=uuid.uuid4().hex, content_type="image/jpeg",
+            delivered_at=timezone.now(), note="Left at front door",
+        )
+
+    def _get(self, order=None):
+        oid = (order or self.order).delivery_order_id
+        return self.api.get(
+            f"/v1/me/deliveries/{oid}/photos/", HTTP_HOST=MEMBER_HOST,
+        )
+
+    def test_ANOTHER_members_delivery_is_404_not_a_leak(self):
+        """⚠ THE ONE THAT MATTERS. The delivery id comes from the client, so a lookup
+        without the member filter would let any signed-in member read any other
+        member's DOORSTEP PHOTOGRAPHS by changing a uuid -- their front door, house
+        number, and sometimes them."""
+        from .models import Client, DeliveryOrder, PurchaseOrder
+
+        other = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Oth", last_name="Er",
+            client_added_at=timezone.now(),
+        )
+        their_order = DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.create(),
+            member=other, quantity=7, status="delivered",
+            expected_delivery_date=timezone.localdate(),
+        )
+        self._proof(order=their_order, key="proofs/theirs.jpg")
+        self.assertEqual(self._get(order=their_order).status_code, 404)
+
+    def test_a_delivery_with_no_proofs_returns_an_empty_list(self):
+        """⚠ THE NORMAL CASE TODAY: DeliveryOrderProof holds ZERO rows against
+        472,628 delivery orders."""
+        r = self._get()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["photos"], [])
+        self.assertTrue(r.data["delivery"]["confirmed"])
+
+    def test_a_proof_with_NO_s3_key_is_skipped_not_rendered_broken(self):
+        """A row with nothing to sign would become a broken image."""
+        self._proof(key="")
+        self.assertEqual(self._get().data["photos"], [])
+
+    def test_a_nonexistent_delivery_is_404(self):
+        r = self.api.get(
+            f"/v1/me/deliveries/{uuid.uuid4()}/photos/", HTTP_HOST=MEMBER_HOST,
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_it_is_refused_while_the_password_change_is_pending(self):
+        from .models import HouseholdMember
+
+        HouseholdMember.objects.filter(pk=self.member.pk).update(
+            mobile_app_must_change_password=True,
+        )
+        self.assertEqual(self._get().status_code, 403)

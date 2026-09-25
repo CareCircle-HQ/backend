@@ -705,3 +705,81 @@ class MemberDeliveryHistoryView(MemberAPIView):
                 ),
             },
         })
+
+
+class MemberDeliveryPhotosView(MemberAPIView):
+    """GET /v1/me/deliveries/<delivery_id>/photos/ -- proof that food arrived.
+
+    ⚠ SHORT-LIVED SIGNED URLS, NEVER A PUBLIC ONE. A proof-of-delivery photograph
+    shows a member's front door, and often their street number and sometimes them.
+    A public S3 URL is forever and is guessable across members; a 15-minute presigned
+    link expires with the screen. This is what D4 asked and it is the same mechanism
+    the vendor documents already use.
+
+    ⚠ AND THE ORDER IS RE-SCOPED TO THE MEMBER, not merely looked up. The delivery id
+    comes from the client, so fetching it without the member filter would let any
+    signed-in member read any other member's doorstep photographs by changing a uuid.
+
+    ⚠ THERE ARE CURRENTLY NO PROOFS AT ALL -- DeliveryOrderProof holds ZERO rows
+    against 472,628 delivery orders, and nothing has ever written one despite
+    ``services.pod_ingest`` being wired to both the CSV importer and the partner API.
+    So this endpoint is correct and will return an empty list for every member until
+    a delivery company actually sends one. That is a pipeline question, not a reason
+    to leave the screen unbuilt.
+    """
+
+    PRESIGN_SECONDS = 900
+
+    def get(self, request, delivery_id):
+        from ..models import DeliveryOrder
+        from ..services import import_storage
+
+        client = request.user.client
+        order = (
+            DeliveryOrder.objects
+            .filter(delivery_order_id=delivery_id, member=client)
+            .first()
+            if client is not None else None
+        )
+        if order is None:
+            # 404 rather than 403: whether a delivery id exists is not something a
+            # member needs told about somebody else's order.
+            return error("not_found", "No such delivery.", http.HTTP_404_NOT_FOUND)
+
+        photos = []
+        for proof in order.proofs.all().order_by("created_at"):
+            url = ""
+            if proof.s3_key:
+                try:
+                    url = import_storage.presign_get(
+                        proof.s3_key, expires=self.PRESIGN_SECONDS, inline=True,
+                        download_name=f"delivery-{order.expected_delivery_date}.jpg",
+                        content_type=proof.content_type or "image/jpeg",
+                    )
+                except Exception:  # noqa: BLE001 - one bad key must not lose the rest
+                    logger.warning(
+                        "member photos: could not presign %s", proof.s3_key,
+                    )
+            if not url:
+                continue
+            photos.append({
+                "id": str(proof.id),
+                "url": url,
+                # Named so the app can say "expired, pull to refresh" rather than
+                # showing a broken image when a member leaves the screen open.
+                "expires_in": self.PRESIGN_SECONDS,
+                "taken_at": proof.delivered_at or proof.created_at,
+                "note": (proof.note or "").strip(),
+            })
+
+        return Response({
+            "delivery": {
+                "id": str(order.delivery_order_id),
+                "date": order.expected_delivery_date,
+                "delivered_at": order.delivered_at,
+                "quantity": order.quantity,
+                "status": order.status,
+                "confirmed": order.delivered_at is not None,
+            },
+            "photos": photos,
+        })
