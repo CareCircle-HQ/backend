@@ -147,6 +147,42 @@ def assessment_price(vendor=None):
     return item.vendor_price
 
 
+def apply_vendor_prices(schema, vendor):
+    """Stamp each intervention option with THIS vendor's price, in place.
+
+    ⚠ IT WALKS ``schema["categories"][*]["groups"][*]["options"]`` -- the shape
+    ``DispatchQuestionnaire.schema()`` actually produces. The vendor payload used to
+    walk ``schema["modules"][*]["intervention_groups"]``, which does not exist in that
+    dict, so the loop ran ZERO times and every option reached the app with no price.
+    The app reads ``Number(o.vendor_price ?? 0)``, so unpriced means FREE: a vendor
+    could add 100 products and still be told they were within the funding limit.
+
+    Both halves failed silently. ``.get("modules", [])`` returns ``[]`` rather than
+    raising, and a missing price is indistinguishable from a zero one downstream.
+    Nothing logged and nothing 500'd -- the only symptom was a cap that never tripped.
+
+    Extracted from the view so the walk can be tested against a literal schema, which
+    is the only way to catch "iterates the wrong key": a fixture-free test over a dict
+    whose shape is written down in the test itself.
+
+    Returns the number of options priced, so a caller can assert it found something.
+    """
+    prices = {
+        r["option_code"]: r["price"]
+        for r in price_list_for(vendor) if r["option_code"]
+    }
+    priced = 0
+    for category in schema.get("categories", []) or []:
+        for group in category.get("groups", []) or []:
+            for option in group.get("options", []) or []:
+                # Absent rather than zero when unpriced: a missing price is something
+                # to ask about, and "$0.00" reads as free.
+                option["vendor_price"] = prices.get(option.get("code"))
+                if option["vendor_price"] is not None:
+                    priced += 1
+    return priced
+
+
 def cap_status(vendor, interventions):
     """How the recommended items stand against the cap.
 

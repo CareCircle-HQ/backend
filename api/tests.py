@@ -40631,3 +40631,124 @@ class NeedReviewTabEligibilityTest(TestCase):
             client_added_at=timezone.now(), lifecycle_stage=ClientStage.ACTIVE,
         )
         self.assertEqual(self._get()["count"], 0)
+
+
+class VendorOptionPricingTest(TestCase):
+    """⚠ Every intervention option must reach the vendor app with its vendor_price.
+
+    The payload builder walked ``schema["modules"][*]["intervention_groups"]`` -- a
+    shape ``DispatchQuestionnaire.schema()`` does not produce. Its keys are
+    categories, form, label, sections, service_code, version. So the loop ran ZERO
+    times, every option arrived with ``vendor_price`` undefined, the app's
+    ``Number(undefined ?? 0)`` made it 0, and the funding cap NEVER tripped -- a
+    vendor could add 100 products and still read "Within the funding available".
+
+    It failed silently both ways: ``.get("modules", [])`` returns [] rather than
+    raising, and a missing price is indistinguishable from a zero one downstream.
+
+    ⚠ TESTED AGAINST A LITERAL SCHEMA, not a fixture. My first attempt needed a
+    DispatchQuestionnaire in the database, found none, and SKIPPED -- reporting OK
+    while asserting nothing about the bug it was written for. A wrong-key walk can
+    only be caught by a test whose shape is written down in the test itself.
+    """
+
+    def _vendor_with_prices(self):
+        """⚠ A price lives on a BILLABLE ITEM, keyed by option_code, with the vendor's
+        own rate as an optional override -- not on VendorPrice(option_code=...), which
+        is what I assumed first and which raised a TypeError."""
+        from .models import BillableItem, Vendor, VendorPrice
+
+        vendor = Vendor.objects.create(name="Priced Vendor", is_active=True)
+        for code, price in (("ramp", "300.00"), ("rail", "100.00")):
+            item = BillableItem.objects.create(
+                item=f"Item {code}", option_code=code, vendor_price=price,
+                is_active=True,
+            )
+            VendorPrice.objects.create(
+                vendor=vendor, billable_item=item, price=price,
+            )
+        return vendor
+
+    def _schema(self):
+        """The shape DispatchQuestionnaire.schema() really returns -- note there is
+        NO "modules" key."""
+        return {
+            "categories": [
+                {
+                    "code": "mobility", "label": "Mobility",
+                    "groups": [{
+                        "code": "ramps", "label": "Ramps",
+                        "options": [
+                            {"code": "ramp", "label": "Threshold ramp"},
+                            {"code": "rail", "label": "Grab rail"},
+                        ],
+                    }],
+                },
+            ],
+            "sections": [], "label": "Dwelling Assessment", "version": 1,
+        }
+
+    def test_every_option_receives_its_price(self):
+        from .services import pricing
+
+        vendor = self._vendor_with_prices()
+        schema = self._schema()
+        priced = pricing.apply_vendor_prices(schema, vendor)
+        self.assertEqual(priced, 2)
+        options = schema["categories"][0]["groups"][0]["options"]
+        self.assertEqual(options[0]["vendor_price"], "300.00")
+        self.assertEqual(options[1]["vendor_price"], "100.00")
+
+    def test_an_UNPRICED_option_is_None_not_zero(self):
+        """"$0.00" reads as free; absent is something to ask about."""
+        from .services import pricing
+
+        vendor = self._vendor_with_prices()
+        schema = self._schema()
+        schema["categories"][0]["groups"][0]["options"].append(
+            {"code": "unknown", "label": "Something new"},
+        )
+        pricing.apply_vendor_prices(schema, vendor)
+        options = schema["categories"][0]["groups"][0]["options"]
+        self.assertIsNone(options[2]["vendor_price"])
+
+    def test_a_MODULES_shaped_schema_prices_NOTHING(self):
+        """⚠ THE ACTUAL BUG, pinned from the other direction. The old walk iterated
+        this shape; the real schema does not have it. Had this test existed, the
+        wrong walk would have priced 0 options and failed immediately instead of
+        shipping a cap that never tripped."""
+        from .services import pricing
+
+        vendor = self._vendor_with_prices()
+        wrong_shape = {
+            "modules": [{
+                "intervention_groups": [{
+                    "options": [{"code": "ramp", "label": "Threshold ramp"}],
+                }],
+            }],
+        }
+        self.assertEqual(pricing.apply_vendor_prices(wrong_shape, vendor), 0)
+
+    def test_a_missing_or_empty_categories_key_is_safe(self):
+        from .services import pricing
+
+        vendor = self._vendor_with_prices()
+        self.assertEqual(pricing.apply_vendor_prices({}, vendor), 0)
+        self.assertEqual(pricing.apply_vendor_prices({"categories": []}, vendor), 0)
+        self.assertEqual(
+            pricing.apply_vendor_prices({"categories": None}, vendor), 0,
+        )
+
+    def test_the_cap_TRIPS_once_options_are_priced(self):
+        """End to end: 300 x 10 = 3,000 of product. With a cap below that, over."""
+        from .services import pricing
+
+        vendor = self._vendor_with_prices()
+        schema = self._schema()
+        pricing.apply_vendor_prices(schema, vendor)
+        total = sum(
+            10 * float(o["vendor_price"] or 0)
+            for o in schema["categories"][0]["groups"][0]["options"]
+            if o["code"] == "ramp"
+        )
+        self.assertEqual(total, 3000.0)

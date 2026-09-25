@@ -338,17 +338,10 @@ class VendorWorkDetailView(VendorAPIView):
             # The vendor sees ONLY their own price -- never the admin fee or what we
             # bill Unite Us. That is our margin, and putting it on their device
             # would be handing a supplier our mark-up.
-            prices = {
-                r["option_code"]: r["price"]
-                for r in pricing.price_list_for(order.vendor)
-                if r["option_code"]
-            }
-            for module in schema.get("modules", []):
-                for group in module.get("intervention_groups", []):
-                    for option in group.get("options", []):
-                        # Absent rather than zero when unpriced: a missing price is
-                        # something to ask about, and "$0.00" reads as free.
-                        option["vendor_price"] = prices.get(option["code"])
+            # In pricing.apply_vendor_prices so the WALK can be tested against a
+            # literal schema -- this used to iterate a key the schema does not have,
+            # silently pricing nothing and leaving the funding cap unable to trip.
+            pricing.apply_vendor_prices(schema, order.vendor)
 
             # THE CAP, as flags and a budget the app can compute against -- never
             # as a running total we render. The app already holds each option's
