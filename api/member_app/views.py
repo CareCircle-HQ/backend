@@ -738,6 +738,7 @@ class MemberDeliveryPhotosView(MemberAPIView):
         order = (
             DeliveryOrder.objects
             .filter(delivery_order_id=delivery_id, member=client)
+            .select_related("menu_type")
             .first()
             if client is not None else None
         )
@@ -780,6 +781,11 @@ class MemberDeliveryPhotosView(MemberAPIView):
                 "quantity": order.quantity,
                 "status": order.status,
                 "confirmed": order.delivered_at is not None,
+                # For the detail screen: the same descriptors the list shows, so
+                # opening a row does not lose information the member could already see.
+                "menu_type": str(order.menu_type) if order.menu_type_id else "",
+                "meal_type": (order.kitchen_meal_type or "").strip(),
+                "note": (order.delivery_note or "").strip(),
             },
             "photos": photos,
         })
