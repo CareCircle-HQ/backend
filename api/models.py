@@ -6093,6 +6093,44 @@ class DispatchItem(models.Model):
             and self.dispatch_order_id is None
         )
 
+    @property
+    def unavailable_reason(self):
+        """WHY this item cannot be dispatched, or "" when it can.
+
+        ⚠ THE UI USED TO GUESS. The Work Orders panel counted "approved but not
+        available" and captioned the number "already in a work order" -- a single
+        cause for three different ones. MIRIAM ISRAEL had 9 approved items, NONE
+        dispatched, all with authorizations that lapsed on 2026-09-18, and the panel
+        said they were already in a work order. The information was here; the caption
+        invented an explanation for it.
+
+        One property, so the serializer, the error message raised by
+        create_work_order and the panel all say the same thing.
+        """
+        if self.dispatch_order_id:
+            return "already in a work order"
+        if not self.is_approved:
+            return self.authorization_status or "no authorization"
+        if self.authorization_expired:
+            _start, end = self.authorization_window
+            return f"authorization expired {end:%b %-d, %Y}" if end else "not authorized"
+        return ""
+
+    @property
+    def expired_only(self):
+        """Approved and undispatched, blocked SOLELY by a lapsed window.
+
+        Separated because it is the one unavailable state an agent may legitimately
+        override: the work still has to happen, and Unite Us routinely leaves a case
+        open past its authorization window. Unapproved or already-dispatched items are
+        never overridable -- the first is unfunded and the second is double-dispatch.
+        """
+        return (
+            self.is_approved
+            and self.dispatch_order_id is None
+            and self.authorization_expired
+        )
+
 
 class DispatchAvailabilityWindow(models.Model):
     """A window the MEMBER offered. Not the appointment.

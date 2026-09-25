@@ -28985,7 +28985,12 @@ class ItemAuthorizationWindowTest(TestCase):
             dispatch.create_work_order(assessment, [item.dispatch_item_id])
         msg = str(ctx.exception)
         self.assertIn("authorization expired", msg)
-        self.assertIn(ends.strftime("%Y-%m-%d"), msg)
+        # ⚠ FORMAT CHANGED from ISO to "Sep 22, 2026". The reason string moved onto
+        # DispatchItem.unavailable_reason so the panel, the serializer and this error
+        # could stop describing the same item three different ways -- and the panel
+        # shows it to an agent verbatim, where "2026-09-22" reads like a log line.
+        # The assertion this replaces pinned strftime("%Y-%m-%d").
+        self.assertIn(ends.strftime("%b %-d, %Y"), msg)
 
     def test_NO_end_date_is_not_treated_as_expired(self):
         """An approved case with no window exported is a gap in the SOURCE data.
@@ -40752,3 +40757,171 @@ class VendorOptionPricingTest(TestCase):
             if o["code"] == "ramp"
         )
         self.assertEqual(total, 3000.0)
+
+
+class WorkOrderExpiredAuthorizationTest(TestCase):
+    """Dispatching an item whose authorization window has lapsed.
+
+    ⚠ MIRIAM ISRAEL could not be given a work order at all. She held 9 approved,
+    undispatched devices on OPEN cases, every authorization window having ended
+    2026-09-18, and ``is_available`` requires an unexpired window -- so the panel
+    hid the New Work Order button entirely and captioned the 9 items "already in a
+    work order", which was true of none of them.
+
+    The window rule is right: installing against a lapsed authorization is unbilled
+    work. But Unite Us routinely leaves a Home Remediation case open past its window
+    and the devices still have to be fitted, so it is an OVERRIDE -- opt-in, recorded
+    on the order -- rather than a block.
+    """
+
+    def _setup(self, *, end_days=-7, approved=True, dispatched=False):
+        from django.utils import timezone
+
+        from .models import (
+            Case, CaseStatus, CaseType, Client, DispatchItem, DispatchKind,
+            DispatchOrder, DispatchStatus,
+        )
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Mira", last_name="Item",
+            client_added_at=timezone.now(),
+        )
+        assessment = DispatchOrder.objects.create(
+            kind=DispatchKind.ASSESSMENT, client=client,
+            status=DispatchStatus.SUBMITTED,
+        )
+        case = Case.objects.create(
+            # ⚠ INTERNAL_SERVICE, not a housing-specific type -- there isn't one.
+            # CaseType is navigation / external_service / internal_service /
+            # eligibility, and a Home Remediation case is internal_service with a
+            # housing service_type. MIRIAM's real cases confirm it.
+            case_id=uuid.uuid4(), client=client, case_type=CaseType.INTERNAL_SERVICE,
+            case_status=CaseStatus.OPEN,
+            service_type="Home Expense Assistance/Repairs",
+            program_name="Home Remediation - Brooklyn",
+            case_created_at=timezone.now(), date_opened=timezone.now(),
+            service_authorization_status="approved" if approved else "denied",
+            # ⚠ The APPROVAL window, not a "service_authorization_start/end" pair --
+            # those do not exist. effective_authorization_window() reads
+            # ...approval_starts_at / ...approval_ends_at.
+            service_authorization_approval_starts_at=(
+                timezone.now() - timezone.timedelta(days=38)
+            ),
+            service_authorization_approval_ends_at=(
+                timezone.now() + timezone.timedelta(days=end_days)
+            ),
+        )
+        wo = None
+        if dispatched:
+            wo = DispatchOrder.objects.create(
+                kind=DispatchKind.REMEDIATION, client=client, parent=assessment,
+                status=DispatchStatus.PENDING_SCHEDULE,
+            )
+        item = DispatchItem.objects.create(
+            assessment=assessment, case=case, item="Air Conditioner",
+            location="Brooklyn", program_name="Home Remediation - Brooklyn",
+            dispatch_order=wo,
+        )
+        return assessment, item
+
+    # ── the reason, which the panel used to invent ──────────────────────────
+    def test_an_EXPIRED_item_says_so_rather_than_already_dispatched(self):
+        """⚠ The exact wrong caption: MIRIAM's 9 expired items were reported as
+        already being in a work order."""
+        _a, item = self._setup(end_days=-7)
+        self.assertFalse(item.is_available)
+        self.assertTrue(item.expired_only)
+        self.assertIn("authorization expired", item.unavailable_reason)
+
+    def test_an_ALREADY_DISPATCHED_item_says_that(self):
+        _a, item = self._setup(end_days=+7, dispatched=True)
+        self.assertEqual(item.unavailable_reason, "already in a work order")
+        self.assertFalse(item.expired_only)
+
+    def test_an_UNAPPROVED_item_says_that(self):
+        _a, item = self._setup(end_days=+7, approved=False)
+        self.assertEqual(item.unavailable_reason, "denied")
+        self.assertFalse(item.expired_only)
+
+    def test_a_dispatchable_item_has_NO_reason(self):
+        _a, item = self._setup(end_days=+7)
+        self.assertTrue(item.is_available)
+        self.assertEqual(item.unavailable_reason, "")
+        self.assertFalse(item.expired_only)
+
+    # ── the override ───────────────────────────────────────────────────────
+    def test_WITHOUT_the_override_an_expired_item_is_refused(self):
+        from .services import dispatch as dispatch_svc
+
+        assessment, item = self._setup(end_days=-7)
+        with self.assertRaises(ValueError) as ctx:
+            dispatch_svc.create_work_order(assessment, [str(item.dispatch_item_id)])
+        self.assertIn("authorization expired", str(ctx.exception))
+
+    def test_WITH_the_override_it_is_dispatched(self):
+        from .services import dispatch as dispatch_svc
+
+        assessment, item = self._setup(end_days=-7)
+        order = dispatch_svc.create_work_order(
+            assessment, [str(item.dispatch_item_id)], allow_expired=True,
+        )
+        item.refresh_from_db()
+        self.assertEqual(item.dispatch_order_id, order.pk)
+
+    def test_the_override_is_NAMED_in_the_notes_a_human_reads(self):
+        """Recorded in audit metadata alone it would be discoverable but not
+        visible, and this is a billing conversation waiting to happen."""
+        from .services import dispatch as dispatch_svc
+
+        assessment, item = self._setup(end_days=-7)
+        order = dispatch_svc.create_work_order(
+            assessment, [str(item.dispatch_item_id)], allow_expired=True,
+        )
+        self.assertIn("EXPIRED authorization", order.notes)
+        self.assertIn("Air Conditioner", order.notes)
+
+    def test_the_override_PRESERVES_the_agents_own_notes(self):
+        from .services import dispatch as dispatch_svc
+
+        assessment, item = self._setup(end_days=-7)
+        order = dispatch_svc.create_work_order(
+            assessment, [str(item.dispatch_item_id)], allow_expired=True,
+            notes="Call before arriving.",
+        )
+        self.assertIn("Call before arriving.", order.notes)
+        self.assertIn("EXPIRED authorization", order.notes)
+
+    def test_the_override_does_NOT_admit_an_unapproved_item(self):
+        """⚠ Not a judgement call: unapproved is unfunded."""
+        from .services import dispatch as dispatch_svc
+
+        assessment, item = self._setup(end_days=-7, approved=False)
+        with self.assertRaises(ValueError) as ctx:
+            dispatch_svc.create_work_order(
+                assessment, [str(item.dispatch_item_id)], allow_expired=True,
+            )
+        self.assertIn("denied", str(ctx.exception))
+
+    def test_the_override_does_NOT_admit_an_already_dispatched_item(self):
+        """⚠ Not a judgement call either: that is double-dispatch."""
+        from .services import dispatch as dispatch_svc
+
+        assessment, item = self._setup(end_days=-7, dispatched=True)
+        with self.assertRaises(ValueError) as ctx:
+            dispatch_svc.create_work_order(
+                assessment, [str(item.dispatch_item_id)], allow_expired=True,
+            )
+        self.assertIn("already in a work order", str(ctx.exception))
+
+    def test_a_normal_dispatch_records_NO_override(self):
+        """So the flag's PRESENCE is the signal, in notes and in metadata."""
+        from .models import StageEvent
+        from .services import dispatch as dispatch_svc
+
+        assessment, item = self._setup(end_days=+7)
+        order = dispatch_svc.create_work_order(
+            assessment, [str(item.dispatch_item_id)], allow_expired=True,
+        )
+        self.assertNotIn("EXPIRED", order.notes or "")
+        ev = StageEvent.objects.filter(dispatch_order=order).first()
+        self.assertEqual((ev.metadata or {}).get("expired_override"), [])

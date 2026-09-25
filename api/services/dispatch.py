@@ -368,7 +368,7 @@ def adopt_unlinked_remediation_cases(assessment):
 
 @transaction.atomic
 def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes="",
-                      agent=None):
+                      agent=None, allow_expired=False):
     """Assemble a work order from approved, undispatched items.
 
     Raises ValueError naming the offending items rather than silently dropping
@@ -379,6 +379,18 @@ def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""
     and not already dispatched. Checked here rather than trusted from the request,
     because the selection list an agent saw may be seconds stale -- and an
     authorization window can lapse between loading the page and submitting it.
+
+    ``allow_expired`` admits items blocked SOLELY by a lapsed authorization window.
+
+    ⚠ A DELIBERATE OVERRIDE, NOT A RELAXATION. Unite Us routinely leaves a Home
+    Remediation case open past its window, and the work still has to happen -- MIRIAM
+    ISRAEL had 9 approved devices, every window ended 2026-09-18, and the panel
+    offered no way to dispatch any of them. Installing against a lapsed window is a
+    BILLING RISK, so it is opt-in per request and named in the order's notes rather
+    than done quietly.
+
+    It never admits an UNAPPROVED item (unfunded) or an ALREADY-DISPATCHED one
+    (double-dispatch). Those are not judgement calls.
     """
     from api.models import DispatchItem, DispatchKind, DispatchOrder
 
@@ -396,18 +408,33 @@ def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""
     if missing:
         raise ValueError(f"unknown item(s): {', '.join(sorted(missing))}")
 
-    unavailable = [i for i in items if not i.is_available]
+    # The reason lives on the model, so this error, the serializer and the panel
+    # cannot describe the same item three different ways.
+    unavailable = [
+        i for i in items
+        if not i.is_available and not (allow_expired and i.expired_only)
+    ]
     if unavailable:
-        def _reason(i):
-            if i.dispatch_order_id:
-                return "already in a work order"
-            if not i.is_approved:
-                return i.authorization_status or "no authorization"
-            _s, end = i.authorization_window
-            return f"authorization expired {end:%Y-%m-%d}" if end else "not authorized"
-
-        why = ", ".join(f"{i.item or i.case_id} ({_reason(i)})" for i in unavailable)
+        why = ", ".join(
+            f"{i.item or i.case_id} ({i.unavailable_reason})" for i in unavailable
+        )
         raise ValueError(f"cannot dispatch: {why}")
+
+    # Which ones went out on an expired authorization. Recorded, because the whole
+    # justification for allowing the override is that it is visible afterwards.
+    overridden = [i for i in items if i.expired_only] if allow_expired else []
+
+    # ⚠ THE OVERRIDE GOES IN THE NOTES A HUMAN READS, not only the audit metadata.
+    # Recorded in metadata alone it would be discoverable but not visible, and an
+    # expired-authorization dispatch is a billing conversation waiting to happen.
+    order_notes = notes
+    if overridden:
+        detail = ", ".join(
+            f"{i.item} (ended {i.authorization_window[1]:%b %-d, %Y})"
+            for i in overridden
+        )
+        line = f"Dispatched on an EXPIRED authorization: {detail}."
+        order_notes = f"{notes}\n\n{line}" if notes else line
 
     # One borough per work order: a vendor visit is a trip to an address, and the
     # items all belong to the same dwelling anyway. Mixed boroughs would mean the
@@ -420,7 +447,7 @@ def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""
         vendor=vendor or assessment.vendor,
         location=locations.pop() if len(locations) == 1 else "",
         status=DispatchStatus.PENDING_SCHEDULE,
-        notes=notes,
+        notes=order_notes,
         # Inherited, not copied: the address was verified once on the assessment.
     )
     DispatchItem.objects.filter(
@@ -435,6 +462,8 @@ def create_work_order(assessment, item_ids, *, vendor=None, actor=None, notes=""
             "items": [i.item for i in items],
             "item_ids": [str(i.dispatch_item_id) for i in items],
             "case_ids": [str(i.case_id) for i in items],
+            # Empty on a normal dispatch, so its presence IS the flag.
+            "expired_override": [str(i.dispatch_item_id) for i in overridden],
         },
     )
     return order

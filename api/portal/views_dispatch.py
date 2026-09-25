@@ -76,6 +76,11 @@ def _serialize_item(row):
             str(row.dispatch_order_id) if row.dispatch_order_id else None
         ),
         "available": row.is_available,
+        # WHY it is unavailable, computed once on the model. The panel used to
+        # caption every unavailable-but-approved item "already in a work order".
+        "unavailable_reason": row.unavailable_reason,
+        # Overridable: approved and undispatched, blocked only by a lapsed window.
+        "expired_only": row.expired_only,
     }
 
 
@@ -624,6 +629,9 @@ class MemberWorkOrderCreateView(PortalAPIView):
                 actor=getattr(request, "user", None),
                 agent=current_agent(request),
                 notes=(data.get("notes") or "").strip(),
+                # Opt-in per request. Absent means the strict rule applies, so an
+                # older client cannot dispatch against a lapsed window by accident.
+                allow_expired=bool(data.get("allow_expired")),
             )
         except ValueError as exc:
             # The message names the offending items, so an agent can see WHICH
