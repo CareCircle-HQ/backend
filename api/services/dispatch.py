@@ -610,6 +610,26 @@ def recommended_products(assessment):
     return categories
 
 
+def product_key(name):
+    """A product name reduced to something two sources can be compared on.
+
+    ⚠ THE TWO SOURCES DISAGREE ON PLURALS. ``BillableItem.billing_category`` says
+    "Air Filtration DeviceS"; the housing case is named "Home Remediation - Air
+    Filtration Device - Queens". Compared exactly, that product is never recognised as
+    recommended -- which is a SILENT omission: the picker simply does not offer an
+    item the assessor asked for, and nothing errors.
+
+    Found on 2026-09-25 while building the member app's assessment screen, where the
+    same mismatch produced a duplicate row: once from the case and once from the
+    recommendation, spelled differently.
+
+    Lower-cased and de-pluralised rather than hard-coding the one known pair, because
+    the next catalogue entry will have the same problem and nobody will remember this.
+    """
+    key = (name or "").strip().lower()
+    return key[:-1] if key.endswith("s") else key
+
+
 def annotate_items_for_picker(assessment, items):
     """Mark which items the work-order picker should offer, and pre-tick.
 
@@ -639,10 +659,13 @@ def annotate_items_for_picker(assessment, items):
             item.recommended_qty = 0
         return {}
 
+    # Keyed on the normalised name -- see product_key.
+    wanted_by_key = {product_key(k): v for k, v in wanted.items()}
     by_category = {}
     for item in items:
-        item.recommended = item.item in wanted
-        item.recommended_qty = wanted.get(item.item, 0)
+        key = product_key(item.item)
+        item.recommended = key in wanted_by_key
+        item.recommended_qty = wanted_by_key.get(key, 0)
         item.preferred = False
         if item.recommended:
             by_category.setdefault(item.item, []).append(item)
@@ -657,7 +680,7 @@ def annotate_items_for_picker(assessment, items):
             -(i.created_at.timestamp() if i.created_at else 0),
         ))
         # As many as were recommended -- a quantity of 2 needs two cases.
-        for item in group[:max(1, wanted.get(category, 1))]:
+        for item in group[:max(1, wanted_by_key.get(product_key(category), 1))]:
             item.preferred = True
     return wanted
 

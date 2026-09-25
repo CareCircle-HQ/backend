@@ -404,7 +404,7 @@ BENEFIT_LABELS = {
     "Medically Tailored Meals": "Medically Tailored Meals",
     "Produce Prescription/Voucher": "Fresh Produce",
     "Home Expense Assistance/Repairs": "Home Repairs & Equipment",
-    "Environmental Exposure Assessment": "Home Assessment",
+    "Environmental Exposure Assessment": "Dwelling Assessment",
     "Environmental Modifications/Accessibility": "Home Modifications",
     "Food Pantry": "Food Pantry",
 }
@@ -880,4 +880,139 @@ class MemberDeliveryPhotosView(MemberAPIView):
                 "note": (order.delivery_note or "").strip(),
             },
             "photos": photos,
+        })
+
+
+class MemberAssessmentView(MemberAPIView):
+    """GET /v1/me/assessment/ -- what the assessor recommended, and where each item is.
+
+    Opened from the Dwelling Assessment card. The member's question after a visit is
+    "what did they say I need, and is it coming?", and until now nothing answered it.
+
+    ⚠ NO PRICES, EVER. The vendor's rates, the programme cap and the authorized amount
+    are all on these records and none of them belongs on a member's phone: the money is
+    between CareCircle, the vendor and the payer. The member needs the ITEM and its
+    STATE.
+
+    ⚠ AND NO DENIAL REASONS. `service_authorization_denial_reason` is payer language
+    written for an appeal, and a member reading "not medically necessary" about their
+    own home on a phone screen, with nobody to ask, is a cruelty. It says the item was
+    not approved and to contact CareCircle, which is the action that can actually help.
+    """
+
+    def get(self, request):
+        from ..models import DispatchItem, DispatchOrder
+        from ..services import dispatch as dispatch_svc
+
+        client = request.user.client
+        if client is None:
+            return Response({"assessment": None, "items": []})
+
+        order = (
+            DispatchOrder.objects
+            .filter(client=client, kind="assessment")
+            .exclude(status="cancelled")
+            .order_by("-created_at")
+            .first()
+        )
+        if order is None:
+            return Response({"assessment": None, "items": []})
+
+        visit = (
+            order.visits.filter(scheduled_for__isnull=False)
+            .order_by("-scheduled_for").first()
+        )
+        questionnaire = getattr(order, "questionnaire", None)
+        recommended = dispatch_svc.recommended_products(order)
+
+        # ⚠ ONE ROW PER PRODUCT, not per DispatchItem. James Bethea has TEN items for
+        # five products -- an open case and a closed one for each -- and listing them
+        # raw shows a member "Heater" twice with different answers. Grouped, the
+        # strongest state wins, because "one of your heaters is on its way" is the true
+        # and useful reading.
+        by_product = {}
+        for item in DispatchItem.objects.filter(
+            assessment=order,
+        ).select_related("dispatch_order", "case"):
+            g = by_product.setdefault(item.item, [])
+            g.append(item)
+
+        def state_of(items):
+            """The most advanced state across a product's items."""
+            best = ("recommended", "Recommended by the assessor.")
+            from django.utils import timezone as tz
+
+            for i in items:
+                wo = i.dispatch_order
+                if wo is None:
+                    pass
+                else:
+                    # ⚠ A FUTURE FITTING VISIT IS NOT AN INSTALLATION, however the
+                    # work order is filed. James Bethea's remediation order is
+                    # "submitted" with a visit on the 29th, read on the 25th -- so
+                    # this said "Installed." about four devices nobody had fitted yet.
+                    # The same trap as the benefits card, one endpoint later.
+                    upcoming = wo.visits.filter(
+                        scheduled_for__gt=tz.now(),
+                    ).exists()
+                    if upcoming:
+                        return ("scheduled", "A fitting visit is arranged.")
+                    if wo.status in {"submitted", "uploaded"}:
+                        return ("installed", "Installed.")
+                    return ("scheduled", "A fitting visit is being arranged.")
+                if i.is_approved and not i.authorization_expired:
+                    best = ("approved", "Approved. We are arranging the fitting.")
+                elif i.is_approved and best[0] == "recommended":
+                    best = ("approved", "Approved.")
+            if best[0] == "recommended" and items and not any(
+                i.is_approved for i in items
+            ):
+                return (
+                    "not_approved",
+                    "Not approved. Contact CareCircle if you have questions.",
+                )
+            return best
+
+        items = []
+        for product, group in sorted(by_product.items()):
+            state, note = state_of(group)
+            items.append({
+                "item": product,
+                # The assessor's recommended quantity where we have it; the number of
+                # funding cases otherwise.
+                "quantity": recommended.get(product) or 1,
+                "status": state,
+                "note": note,
+            })
+
+        # Products the assessor recommended that have no case at all yet -- otherwise a
+        # member sees four of the five things they were told about.
+        #
+        # ⚠ COMPARED ON product_key, NOT THE RAW NAME. billing_category says "Air
+        # Filtration DeviceS" while the case is "Air Filtration Device", so an exact
+        # comparison listed that product TWICE -- once from the case and once from the
+        # recommendation, spelled differently, with different statuses. The same
+        # mismatch was silently hiding the product in the CRM's work-order picker.
+        seen_keys = {dispatch_svc.product_key(p) for p in by_product}
+        for product, qty in recommended.items():
+            if dispatch_svc.product_key(product) not in seen_keys:
+                items.append({
+                    "item": product, "quantity": qty, "status": "recommended",
+                    "note": "Recommended by the assessor. We are arranging funding.",
+                })
+
+        return Response({
+            "assessment": {
+                "id": str(order.pk),
+                "status": order.status,
+                "visit_on": visit.scheduled_for if visit else None,
+                "completed": bool(
+                    questionnaire and questionnaire.state == "submitted",
+                ),
+                # ⚠ SAID PLAINLY when there is no recommendation recorded. An
+                # assessment taken on paper has no questionnaire, and an empty list
+                # would read as "the assessor found nothing wrong".
+                "has_recommendation": bool(recommended or by_product),
+            },
+            "items": items,
         })

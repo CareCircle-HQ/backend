@@ -14,7 +14,7 @@ from .views import (
 )
 from .views import (
     MemberBenefitsView, MemberDashboardView, MemberDeliveriesView,
-    MemberDeliveryHistoryView, MemberDeliveryPhotosView,
+    MemberAssessmentView, MemberDeliveryHistoryView, MemberDeliveryPhotosView,
 )
 
 urlpatterns = [
@@ -29,6 +29,10 @@ urlpatterns = [
     path(
         "v1/me/dashboard/",
         MemberDashboardView.as_view(), name="member-app-dashboard",
+    ),
+    path(
+        "v1/me/assessment/",
+        MemberAssessmentView.as_view(), name="member-app-assessment",
     ),
     path(
         "v1/me/benefits/",

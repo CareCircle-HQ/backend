@@ -43011,7 +43011,7 @@ class MemberHousingBenefitStatusTest(TestCase):
             )
         return order
 
-    def _card(self, name="Home Assessment"):
+    def _card(self, name="Dwelling Assessment"):
         cards = self.api.get(
             "/v1/me/benefits/", HTTP_HOST=MEMBER_HOST,
         ).data["benefits"]
@@ -43085,3 +43085,219 @@ class MemberHousingBenefitStatusTest(TestCase):
         meals = self._card("Medically Tailored Meals")
         self.assertIsNone(meals["visit_on"])
         self.assertEqual(meals["note"], "")
+
+
+class ProductKeyTest(TestCase):
+    """⚠ TWO SOURCES DISAGREE ON PLURALS, and it was hiding a product.
+
+    ``BillableItem.billing_category`` says "Air Filtration DeviceS"; the housing case
+    is "Home Remediation - Air Filtration Device - Queens". Compared exactly, that
+    product was NEVER recognised as recommended -- so the CRM's work-order picker
+    silently did not offer an item the assessor had asked for, and nothing errored.
+
+    Found while building the member app's assessment screen, where the same mismatch
+    listed the product TWICE with different statuses.
+    """
+
+    def test_the_known_mismatch_matches(self):
+        from .services.dispatch import product_key
+
+        self.assertEqual(
+            product_key("Air Filtration Devices"), product_key("Air Filtration Device"),
+        )
+
+    def test_it_is_case_and_space_insensitive(self):
+        from .services.dispatch import product_key
+
+        self.assertEqual(product_key("  air conditioner "), product_key("Air Conditioner"))
+
+    def test_DIFFERENT_products_do_not_collide(self):
+        """The de-pluralisation must not merge two real products."""
+        from .services.dispatch import product_key
+
+        for a, b in (
+            ("Heater", "Humidifier"),
+            ("De-humidifier", "Humidifier"),
+            ("Air Conditioner", "Air Filtration Devices"),
+        ):
+            with self.subTest(pair=(a, b)):
+                self.assertNotEqual(product_key(a), product_key(b))
+
+    def test_the_picker_now_recommends_the_plural_product(self):
+        """End to end: an assessment recommending "Air Filtration Devices" must mark an
+        "Air Filtration Device" case as recommended."""
+        from unittest.mock import patch
+
+        from .models import (
+            Case, Client, DispatchItem, DispatchOrder, Vendor,
+        )
+        from .services import dispatch as dispatch_svc
+
+        client = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Plu", last_name="Ral",
+            client_added_at=timezone.now(),
+        )
+        assessment = DispatchOrder.objects.create(
+            kind="assessment", client=client,
+            vendor=Vendor.objects.create(name="V", is_active=True),
+            status="submitted",
+        )
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=client, case_type="internal_service",
+            case_status="open", service_type="Home Expense Assistance/Repairs",
+            program_name="Home Remediation - Air Filtration Device - Queens",
+            case_created_at=timezone.now(), date_opened=timezone.now(),
+        )
+        item = DispatchItem.objects.create(
+            assessment=assessment, case=case, item="Air Filtration Device",
+            program_name=case.program_name,
+        )
+        with patch.object(
+            dispatch_svc, "recommended_products",
+            return_value={"Air Filtration Devices": 1},
+        ):
+            dispatch_svc.annotate_items_for_picker(assessment, [item])
+        self.assertTrue(item.recommended)
+        self.assertEqual(item.recommended_qty, 1)
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberAssessmentTest(TestCase):
+    """What the assessor recommended, and where each item is."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember, Vendor
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="Ass", last_name="Ess",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Ess HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3055552222",
+            mobile_app_password=make_password("x" * 10),
+        )
+        self.vendor = Vendor.objects.create(name="Fitters", is_active=True)
+        from .models import DispatchOrder
+
+        self.assessment = DispatchOrder.objects.create(
+            kind="assessment", client=self.client_rec, vendor=self.vendor,
+            status="submitted",
+        )
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _item(self, product, *, approved=True, work_order=None):
+        from .models import Case, DispatchItem
+
+        case = Case.objects.create(
+            case_id=uuid.uuid4(), client=self.client_rec,
+            case_type="internal_service", case_status="open",
+            service_type="Home Expense Assistance/Repairs",
+            program_name=f"Home Remediation - {product} - Queens",
+            service_authorization_status="approved" if approved else "denied",
+            case_created_at=timezone.now(), date_opened=timezone.now(),
+        )
+        return DispatchItem.objects.create(
+            assessment=self.assessment, case=case, item=product,
+            program_name=case.program_name, dispatch_order=work_order,
+        )
+
+    def _work_order(self, *, status, visit_in_days=None):
+        from datetime import timedelta
+
+        from .models import DispatchOrder, DispatchVisit
+
+        wo = DispatchOrder.objects.create(
+            kind="remediation", client=self.client_rec, vendor=self.vendor,
+            parent=self.assessment, status=status,
+        )
+        if visit_in_days is not None:
+            DispatchVisit.objects.create(
+                dispatch_order=wo,
+                scheduled_for=timezone.now() + timedelta(days=visit_in_days),
+            )
+        return wo
+
+    def _get(self):
+        return self.api.get("/v1/me/assessment/", HTTP_HOST=MEMBER_HOST).data
+
+    def test_TEN_items_for_five_products_become_five_rows(self):
+        """⚠ James Bethea has an OPEN and a CLOSED case for each of five products.
+        Listed raw a member sees "Heater" twice with different answers."""
+        for product in ("Heater", "Humidifier"):
+            self._item(product)
+            self._item(product, approved=False)
+        rows = self._get()["items"]
+        self.assertEqual(len(rows), 2)
+        self.assertCountEqual([r["item"] for r in rows], ["Heater", "Humidifier"])
+
+    def test_a_FUTURE_fitting_visit_is_not_an_installation(self):
+        """⚠ The work order can be "submitted" while the fitting is days away — James
+        Bethea's is, on the 29th, read on the 25th. This said "Installed." about four
+        devices nobody had fitted. The same trap as the benefits card, one endpoint
+        later."""
+        self._item("Heater", work_order=self._work_order(
+            status="submitted", visit_in_days=4,
+        ))
+        row = self._get()["items"][0]
+        self.assertEqual(row["status"], "scheduled")
+
+    def test_a_PAST_visit_on_a_submitted_work_order_is_installed(self):
+        self._item("Heater", work_order=self._work_order(
+            status="submitted", visit_in_days=-4,
+        ))
+        self.assertEqual(self._get()["items"][0]["status"], "installed")
+
+    def test_an_approved_item_with_no_work_order_reads_as_approved(self):
+        self._item("Heater")
+        self.assertEqual(self._get()["items"][0]["status"], "approved")
+
+    def test_a_DENIED_item_says_so_WITHOUT_the_payers_reason(self):
+        """⚠ Denial reasons are written for an appeal. A member reading "not medically
+        necessary" about their own home, on a phone, with nobody to ask, is a cruelty.
+        It names the action that can help instead."""
+        self._item("Heater", approved=False)
+        row = self._get()["items"][0]
+        self.assertEqual(row["status"], "not_approved")
+        self.assertIn("Contact CareCircle", row["note"])
+        self.assertNotIn("medically", row["note"].lower())
+
+    def test_NO_PRICES_ANYWHERE_in_the_payload(self):
+        """The vendor's rates, the programme cap and the authorized amount are all on
+        these records. None of them belongs on a member's phone."""
+        self._item("Heater")
+        body = str(self._get())
+        for banned in ("price", "amount", "cost", "cap", "rate"):
+            self.assertNotIn(banned, body.lower(), banned)
+
+    def test_a_member_with_NO_assessment_gets_null_not_an_error(self):
+        from .models import DispatchOrder
+
+        DispatchOrder.objects.filter(pk=self.assessment.pk).delete()
+        data = self._get()
+        self.assertIsNone(data["assessment"])
+        self.assertEqual(data["items"], [])
+
+    def test_an_assessment_with_NOTHING_recorded_says_so(self):
+        """⚠ An assessment taken on paper has no questionnaire. An empty list would
+        read as "the assessor found nothing wrong with your home"."""
+        data = self._get()
+        self.assertFalse(data["assessment"]["has_recommendation"])
+
+    def test_it_is_refused_while_the_password_change_is_pending(self):
+        from .models import HouseholdMember
+
+        HouseholdMember.objects.filter(pk=self.member.pk).update(
+            mobile_app_must_change_password=True,
+        )
+        self.assertEqual(
+            self.api.get(
+                "/v1/me/assessment/", HTTP_HOST=MEMBER_HOST,
+            ).status_code, 403,
+        )
