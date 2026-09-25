@@ -14,6 +14,7 @@ from .views import (
 )
 from .views import (
     MemberBenefitsView, MemberDashboardView, MemberDeliveriesView,
+    MemberDeliveryHistoryView,
 )
 
 urlpatterns = [
@@ -36,5 +37,9 @@ urlpatterns = [
     path(
         "v1/me/deliveries/",
         MemberDeliveriesView.as_view(), name="member-app-deliveries",
+    ),
+    path(
+        "v1/me/deliveries/history/",
+        MemberDeliveryHistoryView.as_view(), name="member-app-delivery-history",
     ),
 ]

@@ -618,3 +618,90 @@ class MemberDeliveriesView(MemberAPIView):
             # So the screen can say "no deliveries yet" rather than "none this month".
             "total": base.count(),
         })
+
+
+class MemberDeliveryHistoryView(MemberAPIView):
+    """GET /v1/me/deliveries/history/?limit=&offset= -- every delivery, newest first.
+
+    Separate from ``/me/deliveries/`` because it answers a different question. That
+    one is "what is happening with my food"; this is "what have I been sent", which a
+    member opens to check a specific week or to count what arrived.
+
+    ⚠ PAGINATED even though the heaviest member has only 292 deliveries. It is a
+    phone, often on cellular, and a member who wants the last month should not wait
+    for six years of history to arrive first.
+    """
+
+    DEFAULT_LIMIT = 50
+    MAX_LIMIT = 200
+
+    def get(self, request):
+        from ..models import DeliveryOrder
+
+        client = request.user.client
+        if client is None:
+            return Response({
+                "deliveries": [], "total": 0, "has_more": False, "summary": {},
+            })
+
+        try:
+            limit = min(int(request.query_params.get("limit", self.DEFAULT_LIMIT)),
+                        self.MAX_LIMIT)
+            offset = max(int(request.query_params.get("offset", 0)), 0)
+        except (TypeError, ValueError):
+            limit, offset = self.DEFAULT_LIMIT, 0
+
+        base = (
+            DeliveryOrder.objects
+            .filter(member=client)
+            .select_related("menu_type")
+            # ⚠ SECOND KEY ON THE ID. A member can have two orders on the SAME DATE --
+            # James Bethea has a cancelled and a live one on 18 Sep -- and without a
+            # tiebreak their order changes between pages, so a row can appear twice or
+            # not at all while scrolling.
+            .order_by("-expected_delivery_date", "-created_at")
+        )
+        total = base.count()
+        rows = base[offset:offset + limit]
+
+        # Counted over EVERYTHING, not the page: "14 delivered" must not change as
+        # the member scrolls.
+        from django.db.models import Count
+
+        # ⚠ .order_by() FIRST, TO CLEAR THE ORDERING. values().annotate() adds every
+        # ORDER BY field to the GROUP BY, so grouping a queryset ordered by
+        # (-expected_delivery_date, -created_at) counts one group PER ROW. The dict
+        # comprehension then kept the last group per status and reported
+        # "cancelled: 1" for a member with sixteen cancellations.
+        counts = {
+            r["status"]: r["n"] for r in
+            base.order_by().values("status").annotate(n=Count("delivery_order_id"))
+        }
+
+        return Response({
+            "deliveries": [
+                {
+                    "id": str(r.delivery_order_id),
+                    "date": r.expected_delivery_date,
+                    "delivered_at": r.delivered_at,
+                    "quantity": r.quantity,
+                    "status": r.status,
+                    "confirmed": r.delivered_at is not None,
+                    "menu_type": str(r.menu_type) if r.menu_type_id else "",
+                    "meal_type": (r.kitchen_meal_type or "").strip(),
+                }
+                for r in rows
+            ],
+            "total": total,
+            "has_more": offset + limit < total,
+            "summary": {
+                "delivered": counts.get("delivered", 0),
+                "cancelled": (
+                    counts.get("cancelled", 0) + counts.get("canceled", 0)
+                ),
+                "scheduled": sum(
+                    n for s, n in counts.items()
+                    if s not in {"delivered", "cancelled", "canceled"}
+                ),
+            },
+        })

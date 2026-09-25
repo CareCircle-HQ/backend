@@ -42663,3 +42663,112 @@ class MemberDeliveriesTest(TestCase):
                 "/v1/me/deliveries/", HTTP_HOST=MEMBER_HOST,
             ).status_code, 403,
         )
+
+
+@override_settings(MEMBER_API_HOST=MEMBER_HOST, ALLOWED_HOSTS=["*"])
+class MemberDeliveryHistoryTest(TestCase):
+    """Every delivery, paginated."""
+
+    def setUp(self):
+        from django.contrib.auth.hashers import make_password
+
+        from .models import Client, Household, HouseholdMember
+        from .member_app.auth import issue_token
+
+        self.client_rec = Client.objects.create(
+            client_id=str(uuid.uuid4()), first_name="His", last_name="Tory",
+            client_added_at=timezone.now(),
+        )
+        self.member = HouseholdMember.objects.create(
+            household=Household.objects.create(name="Tory HH"),
+            client=self.client_rec, is_primary=True,
+            mobile_app_username="3055557777",
+            mobile_app_password=make_password("x" * 10),
+        )
+        raw, _t = issue_token(self.member)
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {raw}")
+
+    def _delivery(self, *, days, status="ready_for_delivery", delivered=False):
+        from datetime import timedelta
+
+        from .models import DeliveryOrder, PurchaseOrder
+
+        return DeliveryOrder.objects.create(
+            purchase_order=PurchaseOrder.objects.create(),
+            member=self.client_rec, quantity=7, status=status,
+            expected_delivery_date=timezone.localdate() + timedelta(days=days),
+            delivered_at=timezone.now() if delivered else None,
+        )
+
+    def _get(self, qs=""):
+        return self.api.get(
+            f"/v1/me/deliveries/history/{qs}", HTTP_HOST=MEMBER_HOST,
+        ).data
+
+    def test_the_SUMMARY_counts_everything_not_just_the_page(self):
+        """⚠ THE BUG THIS EXISTS FOR. values().annotate() adds every ORDER BY field to
+        the GROUP BY, so counting a queryset ordered by (-date, -created_at) produced
+        one group PER ROW -- and a member with sixteen cancellations was told
+        "cancelled: 1". Fixed with .order_by() to clear the ordering; the sum of the
+        summary must equal the total."""
+        for d in range(1, 13):
+            self._delivery(days=-d, status="cancelled" if d % 3 else "delivered",
+                           delivered=d % 3 == 0)
+        data = self._get("?limit=2")
+        self.assertEqual(len(data["deliveries"]), 2)
+        self.assertEqual(data["total"], 12)
+        self.assertEqual(sum(data["summary"].values()), 12)
+        self.assertEqual(data["summary"]["delivered"], 4)
+        self.assertEqual(data["summary"]["cancelled"], 8)
+
+    def test_pagination_does_not_SKIP_or_REPEAT_a_row(self):
+        """⚠ Two orders on the SAME DATE are normal -- a cancelled one and its
+        replacement. Without a tiebreak in the ordering their relative position can
+        change between pages, so a row appears twice or vanishes while scrolling."""
+        for _ in range(6):
+            self._delivery(days=-1)
+        for _ in range(6):
+            self._delivery(days=-2)
+        seen = []
+        for offset in (0, 4, 8):
+            seen += [d["id"] for d in self._get(f"?limit=4&offset={offset}")["deliveries"]]
+        self.assertEqual(len(seen), 12)
+        self.assertEqual(len(set(seen)), 12)
+
+    def test_has_more_is_honest(self):
+        for d in range(1, 6):
+            self._delivery(days=-d)
+        self.assertTrue(self._get("?limit=3")["has_more"])
+        self.assertFalse(self._get("?limit=3&offset=3")["has_more"])
+        self.assertFalse(self._get("?limit=50")["has_more"])
+
+    def test_the_limit_is_CAPPED(self):
+        """A phone on cellular should not be able to ask for everything at once."""
+        for d in range(1, 4):
+            self._delivery(days=-d)
+        # Asking for 10,000 must not error, and must not honour the number.
+        self.assertEqual(self._get("?limit=10000")["total"], 3)
+
+    def test_a_JUNK_limit_falls_back_instead_of_500ing(self):
+        self._delivery(days=-1)
+        self.assertEqual(self._get("?limit=abc&offset=-5")["total"], 1)
+
+    def test_FUTURE_deliveries_are_included(self):
+        """The history screen is "everything", not "the past" -- a member checking
+        what is coming should not have to go back to the previous screen."""
+        self._delivery(days=5)
+        self._delivery(days=-5)
+        self.assertEqual(self._get()["total"], 2)
+
+    def test_it_is_refused_while_the_password_change_is_pending(self):
+        from .models import HouseholdMember
+
+        HouseholdMember.objects.filter(pk=self.member.pk).update(
+            mobile_app_must_change_password=True,
+        )
+        self.assertEqual(
+            self.api.get(
+                "/v1/me/deliveries/history/", HTTP_HOST=MEMBER_HOST,
+            ).status_code, 403,
+        )
